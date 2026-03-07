@@ -1,0 +1,10 @@
+# config/mira.yaml
+permissions:
+  filesystem: true
+  calendar: true
+server:
+  mcp_ws: ws://localhost:8765
+  ui_http: http://localhost:5000
+model:
+  type: simulated
+  name: mira-sim

@@ -1,0 +1,31 @@
+
+openclaw-docker/
+openclaw-main/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Python runtime/cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Secrets and local env
+.env
+.env.*
+!MIRA-Windows/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Project-specific sensitive/runtime data
+AION-Windows/.env
+AION-Windows/venv/
+AION-Windows/mcp_server/db.sqlite
+AION-Windows/whatsapp_bridge/auth_whatsapp/

@@ -1,0 +1,18 @@
+{
+  "name": "mira-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "Baileys WhatsApp Web sidecar for MIRA",
+  "type": "module",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "@hapi/boom": "^10.0.1",
+    "express": "^4.18.2",
+    "axios": "^1.6.7",
+    "qrcode": "^1.5.3",
+    "pino": "^8.19.0"
+  }
+}

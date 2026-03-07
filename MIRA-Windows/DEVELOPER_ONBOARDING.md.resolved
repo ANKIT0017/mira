@@ -1,0 +1,925 @@
+# MIRA Developer Onboarding Guide
+
+> **Welcome to MIRA: Advanced Agentic Intelligence & Operations Network**  
+> A comprehensive guide for new developers joining the project
+
+---
+
+## 📑 Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Architecture Deep Dive](#architecture-deep-dive)
+3. [Project Structure](#project-structure)
+4. [Tool Ecosystem](#tool-ecosystem)
+5. [Setup & Configuration](#setup--configuration)
+6. [Development Workflows](#development-workflows)
+7. [Key Components Explained](#key-components-explained)
+8. [Common Tasks & Patterns](#common-tasks--patterns)
+9. [Testing & Debugging](#testing--debugging)
+10. [Next Steps](#next-steps)
+
+---
+
+## 🎯 Project Overview
+
+### What is MIRA?
+
+MIRA is a **modular, high-performance AI agent ecosystem** designed for autonomous operations on Windows systems. Unlike traditional chatbots, MIRA can:
+
+- **Execute system commands** (terminal access)
+- **Manage files and documents** (create PDFs, Word, Excel)
+- **Send and receive emails** (Gmail API + SMTP/IMAP)
+- **Search the web** (DuckDuckGo + article scraping)
+- **Manage tasks** (SQLite-backed todo system)
+- **Interact via voice** (Speech-to-Text + Text-to-Speech)
+- **Chain multi-step workflows** (e.g., "Find AI startups, save to Excel, draft emails")
+
+### Core Philosophy
+
+- **Local-First**: Privacy-focused, all data stored locally in SANDBOX
+- **Modular Design**: Easy to add new tools/connectors
+- **Autonomous Operation**: Multi-step workflow execution without user intervention
+- **Flexible LLM Backend**: Supports local (Ollama), Groq, and Gemini models
+- **Security-First**: Strict SANDBOX enforcement, whitelisted shell commands
+
+---
+
+## 🏗️ Architecture Deep Dive
+
+MIRA follows a **three-tier architecture**:
+
+```mermaid
+graph TB
+    User[👤 User] -->|SSE/WebSocket| UI[Frontend - Flask UI]
+    User -->|Voice| Voice[Voice Agent]
+    
+    UI -->|SSE| MCP[MCP Server :9000]
+    Voice -->|Direct Import| Agent
+    
+    MCP -->|Orchestrates| Agent[Agent - LLM Orchestrator]
+    MCP -->|Manages Plugins| Plugins[Plugin Manager]
+    
+    Agent -->|Calls| Tools[Tool Registry]
+    Agent -->|Model Requests| LLM[LLM Backend<br/>Groq/Gemini/Ollama]
+    
+    Tools -->|Executes via| Connectors[Connectors]
+    Tools -->|Extends via| Plugins
+    
+    Connectors -->|System APIs| System[System OS]
+    Connectors -->|Vector Store| RAG[ChromaDB]
+    Connectors -->|SQLite| DB[(Local DB)]
+    
+    style UI fill:#4a90e2
+    style MCP fill:#e27d60
+    style Agent fill:#85dcba
+    style Tools fill:#e8a87c
+    style Connectors fill:#c38d9e
+    style RAG fill:#ffd700
+```
+
+### Layer 1: Frontend (UI)
+
+**Location**: [ui/app.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/ui/app.py)
+
+- Flask web server running on `http://localhost:5000`
+- Serves HTML chat interface with real-time SSE updates
+- **SSE Streaming**: Sends token-by-token reasoning and tool updates to the UI via `/api/stream`
+
+**Key Routes**:
+- `GET /` - Main chat interface
+- `GET /api/stream` - [NEW] Server-Sent Events (SSE) for streaming agent reasoning
+- `POST /api/reset` - Clear conversation history
+- `GET /api/list-files` - List files in `SANDBOX/`
+- `POST /api/read-file` - Read file content
+
+### Layer 2: MCP Server (Orchestration)
+
+**Location**: [mcp_server/server.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/server.py)
+
+- WebSocket server on `ws://localhost:9000`
+- **Plugin Manager**: Discovers and auto-loads plugins from the `plugins/` directory
+- Manages Agent lifecycle and tool synchronization
+
+**Key Actions**:
+- `agent_invoke_stream` - [NEW] Invoke agent with SSE streaming events
+- `plugin.install`, `plugin.list` - Manage dynamic capabilities
+- `ping` - Health check
+- `list_dir`, [read_file](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/ui/app.py#113-138), `add_event`, `list_events` - Direct MCP calls
+
+### Layer 3: Agent (Intelligence)
+
+**Location**: [agent/agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py)
+
+The **brain** of MIRA. Features:
+1. **Loop Detection**: Automatically breaks infinite tool-call repetitions
+2. **Robust Parsing**: Advanced brace-matching parser for tool calls
+3. **Multi-Provider Rotation**: Smart fallback across 5+ providers in [model_adapter.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/model_adapter.py)
+4. **Autonomous Execution**: Detects when more steps are needed, continues until task completion
+
+**Key Methods**:
+- `Agent.handle_streaming(text, model)` - [NEW] Specialized entry point for UI updates
+- `Agent._build_system_prompt()` - Creates core instruction set
+- `Agent.reset()` - Resets internal state and loop detectors
+
+---
+
+## 📂 Project Structure
+
+```
+MIRA-Windows/
+│
+├── agent/                        # LLM orchestration layer
+MIRA-Windows/
+│
+├── agent/                        # LLM orchestration layer
+│   └── model_adapter.py          # 5-provider fallback chain (Groq, Gemini, Cerebras, etc.)
+│
+├── mcp_server/                   # Tool connectivity layer
+│   ├── connectors/               # Core tool implementations
+│   │   ├── contacts.py           # CRM/Contact management [NEW]
+│   │   ├── knowledge.py          # RAG/Knowledge base [NEW]
+│   │   ├── calendar.py           # Includes autonomous scheduler support
+│   │   └── plugin_tools.py       # Plugin management [NEW]
+│   ├── plugin_manager.py         # Plugin lifecycle system [NEW]
+│   └── db.sqlite                 # Core SQLite DB (events, contacts)
+│
+├── plugins/                      # Dynamic extensions directory
+│   └── (plugin_folders)/         # Each with plugin.yaml + main.py
+│
+├── scheduler/                    # Real-time background services
+│   └── autonomous_scheduler.py   # Monitors DB for voice notifications [NEW]
+│
+├── ui/                           # Web interface
+│   └── templates/chat.html       # Reactive streaming UI
+│
+├── voice/                        # Voice interaction (Whisper/Piper)
+│
+├── SANDBOX/                      # SECURE workspace for agent files [NEW]
+│
+├── pyproject.toml                # Unified package structure [PEP 517]
+├── requirements.txt              # Unified dependencies
+└── run.bat                       # Launch MCP + UI + Scheduler
+```
+
+---
+
+### 1. 🔍 Information & Knowledge (RAG)
+
+**Connector**: [mcp_server/connectors/knowledge.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/knowledge.py)
+
+| Tool | Description |
+|------|-------------|
+| `knowledge.ingest` | Process documents/text and store in ChromaDB |
+| `knowledge.search` | Semantic (vector) search for relevant context |
+
+### 2. 📊 Contacts & CRM
+
+**Connector**: [mcp_server/connectors/contacts.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/contacts.py)
+
+| Tool | Description |
+|------|-------------|
+| `contacts.add` | Add a new contact with name, email, company, profession |
+| `contacts.search` | Fuzzy search for contacts by any field |
+| `contacts.update` | Modify existing contact records |
+| `contacts.list` | List all stored contacts |
+| `contacts.find_and_email` | Find a contact and prepare an email draft |
+
+### 3. 🧩 Plugin Management
+
+**Connector**: [mcp_server/connectors/plugin_tools.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/plugin_tools.py)
+
+| Tool | Description |
+|------|-------------|
+| `plugin.list` | List all discovered and active plugins |
+| `plugin.install` | Install a plugin from a local path |
+| `plugin.remove` | Safely remove an active plugin |
+
+---
+
+### 4. 🌐 Web & Search
+
+**Connectors**: [search.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/search.py) · [web.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/web.py) · [firecrawl.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/firecrawl.py)
+
+| Tool | Description |
+|------|-------------|
+| `search.duckduckgo` | Search the web with DuckDuckGo (no API key needed) |
+| `search.news` | Search for latest news stories via DuckDuckGo |
+| `web.fetch` | Fetch raw HTML from a URL |
+| `web.read` | Extract clean article text from a URL (strips ads/clutter) |
+| `web.summarize` | Fetch and LLM-summarize a URL |
+| `firecrawl.scrape` | Scrape a single page → returns markdown (JS-rendered) |
+| `firecrawl.crawl` | Crawl an entire website and save JSON to `SANDBOX/` |
+| `firecrawl.map` | Discover all URLs on a website (no scraping) |
+| `firecrawl.search` | Search the web and auto-scrape results into markdown |
+| `firecrawl.search_cache` | Full-text search over all previously scraped pages (instant, offline) |
+| `firecrawl.extract` | AI-powered structured data extraction by JSON schema |
+
+> [!NOTE]
+> **Search Decision Guide**:
+> - `search.duckduckgo` — Fast, no-key-needed, returns snippets + links.
+> - `web.read` — Read a single known article URL cleanly.
+> - `firecrawl.scrape` — Heavy/JS sites needing full render. Requires Firecrawl on `localhost:3100`.
+
+
+### 2. 📧 Communication & Outreach
+
+**Connector**: [mcp_server/connectors/email.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/email.py)
+
+| Tool | Description |
+|------|-------------|
+| `email.send` | Send emails via Gmail API or SMTP |
+| `email.fetch` | Fetch recent emails via IMAP |
+| `email.read` | Read full email content |
+| `email.send_job_application` | Automated job applications with tracking |
+
+> [!NOTE]
+> Email tools support both Gmail OAuth (recommended) and SMTP fallback. See [EMAIL_SETUP.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/EMAIL_SETUP.md) for configuration.
+
+### 3. 📄 Document & Data Processing
+
+**Connector**: [mcp_server/connectors/document.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/document.py)
+
+| Tool | Description |
+|------|-------------|
+| `document.create_pdf` | Create PDFs from text/markdown |
+| `document.extract_pdf` | Extract text from PDFs (OCR capable) |
+| `document.merge_pdf` | Combine multiple PDFs |
+| `document.split_pdf` | Split PDFs by page range |
+| `document.create_word` | Generate .docx files |
+| `document.read_word` | Parse Word documents |
+| `document.create_excel` | Create .xlsx spreadsheets |
+| `document.read_excel` | Parse Excel files |
+| `document.markdown_to_html` | Convert markdown to HTML |
+
+### 4. 📝 Personal & Task Management
+
+**Connector**: [mcp_server/connectors/todo.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/todo.py)
+
+| Tool | Description |
+|------|-------------|
+| `todo.add` | Add new task with priority/due date |
+| `todo.list` | List all tasks (sorted by priority) |
+| `todo.complete` | Mark task as done |
+| `todo.delete` | Remove task |
+| `todo.search` | Full-text search in tasks |
+| `todo.complete_all` | Complete all tasks at once |
+| `todo.clear_history` | Delete all completed tasks |
+
+**Backend**: SQLite database ([todos.db](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/todos.db)) with schema:
+```sql
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    task TEXT NOT NULL,
+    priority TEXT DEFAULT 'medium',
+    due_date TEXT,
+    completed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+### 5. ⚙️ System & Environment Control
+
+**Connector**: [mcp_server/connectors/system.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/system.py)
+
+| Tool | Description |
+|------|-------------|
+| `system.shell` | Run whitelisted PowerShell commands (SANDBOX only) |
+| `system.time` | Get current date/time |
+| `system.clipboard.read` | Read clipboard contents |
+| `system.clipboard.write` | Write to clipboard |
+
+> [!IMPORTANT]
+> **Security**: `system.shell` only allows whitelisted read-only commands (dir, echo, type, etc.) and executes them in the SANDBOX directory. Write operations, script execution, and network commands are blocked.
+
+**Connector**: [mcp_server/connectors/filesystem.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/filesystem.py)
+
+| Tool | Description |
+|------|-------------|
+| `filesystem.read` | Read file contents (SANDBOX only) |
+| `filesystem.write` | Write to files (SANDBOX only) |
+| `filesystem.append` | Append to files (SANDBOX only) |
+| `filesystem.list` | List directory contents (SANDBOX only) |
+| `filesystem.search` | Recursive file search (SANDBOX only) |
+
+> [!IMPORTANT]
+> **Security**: ALL filesystem operations are restricted to the `SANDBOX/` directory only. The agent cannot access `.env`, source code, or system files.
+
+### 6. 📋 Other Tools
+
+**Connector**: [mcp_server/connectors/calendar.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/calendar.py)
+
+| Tool | Description |
+|------|-------------|
+| `calendar.add_event` | Add events to local calendar DB |
+| `calendar.list_events` | Retrieve upcoming events |
+
+---
+
+## ⚙️ Setup & Configuration
+
+### Prerequisites
+
+- **Windows OS** (PowerShell required)
+- **Python 3.12+**
+- **Ollama** (for local LLM) OR **Groq API Key** (for cloud LLM)
+- **Git** (optional, for cloning updates)
+
+### Step 1: Environment Setup
+
+```bash
+# Navigate to project directory
+cd C:\Users\lenovo\Downloads\MIRA-Deliverables\MIRA-Windows
+
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+venv\Scripts\activate
+
+# [NEW] Install as editable package (PEP 517)
+# This enables clean imports across the project without sys.path hacks
+pip install -e .
+
+# Install additional dependencies
+pip install -r requirements.txt
+```
+
+### Step 2: Configure API Keys
+
+Edit [.env](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/.env):
+
+```env
+# --- MULTI-PROVIDER ROTATION (MIRA SMART FALLBACK) ---
+# MIRA automatically rotates between these 5 providers to avoid rate limits.
+# Recommended: Get free keys for all of them to maximize RPM.
+
+GROQ_API_KEY=gsk_xxx
+GEMINI_API_KEY=AIzaSyAxxx
+CEREBRAS_API_KEY=csk_xxx       # cloud.cerebras.ai (30 RPM, legacy speed)
+SAMBANOVA_API_KEY=xxx-xxx-xxx  # cloud.sambanova.ai
+OPENROUTER_API_KEY=sk-or-xxx   # openrouter.ai/keys (Free Llama 70B)
+
+# Firecrawl Configuration (for web scraping tools)
+FIRECRAWL_API_URL=http://localhost:3100
+
+# SMTP Configuration (for email sending)
+SMTP_USER=your.email@gmail.com
+SMTP_PASS=your_app_password_here
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# IMAP Configuration (for email reading)
+IMAP_USER=your.email@gmail.com
+IMAP_PASS=your_app_password_here
+IMAP_SERVER=imap.gmail.com
+```
+
+
+> [!TIP]
+> For Gmail, generate an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+
+### Step 3: Choose LLM Backend
+
+**Option A: Local (Ollama)**
+
+```bash
+# Install Ollama from https://ollama.ai
+
+# Pull recommended model
+ollama pull mistral:7b
+```
+
+**Option B: Cloud (Groq)**
+
+- Sign up at [console.groq.com](https://console.groq.com)
+- Add `GROQ_API_KEY` to [.env](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/.env)
+
+**Option C: Cloud (Gemini)**
+
+- Get API key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+- Add `GEMINI_API_KEY` to [.env](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/.env)
+- Supports Gemini 2.5 Flash-Lite (best free tier: 15 RPM, 1000 requests/day)
+
+> [!IMPORTANT]
+> **Recommended Model**: `mistral:7b` or higher (7B+ parameters)  
+> Small models like `qwen2.5:3b` cause hallucinations. See [RECOMMENDED_MODELS.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/RECOMMENDED_MODELS.md).
+
+### Step 4: Launch MIRA
+
+**Standard Mode (Web UI)**:
+```bash
+# Run both MCP server and UI
+run.bat
+```
+
+This starts:
+1. MCP Server on `ws://localhost:9000`
+2. Flask UI on `http://localhost:5000`
+
+**Voice Mode**:
+```bash
+# Interactive voice assistant
+run_voice.bat
+```
+
+**Mobile Access (via ngrok)**:
+```bash
+# Expose UI publicly for mobile testing
+run_with_ngrok.bat
+```
+
+See [NGROK_SETUP.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/NGROK_SETUP.md) for details.
+
+---
+
+## 🔄 Development Workflows
+
+### Adding a New Tool
+
+1. **Create/Edit Connector**  
+   Example: Adding a weather tool to `mcp_server/connectors/weather.py`
+
+```python
+# mcp_server/connectors/weather.py
+# NO sys.path HACKS NEEDED - Just import directly!
+from mcp_server.tools import register_tool
+
+@register_tool(
+    name="weather.get_forecast",
+    description="Get weather forecast for a city",
+    parameters={
+        "city": {"type": "string", "description": "City name"},
+        "days": {"type": "integer", "description": "Number of days"}
+    }
+)
+def get_forecast(city: str, days: int = 3):
+    # Your implementation here
+    return f"Weather for {city}: Sunny, {days} days"
+```
+
+2. **Connector Auto-Discovery**  
+   The MCP server automatically loads all [.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/ui/app.py) files in [connectors/](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/server.py#108-121) on startup. No manual registration needed!
+
+3. **Test the Tool**  
+   Restart MCP server, then in chat:
+   ```
+   "What's the weather in London for the next 5 days?"
+   ```
+
+### Creating a Plugin
+
+Plugins allow adding new tools dynamically without touching the core `mcp_server/` folder.
+
+1. **Create Plugin Folder**: `plugins/my_weather_plugin/`
+2. **Add `plugin.yaml`**:
+   ```yaml
+   name: "My Weather Plugin"
+   description: "Shows local weather"
+   version: "1.0.0"
+   main: "main.py"
+   ```
+3. **Add `main.py`**:
+   ```python
+   def get_tools():
+       return {
+           "plugin.weather": lambda location: f"Sunny in {location}"
+       }
+   ```
+4. **Auto-Loading**: The Plugin Manager detects the folder on startup and registers the tools.
+
+### Changing LLM Model
+
+**Method 1: Edit Code**
+
+In [agent/model_adapter.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/model_adapter.py) line 18:
+
+```python
+# Change from:
+model: str = "qwen2.5:3b"
+
+# To:
+model: str = "mistral:7b"
+```
+
+**Method 2: UI Selection** (if implemented)
+
+The UI has model selection dropdown (check `chat.html` template).
+
+### Multi-Step Workflow Logic
+
+MIRA automatically detects when to continue workflows. Example:
+
+**User**: "Find 5 AI startups in Bangalore, save to Excel, and draft an email"
+
+**Agent Execution**:
+1. Calls `search.web` with query: "AI startups Bangalore"
+2. Processes results
+3. Calls `document.create_excel` to save data
+4. Detects phrase "draft an email" in original request
+5. Calls `email.send_job_application` for each startup
+6. Returns summary to user
+
+This is implemented in [agent/agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py) via **workflow continuation detection** (lines 240-260).
+
+---
+
+## 🔑 Key Components Explained
+
+### Tool Registry System
+
+**Location**: `mcp_server/tools/__init__.py`
+
+All connectors use this registry to declare their tools:
+
+```python
+from mcp_server.tools import register_tool, execute_tool, list_tools
+
+# Registering a tool
+@register_tool(
+    name="todo.add",
+    description="Add a new task to the todo list",
+    parameters={
+        "task": {"type": "string", "description": "Task description"},
+        "priority": {"type": "string", "description": "low/medium/high"}
+    }
+)
+def add_task(task: str, priority: str = "medium"):
+    # Implementation
+    pass
+
+# Executing a tool (used by agent)
+result = execute_tool("todo.add", {"task": "Buy milk", "priority": "high"})
+
+# Listing all tools (used by agent for system prompt)
+all_tools = list_tools()
+```
+
+### Model Adapter (LLM Interface)
+
+**Location**: [agent/model_adapter.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/model_adapter.py)
+
+Abstracts Ollama/Groq API calls:
+
+```python
+from agent.model_adapter import generate
+
+# Generate response
+response_text = generate(
+    prompt="You are a helpful assistant",
+    messages=[
+        {"role": "user", "content": "What is AI?"}
+    ],
+    model="mistral:7b",
+    temperature=0.7
+)
+```
+
+**Key Features**:
+- **Multi-Provider Rotation**: When Groq is rate-limited, automatically switches to Gemini (and vice versa)
+- Supports local (Ollama), Groq, and Gemini models
+- Smart fallback: Cloud → Cloud (different provider) → Local
+
+**Available Cloud Models**:
+- Groq: `llama-3.3-70b-versatile`, `qwen/qwen3-32b`
+- Gemini: `gemini-2.5-flash-lite` (best free tier), `gemini-2.5-flash`, `gemma-3-12b-it`, `gemma-3-27b-it`
+
+### Agent Workflow Engine
+
+**Location**: [agent/agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py)
+
+```python
+# Example internal flow
+agent = Agent()
+
+# 1. User input received
+user_input = "Add 'Write documentation' to my todos"
+
+# 2. Agent builds system prompt with all tools
+system_prompt = agent._build_system_prompt()
+
+# 3. Sends to LLM
+llm_response = generate(
+    prompt=system_prompt,
+    messages=[{"role": "user", "content": user_input}],
+    model="mistral:7b"
+)
+
+# 4. Parses JSON tool calls from response
+# Example LLM output:
+# {
+#   "tool": "todo.add",
+#   "args": {"task": "Write documentation", "priority": "high"}
+# }
+
+# 5. Executes tool
+result = execute_tool("todo.add", {"task": "Write documentation", "priority": "high"})
+
+# 6. Returns to user
+return {"reply": result, "workflow_complete": True}
+```
+
+---
+
+## 🧪 Testing & Debugging
+
+### Test Files
+
+The project includes several test scripts:
+
+| File | Purpose |
+|------|---------|
+| [test_agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/test_agent.py) | Test agent without UI |
+| [test_context.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/test_context.py) | Test conversation memory |
+| [test_smtp.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/test_smtp.py) | Test email sending |
+| [test_tool_memory.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/test_tool_memory.py) | Test tool execution memory |
+
+### Running Tests
+
+```bash
+# Test agent directly
+python test_agent.py
+
+# Test email functionality
+python test_smtp.py
+```
+
+### Debugging Tips
+
+**1. Check MCP Server Logs**
+
+The MCP server prints detailed logs:
+```
+[MCP] Received agent_invoke with model=mistral:7b, input=Add task...
+[MCP] Clearing AGENT history (had 12 messages)
+```
+
+**2. Check Tool Execution**
+
+Add debug prints in connectors:
+```python
+@register_tool(name="todo.add", ...)
+def add_task(task: str):
+    print(f"[TODO] Adding task: {task}")  # Debug
+    # ... rest of code
+```
+
+**3. Test Tools Directly**
+
+```python
+# In Python REPL
+from mcp_server.tools import execute_tool
+
+result = execute_tool("todo.add", {"task": "Test", "priority": "low"})
+print(result)
+```
+
+**4. Monitor WebSocket Communication**
+
+Use browser DevTools → Network → WS to see messages between UI and MCP server.
+
+---
+
+## 🚀 Common Tasks & Patterns
+
+### Task 1: Add a New Document Format
+
+Example: Adding PowerPoint support
+
+1. Edit [mcp_server/connectors/document.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/document.py)
+2. Add new tool:
+
+```python
+@register_tool(
+    name="document.create_pptx",
+    description="Create PowerPoint presentation",
+    parameters={
+        "filename": {"type": "string"},
+        "slides": {"type": "array", "description": "List of slide content"}
+    }
+)
+def create_pptx(filename: str, slides: list):
+    from pptx import Presentation
+    prs = Presentation()
+    for slide_content in slides:
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        slide.shapes.title.text = slide_content.get("title", "")
+        # Add content...
+    
+    output_path = Path(__file__).parent.parent.parent / "CREATEDBY-MIRA" / filename
+    prs.save(output_path)
+    return f"Created {filename}"
+```
+
+3. Add dependency to [requirements.txt](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/requirements.txt):
+```
+python-pptx>=0.6.21
+```
+
+4. Restart MCP server
+
+### Task 2: Integrate External API
+
+Example: OpenWeatherMap
+
+1. Create `mcp_server/connectors/weather.py`:
+
+```python
+import requests
+from pathlib import Path
+import sys
+sys.path.append(str(Path(__file__).parent.parent.parent))
+from mcp_server.tools import register_tool
+import os
+
+@register_tool(
+    name="weather.current",
+    description="Get current weather for a location",
+    parameters={
+        "location": {"type": "string", "description": "City name"}
+    }
+)
+def get_current_weather(location: str):
+    api_key = os.getenv("OPENWEATHER_API_KEY")
+    url = f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={api_key}"
+    response = requests.get(url)
+    data = response.json()
+    return f"Weather in {location}: {data['weather'][0]['description']}, {data['main']['temp']}°K"
+```
+
+2. Add API key to [.env](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/.env):
+```
+OPENWEATHER_API_KEY=your_key_here
+```
+
+3. Restart and test: "What's the weather in Paris?"
+
+### Task 3: Custom Workflow Templates
+
+Create reusable workflows in the agent's system prompt:
+
+Edit [agent/agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py) → [_build_system_prompt()](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py#33-137):
+
+```python
+def _build_system_prompt(self):
+    # ... existing code ...
+    
+    prompt += """
+    
+WORKFLOW TEMPLATES:
+1. **Job Application Workflow**: search.web → document.create_excel → email.send_job_application
+2. **Research & Report**: search.web → web.scrape → document.create_pdf
+3. **Daily Briefing**: email.fetch → search.news → todo.list → system.get_status
+    """
+    return prompt
+```
+
+---
+
+## 📚 Additional Resources
+
+### Documentation Files
+
+- [README.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/README.md) - Quick start guide
+- [PROJECT_SPEC.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/PROJECT_SPEC.md) - Technical specification
+- [EMAIL_INTEGRATION.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/EMAIL_INTEGRATION.md) - Email setup details
+- [EMAIL_SETUP.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/EMAIL_SETUP.md) - Gmail OAuth configuration
+- [NGROK_SETUP.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/NGROK_SETUP.md) - Mobile access setup
+- [RECOMMENDED_MODELS.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/RECOMMENDED_MODELS.md) - LLM model recommendations
+
+### Key Dependencies
+
+| Library | Purpose |
+|---------|---------|
+| `websockets` | MCP server communication |
+| `Flask` | Web UI framework |
+| `openai-whisper` | Speech-to-Text |
+| `piper-tts` | Text-to-Speech |
+| `beautifulsoup4` | Web scraping |
+| `readability-lxml` | Article extraction |
+| `ddgs` | DuckDuckGo search |
+| `pypdf2` | PDF manipulation |
+| `python-docx` | Word document creation |
+| `openpyxl` | Excel file handling |
+| `pandas` | Data processing |
+
+---
+
+## 🎓 Next Steps
+
+### For New Developers
+
+1. **Run the system** locally and test basic commands:
+   - "Add 'Learn MIRA' to my todos"
+   - "Search for latest AI news"
+   - "Create a PDF with content: Hello World"
+
+2. **Read the agent code** ([agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/agent/agent.py)) to understand the workflow engine
+
+3. **Explore a connector** (start with [todo.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/mcp_server/connectors/todo.py) - it's the simplest)
+
+4. **Create your first tool** following the "Adding a New Tool" workflow
+
+5. **Join debugging sessions** to see how multi-step workflows execute in real-time
+
+### Advanced Topics
+
+- **Streaming Responses**: Implement token-by-token output (see [voice_agent.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/voice/voice_agent.py) → [run_streaming()](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/voice/voice_agent.py#105-157))
+- **Custom Connectors**: Build domain-specific tools (e.g., database connectors, CRM integrations)
+- **UI Enhancements**: Modify the glassmorphism theme, add chat history persistence
+- **Mobile Optimization**: Improve responsive design for ngrok-exposed mobile UI
+- **Multi-Agent Systems**: Extend MIRA to support specialized sub-agents
+
+---
+
+## 🤝 Contributing
+
+### Coding Standards
+
+- Follow PEP 8 for Python code
+- Add docstrings to all connectors and tools
+- Use type hints where possible
+- Keep connectors independent (no cross-connector imports)
+
+### Tool Design Guidelines
+
+1. **Single Responsibility**: Each tool should do ONE thing well
+2. **Clear Parameters**: Use descriptive parameter names with type hints
+3. **Error Handling**: Return user-friendly error messages, not stack traces
+4. **Documentation**: Always include detailed `description` in `@register_tool`
+
+### Commit Message Format
+
+```
+[CATEGORY] Brief description
+
+Detailed explanation of changes
+
+- Feature: New tool for X
+- Fix: Resolved issue with Y
+- Docs: Updated Z documentation
+```
+
+Categories: `AGENT`, `MCP`, `UI`, `VOICE`, `CONNECTOR`, `DOCS`, `TEST`
+
+---
+
+## ❓ FAQ
+
+**Q: Why does the agent hallucinate or invent conversations?**  
+A: You're likely using a model that's too small (e.g., `qwen2.5:3b`). Upgrade to `mistral:7b` or larger. See [RECOMMENDED_MODELS.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/RECOMMENDED_MODELS.md).
+
+**Q: Where are agent-created files stored?**  
+A: All files are saved in `CREATEDBY-MIRA/` folder in the project root.
+
+**Q: How do I reset the conversation?**  
+A: Click the "Reset" button in the UI or call `/api/reset` endpoint.
+
+**Q: Can I use MIRA without Ollama?**  
+A: Yes! Configure cloud API keys (Groq, Gemini, Cerebras, SambaNova, OpenRouter) in [.env](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/.env) and the agent will use cloud models automatically.
+
+**Q: How does the multi-provider rotation work?**  
+A: MIRA tracks rate limits for all 5 providers. If one is limited, it skips it for 65 seconds and tries the next available one. This ensures high availability on free tiers.
+
+**Q: Where is the knowledge base stored?**  
+A: MIRA uses a local ChromaDB instance stored in the project root. RAG data remains private and offline.
+
+**Q: Voice mode isn't working?**  
+A: Ensure you have a microphone connected and Whisper model downloaded. Check [voice/test_stt.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/voice/test_stt.py) and [voice/test_tts.py](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/voice/test_tts.py).
+
+**Q: How do I access MIRA from my phone?**  
+A: Use [run_with_ngrok.bat](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/run_with_ngrok.bat) to create a public URL. See [NGROK_SETUP.md](file:///C:/Users/lenovo/Downloads/MIRA-Deliverables/MIRA-Windows/NGROK_SETUP.md).
+
+**Q: Firecrawl tools aren't working?**  
+A: Ensure Firecrawl Docker containers are running on port 3100:
+```powershell
+cd C:\Users\lenovo\Downloads\MIRA-Deliverables\firecrawl
+docker-compose up -d
+docker ps | findstr firecrawl-api
+# Should show: 0.0.0.0:3100->3002/tcp
+```
+Then restart the MCP server to pick up the connection.
+
+**Q: Getting "Port 3002 bind error" with Firecrawl?**  
+A: Windows reserves ports 2998-3097. Verify these files:
+- `firecrawl/.env` contains `PORT=3100`
+- `MIRA-Windows/.env` contains `FIRECRAWL_API_URL=http://localhost:3100`
+- Restart both Docker and MCP server after changes
+
+**Q: MCP server connects to wrong Firecrawl port?**  
+A: The MCP server caches the Firecrawl client on startup. After changing `FIRECRAWL_API_URL` in `.env`, you **must restart** `run_with_ngrok.bat` or `run.bat` for changes to take effect.
+
+---
+
+## 📞 Support
+
+For questions or issues:
+1. Check existing documentation files
+2. Review conversation history (this project has extensive development logs)
+3. Test with `test_*.py` scripts to isolate issues
+4. Check MCP server and Flask logs for error messages
+
+---
+
+**Welcome aboard, and happy coding! 🚀**
+
+*Last Updated: 2026-02-10*

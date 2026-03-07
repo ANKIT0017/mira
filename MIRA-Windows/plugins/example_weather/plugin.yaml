@@ -1,0 +1,7 @@
+name: example_weather
+version: 1.0.0
+description: Get current weather information for any city (example plugin)
+author: MIRA
+entry_point: main.py
+dependencies:
+  - requests>=2.28.0

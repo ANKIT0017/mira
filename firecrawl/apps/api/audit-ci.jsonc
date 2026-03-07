@@ -1,0 +1,17 @@
+{
+    "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+    "low": true,
+    "allowlist": [
+        "GHSA-3gc7-fjrx-p6mg|@coinbase/x402>@coinbase/cdp-sdk>@solana/spl-token>@solana/buffer-layout-utils>bigint-buffer", // never gets called in our code paths
+        "GHSA-m732-5p4w-x69g|@coinbase/x402>x402>wagmi>@wagmi/connectors>porto>hono", // we don't use hono
+        "GHSA-q7jf-gf43-6x6p|@coinbase/x402>x402>wagmi>@wagmi/connectors>porto>hono", // we don't use hono
+        "GHSA-5j98-mcp5-4vw2|jest>@jest/core>@jest/reporters>glob", // we do not use the glob CLI
+        "GHSA-mh29-5h37-fv8m|@jest/globals>@jest/expect>jest-snapshot>@jest/transform>babel-plugin-istanbul>@istanbuljs/load-nyc-config>js-yaml", // not impacted by this
+        "GHSA-36hm-qxxp-pg3m|@coinbase/x402>x402>wagmi>@wagmi/connectors>@coinbase/wallet-sdk>preact", // we don't use preact in our code paths
+        "GHSA-3vhc-576x-3qv4|@coinbase/x402>x402>wagmi>@wagmi/connectors>porto>hono", // we don't use hono
+        "GHSA-f67f-6cw9-8mq4|@coinbase/x402>x402>wagmi>@wagmi/connectors>porto>hono", // we don't use hono
+        "GHSA-73rr-hh4g-fpgx|git-diff>diff", // dev dependency for diffs, not processing user-supplied patches
+        "GHSA-73rr-hh4g-fpgx|ts-node>diff", // dev dependency for TypeScript execution, not processing user-supplied patches
+        "GHSA-mp2g-9vg9-f4cg|@coinbase/x402>x402>wagmi>@wagmi/connectors>@walletconnect/ethereum-provider>@walletconnect/keyvaluestorage>unstorage>h3" // h3 is a storage dependency in x402 payment chain, not used for serving HTTP traffic
+    ]
+}

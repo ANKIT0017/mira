@@ -1,0 +1,36 @@
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>MIRA PoC — UI</title>
+      <style>
+        body { font-family: Arial, Helvetica, sans-serif; margin: 24px; }
+        textarea { width: 90%; height: 120px; }
+        input, button { padding: 8px 12px; margin: 6px; }
+        pre { background:#f4f4f4; padding:12px; border-radius:6px; }
+      </style>
+    </head>
+    <body>
+      <h2>MIRA — PoC UI (Windows)</h2>
+      <p>Enter JSON action payload (example below):</p>
+      <pre>{
+  "action": "agent_invoke",
+  "payload": {"input":"Hello agent"}
+}</pre>
+      <textarea id="payload">{"action":"agent_invoke","payload":{"input":"Hello agent"}}</textarea><br/>
+      <button onclick="invoke()">Invoke</button>
+      <h3>Response</h3>
+      <pre id="out">-</pre>
+
+      <script>
+        async function invoke(){
+          const p = document.getElementById("payload").value;
+          let json;
+          try{ json = JSON.parse(p); } catch(e){ alert("Invalid JSON"); return; }
+          const res = await fetch('/api/invoke', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(json)});
+          const j = await res.json();
+          document.getElementById("out").textContent = JSON.stringify(j, null, 2);
+        }
+      </script>
+    </body>
+    </html>

@@ -1,0 +1,4 @@
+packages:
+  - "native"
+injectWorkspacePackages: true
+minimumReleaseAge: 720 # 12 hours

@@ -1,0 +1,2911 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>MIRA — Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet">
+  <style>
+    /* ────────────────────────────────────────────
+       TERMINAL DESIGN SYSTEM
+    ──────────────────────────────────────────── */
+    :root {
+      --bg: #0d0f0e;
+      --bg-panel: #111413;
+      --bg-input: #131615;
+      --border: #1f2421;
+      --border-bright: #2a3330;
+
+      --green: #4ade80;
+      --green-dim: #22c55e;
+      --green-faint: #16a34a44;
+      --green-glow: rgba(74, 222, 128, 0.08);
+
+      --yellow: #fde047;
+      --yellow-dim: #facc15;
+      --yellow-bg: rgba(253, 224, 71, 0.06);
+
+      --cyan: #22d3ee;
+      --red: #f87171;
+      --orange: #fb923c;
+      --purple: #c084fc;
+
+      --text: #d4d4d4;
+      --text-dim: #6b7280;
+      --text-muted: #4b5563;
+
+      --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+      /* Legacy aliases kept for JS-driven inline styles */
+      --bg-color: var(--bg);
+      --text-color: var(--text);
+      --input-bg: var(--bg-input);
+      --input-border: var(--border);
+      --status-color: var(--text-dim);
+      --button-bg: var(--bg-panel);
+      --button-hover: #1a1f1c;
+      --accent-color: var(--green);
+      --sidebar-bg: var(--bg-panel);
+      --card-bg: var(--bg-panel);
+      --border-color: var(--border);
+      --hover-bg: #181d1a;
+    }
+
+    /* Light theme disabled visually — terminal is always dark */
+    [data-theme="light"] {
+      --bg: #0d0f0e;
+      --bg-panel: #111413;
+      --bg-input: #131615;
+      --border: #1f2421;
+      --border-bright: #2a3330;
+      --text: #d4d4d4;
+      --text-dim: #6b7280;
+      --bg-color: var(--bg);
+      --text-color: var(--text);
+      --input-bg: var(--bg-input);
+      --input-border: var(--border);
+      --status-color: var(--text-dim);
+      --button-bg: var(--bg-panel);
+      --button-hover: #1a1f1c;
+      --accent-color: var(--green);
+      --sidebar-bg: var(--bg-panel);
+      --card-bg: var(--bg-panel);
+      --border-color: var(--border);
+      --hover-bg: #181d1a;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border-bright);
+      border-radius: 2px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--green-dim);
+    }
+
+    body {
+      font-family: var(--font-mono);
+      margin: 0;
+      padding: 0;
+      background-color: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── SIDEBAR ────────────────────────────────── */
+    .sidebar {
+      position: fixed;
+      left: -300px;
+      top: 0;
+      width: 300px;
+      height: 100%;
+      background-color: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      z-index: 1000;
+      transition: left 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      padding: 20px 16px;
+      overflow-y: auto;
+    }
+
+    .sidebar.open {
+      left: 0;
+    }
+
+    .sidebar-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.7);
+      z-index: 999;
+      display: none;
+      backdrop-filter: blur(2px);
+    }
+
+    .sidebar-overlay.visible {
+      display: block;
+    }
+
+    .sidebar h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--green);
+      margin-top: 40px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .capability-item {
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 4px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      transition: border-color 0.15s;
+    }
+
+    .capability-item:hover {
+      border-color: var(--green-dim);
+    }
+
+    .capability-item strong {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--green);
+      font-weight: 600;
+      font-size: 0.78rem;
+    }
+
+    .capability-item span {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      line-height: 1.4;
+    }
+
+    /* ── TOP-BAR CONTROLS ──────────────────────── */
+    .sidebar-toggle {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      padding: 6px 10px;
+      font-size: 1rem;
+      z-index: 1001;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--green);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      transition: border-color 0.15s, color 0.15s;
+    }
+
+    .sidebar-toggle:hover {
+      border-color: var(--green);
+    }
+
+    .theme-toggle {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      padding: 5px 9px;
+      font-size: 0.85rem;
+      z-index: 10;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-dim);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      transition: border-color 0.15s;
+    }
+
+    .theme-toggle:hover {
+      border-color: var(--green-dim);
+      color: var(--green);
+    }
+
+    .model-switcher {
+      position: absolute;
+      top: 10px;
+      right: 58px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      background: var(--bg-panel);
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      z-index: 10;
+      transition: border-color 0.15s;
+      color: var(--text-dim);
+    }
+
+    .model-switcher:hover {
+      border-color: var(--green-dim);
+    }
+
+    .model-switcher select {
+      background: transparent;
+      border: none;
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 600;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      outline: none;
+      padding: 0 2px;
+    }
+
+    .model-switcher select option {
+      background: var(--bg-panel);
+      color: var(--text);
+    }
+
+    .model-icon {
+      font-size: 0.85rem;
+    }
+
+    /* ── MAIN CONTAINER ────────────────────────── */
+    .container {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      max-width: 1100px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 10px 14px 10px;
+      gap: 6px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 0;
+      /* hidden — terminal doesn't need a big header */
+    }
+
+    /* Session status bar */
+    #status {
+      color: var(--text-muted);
+      font-size: 0.68rem;
+      text-align: center;
+      margin: 0;
+      padding: 2px 0;
+      flex-shrink: 0;
+      letter-spacing: 0.05em;
+    }
+
+    #status::before {
+      content: "[ ";
+      color: var(--border-bright);
+    }
+
+    #status::after {
+      content: " ]";
+      color: var(--border-bright);
+    }
+
+    /* ── CHAT AREA ─────────────────────────────── */
+    #chatContainer {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      /* terminal lines stack tight */
+      background-color: var(--bg);
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      scroll-behavior: smooth;
+    }
+
+    /* ── MESSAGES ──────────────────────────────── */
+    .message {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+      animation: termAppear 0.12s ease-out;
+      position: relative;
+    }
+
+    .message:last-child {
+      border-bottom: none;
+    }
+
+    @keyframes termAppear {
+      from {
+        opacity: 0;
+        transform: translateY(4px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* Remove old bubble row layout — terminal is full-width */
+    .message.user {
+      flex-direction: column;
+    }
+
+    .message.mira {
+      flex-direction: column;
+    }
+
+    /* Label row above message */
+    .message::before {
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+      display: block;
+    }
+
+    .message.user::before {
+      content: "▸ you";
+      color: var(--yellow-dim);
+    }
+
+    .message.mira::before {
+      content: "◆ mira";
+      color: var(--green-dim);
+    }
+
+    /* Hide old icon divs */
+    .message-icon {
+      display: none;
+    }
+
+    .message-content {
+      max-width: 100%;
+      padding: 0;
+      border-radius: 0;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+      font-size: 0.83rem;
+      line-height: 1.65;
+      font-family: var(--font-mono);
+      border: none;
+      background: transparent !important;
+    }
+
+    /* User message text — yellow */
+    .message.user .message-content {
+      color: var(--yellow);
+      background: transparent !important;
+    }
+
+    /* MIRA message text — green/dim */
+    .message.mira .message-content {
+      color: var(--text);
+    }
+
+    /* Code inside messages */
+    .message-content code {
+      background: rgba(74, 222, 128, 0.08);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-family: var(--font-mono);
+      font-size: 0.9em;
+      color: var(--green);
+      border: 1px solid var(--border);
+    }
+
+    .message.user .message-content code {
+      background: rgba(253, 224, 71, 0.1);
+      color: var(--yellow);
+      border-color: rgba(253, 224, 71, 0.2);
+    }
+
+    .message-content a {
+      color: var(--cyan);
+      text-decoration: underline;
+      word-break: break-word;
+    }
+
+    .message-content a:hover {
+      opacity: 0.8;
+    }
+
+    .message.user .message-content a {
+      color: var(--yellow-dim);
+    }
+
+    /* ── STREAMING STEPS ───────────────────────── */
+    .stream-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      margin-bottom: 6px;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+    }
+
+    .stream-step {
+      padding: 3px 8px;
+      border-radius: 0;
+      font-size: 0.72rem;
+      line-height: 1.5;
+      border-left: 2px solid var(--border-bright);
+      background: transparent;
+      color: var(--text-muted);
+      animation: stepIn 0.1s ease-out;
+    }
+
+    @keyframes stepIn {
+      from {
+        opacity: 0;
+        transform: translateX(-4px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .stream-step.thought {
+      border-left-color: var(--purple);
+      color: #9ca3af;
+      font-style: italic;
+    }
+
+    .stream-step.tool-call {
+      border-left-color: var(--orange);
+      color: var(--orange);
+    }
+
+    .stream-step.tool-call::before {
+      content: "$ ";
+    }
+
+    .stream-step.tool-call .spinner {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border: 1.5px solid var(--border-bright);
+      border-top-color: var(--orange);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .stream-step.tool-result {
+      border-left-color: var(--green-dim);
+      color: var(--text-muted);
+      max-height: 60px;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    .stream-step.tool-result::before {
+      content: "✓ ";
+      color: var(--green);
+    }
+
+    .stream-step.tool-result.expanded {
+      max-height: none;
+    }
+
+    .stream-step.tool-result.error {
+      border-left-color: var(--red);
+      color: var(--red);
+    }
+
+    .stream-step.tool-result.error::before {
+      content: "✗ ";
+      color: var(--red);
+    }
+
+    /* collapsed steps toggle */
+    .steps-toggle {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      user-select: none;
+      padding: 2px 0;
+      display: inline-block;
+    }
+
+    .steps-toggle:hover {
+      color: var(--green-dim);
+    }
+
+    .stream-final {
+      margin-top: 6px;
+      color: var(--text);
+      font-size: 0.83rem;
+      line-height: 1.65;
+    }
+
+    /* NEED_INPUT inline question widget */
+    .need-input-widget {
+      border-left: 3px solid var(--purple);
+      background: rgba(139,92,246,0.07);
+      border-radius: 0 6px 6px 0;
+      padding: 10px 12px;
+      margin: 6px 0;
+      font-size: 0.8rem;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .need-input-widget .ni-label {
+      color: #c084fc;
+      font-weight: 600;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 2px;
+    }
+    .need-input-widget .ni-question {
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .need-input-widget .ni-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .need-input-widget .ni-input {
+      flex: 1;
+      background: var(--bg-input, #1a1b26);
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 0.8rem;
+      padding: 5px 8px;
+      font-family: var(--font-mono);
+      outline: none;
+    }
+    .need-input-widget .ni-input:focus {
+      border-color: var(--purple);
+    }
+    .need-input-widget .ni-send {
+      background: var(--purple);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 5px 14px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      white-space: nowrap;
+    }
+    .need-input-widget .ni-send:hover { filter: brightness(1.15); }
+    .need-input-widget.answered {
+      background: rgba(139,92,246,0.03);
+      border-left-color: var(--green-dim);
+    }
+    .need-input-widget.answered .ni-label { color: var(--green-dim); }
+
+    /* ── EMPTY STATE ──────────────────────────── */
+    .empty-state {
+      margin: auto;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      opacity: 0.7;
+      line-height: 2;
+    }
+
+    .empty-state::before {
+      content: "MIRA v2.0 — ready\A──────────────────\A type a command to begin";
+      white-space: pre;
+      display: block;
+    }
+
+    /* ── FILE BROWSER ─────────────────────────── */
+    .file-browser {
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .file-browser-toggle {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      color: var(--text-dim);
+      transition: border-color 0.15s, color 0.15s;
+      letter-spacing: 0.05em;
+    }
+
+    .file-browser-toggle:hover {
+      border-color: var(--green-dim);
+      color: var(--green);
+      background: var(--bg-panel);
+      transform: none;
+    }
+
+    .file-browser-toggle::before {
+      content: "📁 ";
+    }
+
+    .file-browser-content {
+      display: none;
+      position: absolute;
+      bottom: 44px;
+      left: 0;
+      right: 0;
+      max-height: 280px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-bright);
+      border-radius: 4px;
+      box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.6);
+      overflow: hidden;
+      z-index: 100;
+    }
+
+    .file-browser-content.show {
+      display: block;
+      animation: slideUp 0.18s ease-out;
+    }
+
+    @keyframes slideUp {
+      from {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .file-browser-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--green);
+    }
+
+    .file-list {
+      max-height: 220px;
+      overflow-y: auto;
+      padding: 6px;
+    }
+
+    .file-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      margin-bottom: 4px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      transition: border-color 0.15s;
+      flex-wrap: wrap;
+    }
+
+    .file-item:hover {
+      border-color: var(--green-dim);
+      transform: none;
+    }
+
+    .file-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .file-name {
+      font-size: 0.75rem;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+      font-family: var(--font-mono);
+    }
+
+    .file-meta {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+    }
+
+    .file-actions {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .file-btn {
+      padding: 4px 10px;
+      font-size: 0.68rem;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      white-space: nowrap;
+      min-width: 60px;
+      text-align: center;
+      background: var(--bg-panel);
+      color: var(--text-dim);
+      transition: border-color 0.15s, color 0.15s;
+    }
+
+    .file-btn:hover {
+      transform: none;
+      box-shadow: none;
+    }
+
+    .file-btn.insert {
+      border-color: var(--green-dim);
+      color: var(--green);
+    }
+
+    .file-btn.insert:hover {
+      background: var(--green-faint);
+    }
+
+    .file-btn.download {
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+
+    .file-btn.download:hover {
+      background: rgba(34, 211, 238, 0.08);
+    }
+
+    .file-btn.delete {
+      border-color: var(--red);
+      color: var(--red);
+    }
+
+    .file-btn.delete:hover {
+      background: rgba(248, 113, 113, 0.08);
+    }
+
+    /* ── INPUT ROW ─────────────────────────────── */
+    .input-container {
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+      flex-shrink: 0;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      transition: border-color 0.15s;
+    }
+
+    .input-container:focus-within {
+      border-color: var(--green-dim);
+    }
+
+    /* terminal prompt prefix */
+    .input-prompt {
+      color: var(--green);
+      font-size: 0.9rem;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      flex-shrink: 0;
+      padding-bottom: 2px;
+      user-select: none;
+      line-height: 1.5;
+      align-self: flex-end;
+      margin-bottom: 2px;
+    }
+
+    #input {
+      flex: 1;
+      padding: 0;
+      background: transparent;
+      color: var(--yellow);
+      border: none;
+      outline: none;
+      font-size: 0.85rem;
+      font-family: var(--font-mono);
+      resize: none;
+      overflow-y: auto;
+      min-height: 24px;
+      max-height: calc(1.5em * 8 + 24px);
+      line-height: 1.5em;
+      min-width: 0;
+      caret-color: var(--green);
+    }
+
+    #input::placeholder {
+      color: var(--text-muted);
+      font-style: italic;
+    }
+
+    /* ── BUTTONS ──────────────────────────────── */
+    button {
+      padding: 7px 14px;
+      background-color: var(--bg-panel);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      white-space: nowrap;
+      min-width: 40px;
+      min-height: 36px;
+      letter-spacing: 0.05em;
+    }
+
+    button:hover {
+      border-color: var(--green-dim);
+      color: var(--green);
+      background: var(--bg-panel);
+    }
+
+    button:active {
+      transform: scale(0.97);
+    }
+
+    /* Send button */
+    #sendBtn {
+      background: var(--green-faint);
+      border-color: var(--green-dim);
+      color: var(--green);
+      font-weight: 700;
+    }
+
+    #sendBtn:hover {
+      background: rgba(74, 222, 128, 0.14);
+      border-color: var(--green);
+    }
+
+    /* Voice buttons */
+    .voice-btn {
+      font-size: 1rem;
+      padding: 6px 8px;
+      background: var(--bg-panel);
+      min-width: 36px;
+      min-height: 36px;
+    }
+
+    .voice-btn.recording {
+      background: rgba(248, 113, 113, 0.15);
+      border-color: var(--red);
+      color: var(--red);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
+      }
+
+      50% {
+        box-shadow: 0 0 0 4px rgba(248, 113, 113, 0.25);
+      }
+    }
+
+    /* Voice status */
+    .controls {
+      flex-shrink: 0;
+    }
+
+    #voiceStatus {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      display: block;
+      min-height: 14px;
+      padding: 2px 0;
+    }
+
+    /* ── CLEAR HISTORY (sidebar) ─────────────── */
+    #clearHistoryBtn {
+      width: 100%;
+      margin-top: 20px;
+      background: rgba(248, 113, 113, 0.08);
+      border: 1px solid var(--red);
+      color: var(--red);
+      padding: 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      transition: background 0.15s;
+    }
+
+    #clearHistoryBtn:hover {
+      background: rgba(248, 113, 113, 0.16);
+    }
+
+    /* ── RESPONSIVE ───────────────────────────── */
+    @media (max-width: 768px) {
+      .sidebar {
+        width: 260px;
+        left: -260px;
+      }
+
+      .container {
+        padding: 6px 8px;
+      }
+
+      .message-content {
+        font-size: 0.8rem;
+      }
+
+      #input {
+        font-size: 15px;
+      }
+
+      .model-switcher {
+        right: 52px;
+      }
+
+      .file-item {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .file-actions {
+        width: 100%;
+        justify-content: stretch;
+      }
+
+      .file-btn {
+        flex: 1;
+        min-width: 0;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .file-actions {
+        flex-direction: column;
+      }
+
+      .file-btn {
+        width: 100%;
+      }
+    }
+
+    /* notification toast */
+    .term-notification {
+      position: fixed;
+      bottom: 90px;
+      right: 16px;
+      background: var(--bg-panel);
+      border: 1px solid var(--green-dim);
+      color: var(--green);
+      padding: 10px 16px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      z-index: 10000;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      animation: slideIn 0.2s ease-out;
+    }
+
+    .term-notification.error {
+      border-color: var(--red);
+      color: var(--red);
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateX(10px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+  </style>
+
+  <style>
+    /* ── TASKS PANEL (right-side drawer) ─────────────────────────────── */
+    .tasks-panel {
+      position: fixed;
+      right: -340px;
+      top: 0;
+      width: 320px;
+      height: 100%;
+      background-color: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      z-index: 1000;
+      transition: right 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      padding: 16px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .tasks-panel.open {
+      right: 0;
+    }
+
+    .tasks-panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 38px;
+      margin-bottom: 14px;
+    }
+
+    .tasks-panel-header h2 {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--green);
+      margin: 0;
+      border: none;
+      padding: 0;
+    }
+
+    .tasks-panel-header button {
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color: var(--green);
+      font-size: 1rem;
+      padding: 0 4px;
+      min-width: unset;
+      min-height: unset;
+      line-height: 1;
+    }
+
+    /* ── TASK LIST ITEMS ──────────────────────────────────────────────── */
+    .task-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 9px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+
+    .task-item:hover {
+      border-color: var(--green-dim);
+    }
+
+    .task-status-icon {
+      flex-shrink: 0;
+      font-size: 0.78rem;
+      margin-top: 1px;
+      width: 14px;
+      text-align: center;
+    }
+
+    .task-status-icon.running {
+      color: var(--yellow);
+    }
+
+    .task-status-icon.completed {
+      color: var(--green);
+    }
+
+    .task-status-icon.failed {
+      color: var(--red);
+    }
+
+    .task-status-icon.pending {
+      color: var(--text-dim);
+    }
+
+    .task-body {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .task-text {
+      font-size: 0.71rem;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: block;
+      margin-bottom: 3px;
+    }
+
+    .task-meta {
+      font-size: 0.61rem;
+      color: var(--text-dim);
+      display: block;
+    }
+
+    .task-del-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted, #555);
+      cursor: pointer;
+      padding: 2px 5px;
+      font-size: 0.72rem;
+      min-width: unset;
+      min-height: unset;
+      line-height: 1;
+      border-radius: 3px;
+      flex-shrink: 0;
+      opacity: 0;
+      transition: opacity 0.1s, color 0.1s;
+    }
+
+    .task-item:hover .task-del-btn {
+      opacity: 1;
+    }
+
+    .task-del-btn:hover {
+      color: var(--red);
+      background: transparent;
+    }
+
+    /* ── WHATSAPP BUTTON + MODAL ─────────────────────────────────────── */
+    .wa-toggle-wrap {
+      position: absolute;
+      top: 10px;
+      right: 370px;
+      z-index: 10;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .wa-toggle-btn {
+      padding: 5px 9px;
+      font-size: 0.72rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-dim);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      transition: border-color 0.15s, color 0.15s;
+      min-width: unset;
+      min-height: unset;
+      line-height: 1.4;
+    }
+
+    .wa-toggle-btn:hover,
+    .wa-toggle-btn.wa-active {
+      border-color: #25d366;
+      color: #25d366;
+    }
+
+    .wa-dot {
+      position: absolute;
+      top: -4px;
+      right: -4px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      display: none;
+    }
+
+    .wa-dot.connected {
+      background: #25d366;
+      display: block;
+    }
+
+    .wa-dot.qr {
+      background: var(--yellow);
+      display: block;
+    }
+
+    /* Modal overlay */
+    .wa-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      z-index: 300;
+      display: none;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .wa-overlay.open {
+      display: flex;
+    }
+
+    .wa-modal {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-bright);
+      border-radius: 10px;
+      padding: 24px 28px;
+      width: 320px;
+      font-family: var(--font-mono);
+      color: var(--text);
+      position: relative;
+    }
+
+    .wa-modal-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #25d366;
+      margin-bottom: 4px;
+    }
+
+    .wa-modal-subtitle {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+
+    .wa-close {
+      position: absolute;
+      top: 12px;
+      right: 14px;
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      cursor: pointer;
+      font-size: 1rem;
+      font-family: var(--font-mono);
+    }
+
+    .wa-close:hover {
+      color: var(--red);
+    }
+
+    .wa-status-line {
+      font-size: 0.72rem;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      margin-bottom: 14px;
+    }
+
+    #waQrImg {
+      width: 100%;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      display: none;
+    }
+
+    .wa-connected-box {
+      display: none;
+      font-size: 0.75rem;
+      color: #25d366;
+      padding: 8px 10px;
+      border: 1px solid #25d36633;
+      border-radius: 6px;
+      text-align: center;
+      line-height: 1.7;
+    }
+
+    .wa-hint {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      margin-top: 12px;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    /* Chat mode — wider modal */
+    .wa-modal.wa-chat-mode {
+      width: 440px;
+    }
+
+    /* Conversation area */
+    .wa-conv-area {
+      display: none;
+      margin-top: 10px;
+    }
+
+    .wa-msg-list {
+      height: 240px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      scrollbar-width: thin;
+      background: var(--bg);
+    }
+
+    .wa-msg-list::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .wa-msg-list::-webkit-scrollbar-thumb {
+      background: var(--border-bright);
+      border-radius: 2px;
+    }
+
+    .wa-bubble {
+      max-width: 82%;
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 0.72rem;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .wa-bubble.user {
+      align-self: flex-start;
+      background: #1a2a1f;
+      border: 1px solid #25d36633;
+      color: var(--text);
+    }
+
+    .wa-bubble.agent {
+      align-self: flex-end;
+      background: #1f1f2a;
+      border: 1px solid var(--border-bright);
+      color: var(--purple);
+    }
+
+    .wa-bubble-meta {
+      font-size: 0.58rem;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+
+    .wa-empty-conv {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.68rem;
+      color: var(--text-muted);
+    }
+
+    /* Send form */
+    .wa-send-form {
+      margin-top: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .wa-send-row {
+      display: flex;
+      gap: 6px;
+    }
+
+    .wa-input {
+      flex: 1;
+      padding: 6px 8px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.71rem;
+      outline: none;
+      resize: none;
+    }
+
+    .wa-input:focus {
+      border-color: #25d36688;
+    }
+
+    .wa-input::placeholder {
+      color: var(--text-muted);
+    }
+
+    .wa-send-btn {
+      padding: 6px 12px;
+      background: #25d366;
+      border: none;
+      border-radius: 4px;
+      color: #000;
+      font-family: var(--font-mono);
+      font-size: 0.71rem;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+      align-self: flex-end;
+    }
+
+    .wa-send-btn:hover {
+      background: #22c55e;
+    }
+
+    .wa-send-btn:active {
+      background: #16a34a;
+    }
+
+    /* ── TASKS TOGGLE BUTTON (toolbar) ───────────────────────────────── */
+    .tasks-toggle-wrap {
+      position: absolute;
+      top: 10px;
+      right: 265px;
+      z-index: 10;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .tasks-toggle-btn {
+      padding: 5px 9px;
+      font-size: 0.72rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-dim);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      transition: border-color 0.15s, color 0.15s;
+      min-width: unset;
+      min-height: unset;
+      line-height: 1.4;
+    }
+
+    .tasks-toggle-btn:hover {
+      border-color: var(--green-dim);
+      color: var(--green);
+    }
+
+    .task-badge {
+      position: absolute;
+      top: -5px;
+      right: -5px;
+      background: var(--green);
+      color: var(--bg);
+      font-size: 0.52rem;
+      font-weight: 700;
+      border-radius: 50%;
+      width: 14px;
+      height: 14px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+    }
+
+    /* ── TASK STATUS INDICATORS IN DETAIL VIEW ───────────────────────── */
+    .task-running-band {
+      font-size: 0.71rem;
+      color: var(--yellow);
+      margin-top: 8px;
+      padding: 6px 10px;
+      border: 1px solid rgba(253, 224, 71, 0.3);
+      border-radius: 4px;
+      font-family: var(--font-mono);
+    }
+
+    .task-detail-back {
+      font-size: 0.63rem;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+      cursor: pointer;
+      font-family: var(--font-mono);
+      padding: 4px 0;
+      transition: color 0.15s;
+    }
+
+    .task-detail-back:hover {
+      color: var(--green);
+    }
+  </style>
+</head>
+
+<body data-mira-api-key="{{ mira_api_key }}">
+  <!-- Sidebar for Capabilities -->
+  <div id="sidebarOverlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
+  <button class="sidebar-toggle" onclick="toggleSidebar()">⌥</button>
+
+  <!-- Tasks history right-side drawer -->
+  <div id="tasksPanelOverlay" class="sidebar-overlay" onclick="toggleTasksPanel()"></div>
+  <div id="tasksPanel" class="tasks-panel">
+    <div class="tasks-panel-header">
+      <h2>Task History</h2>
+      <button onclick="loadTasks()" title="Refresh">↺</button>
+    </div>
+    <div id="tasksList">
+      <div style="text-align:center;padding:20px;color:var(--text-dim);font-size:0.71rem;">Loading...</div>
+    </div>
+  </div>
+
+  <div id="sidebar" class="sidebar">
+    <h2>MIRA Capabilities</h2>
+
+    <div class="capability-item">
+      <strong>search.web</strong>
+      <span>DuckDuckGo search + real-time news updates.</span>
+    </div>
+    <div class="capability-item">
+      <strong>web.read</strong>
+      <span>Fetch any URL, extract clean article text.</span>
+    </div>
+    <div class="capability-item">
+      <strong>email.*</strong>
+      <span>Send & receive via IMAP/SMTP (Gmail supported).</span>
+    </div>
+    <div class="capability-item">
+      <strong>todo.*</strong>
+      <span>Tasks with priorities + due dates (SQLite).</span>
+    </div>
+    <div class="capability-item">
+      <strong>contacts.*</strong>
+      <span>CRM: name, email, company. Search & email.</span>
+    </div>
+    <div class="capability-item">
+      <strong>knowledge.*</strong>
+      <span>RAG: ingest docs, semantic search (ChromaDB).</span>
+    </div>
+    <div class="capability-item">
+      <strong>calendar.*</strong>
+      <span>Events, reminders, autonomous scheduler.</span>
+    </div>
+    <div class="capability-item">
+      <strong>plugin.*</strong>
+      <span>Drop a folder → new tools. Hot-reloaded.</span>
+    </div>
+    <div class="capability-item">
+      <strong>system.shell</strong>
+      <span>Whitelisted PowerShell in SANDBOX only.</span>
+    </div>
+    <div class="capability-item">
+      <strong>think</strong>
+      <span>Sub-agent: reason over fetched data without bloating context.</span>
+    </div>
+
+    <button id="clearHistoryBtn" onclick="resetSession()">⌧ Clear Session</button>
+  </div>
+
+  <div class="container">
+    <button id="sidebarToggle" onclick="toggleSidebar()">☰</button>
+    <div class="model-switcher">
+      <span class="model-icon">⚡</span>
+      <select id="modelSelect" onchange="switchModel()">
+        <option value="qwen2.5:3b">Fast Qwen2.5 3b</option>
+        <option value="qwen3:4b-instruct">qwen3:4b-instruct 🧠</option>
+        <option value="qwen3.5:4b">qwen3.5:4b 🧠 (32k)</option>
+        <option value="groq:llama-3.3-70b-versatile">Cloud (Llama 70B)</option>
+        <option value="groq:qwen/qwen3-32b">Cloud (Qwen3 32B)</option>
+        <option value="gemini:gemini-2.5-flash-lite">Gemini (2.5 Flash-Lite) 🚀</option>
+        <option value="gemini:gemini-2.5-flash">Gemini (2.5 Flash)</option>
+        <option value="gemini:gemma-3-12b-it">Gemma 3 (12B)</option>
+        <option value="gemini:gemma-3-27b-it">Gemma 3 (27B)</option>
+        <option value="cerebras:llama-3.3-70b">Cerebras (Llama 70B) ⚡</option>
+        <option value="sambanova:Meta-Llama-3.3-70B-Instruct">SambaNova (Llama 70B)</option>
+        <option value="openrouter:meta-llama/llama-3.3-70b-instruct:free">OpenRouter (Free Llama 70B)</option>
+      </select>
+    </div>
+    <button class="theme-toggle" onclick="toggleTheme()">◑</button>
+    <!-- WhatsApp connect button -->
+    <div class="wa-toggle-wrap">
+      <button class="wa-toggle-btn" id="waToggleBtn" onclick="toggleWAModal()" title="WhatsApp">⬡ WhatsApp</button>
+      <span class="wa-dot" id="waDot"></span>
+    </div>
+
+    <!-- WhatsApp QR Modal -->
+    <div class="wa-overlay" id="waOverlay" onclick="if(event.target===this)toggleWAModal()">
+      <div class="wa-modal" id="waModal">
+        <button class="wa-close" onclick="toggleWAModal()">✕</button>
+        <div class="wa-modal-title">WhatsApp</div>
+        <div class="wa-modal-subtitle">
+          Link MIRA as a WhatsApp companion device.<br>
+          Messages you receive will be answered by the agent.
+        </div>
+        <div class="wa-status-line" id="waStatusLine" style="color:var(--text-dim);">Checking bridge...</div>
+        <img id="waQrImg" src="" alt="QR Code" />
+        <div class="wa-connected-box" id="waConnectedBox"></div>
+
+        <!-- Conversation view (shown when connected) -->
+        <div class="wa-conv-area" id="waConvArea">
+          <div class="wa-msg-list" id="waMsgList">
+            <div class="wa-empty-conv" id="waEmptyConv">No messages yet — send a WhatsApp message to start</div>
+          </div>
+          <!-- Send form -->
+          <div class="wa-send-form">
+            <div class="wa-send-row">
+              <input class="wa-input" id="waRecipient" type="text"
+                placeholder="Phone with country code (e.g. 919876543210)" />
+            </div>
+            <div class="wa-send-row">
+              <textarea class="wa-input" id="waTextInput" rows="2" placeholder="Type a message..."
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendWAMessage()}"></textarea>
+              <button class="wa-send-btn" onclick="sendWAMessage()">Send ↑</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="wa-hint" id="waHint"></div>
+      </div>
+    </div>
+
+    <!-- Tasks history panel toggle -->
+    <div class="tasks-toggle-wrap">
+      <button class="tasks-toggle-btn" onclick="toggleTasksPanel()" title="Task History">☰ Tasks</button>
+      <span class="task-badge" id="tasksBadge"></span>
+    </div>
+    <div id="status">Connecting...</div>
+
+    <!-- Chat Messages -->
+    <div id="chatContainer">
+      <div class="empty-state"></div>
+    </div>
+
+    <!-- File Browser -->
+    <div id="fileBrowser" class="file-browser">
+      <button class="file-browser-toggle" onclick="toggleFileBrowser()">Files</button>
+      <div id="fileBrowserContent" class="file-browser-content">
+        <div class="file-browser-header">
+          <span>SANDBOX Files</span>
+          <button onclick="refreshFiles()"
+            style="background:transparent;border:none;cursor:pointer;color:var(--green);font-size:0.85rem;padding:0 4px;">↺</button>
+        </div>
+        <div id="fileList" class="file-list">
+          <div style="text-align:center;padding:20px;color:#6b7280;font-size:0.72rem;">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="input-container">
+      <button id="voiceInputBtn" class="voice-btn" onclick="toggleVoiceInput()" title="Voice Input">🎤</button>
+      <span class="input-prompt">&gt;</span>
+      <textarea id="input" placeholder="enter command... (Shift+Enter to send)" onkeydown="handleInputKeydown(event)"
+        oninput="autoResize(this)"></textarea>
+      <button id="sendBtn" onclick="handleSendStop()">Send</button>
+      <button id="voiceOutputBtn" class="voice-btn" onclick="toggleVoiceOutput()" title="Voice Output">🔊</button>
+    </div>
+    <div class="controls">
+      <small id="voiceStatus"></small>
+    </div>
+  </div>
+
+  <script>
+    // Theme handling
+    function toggleTheme() {
+      const currentTheme = document.documentElement.getAttribute('data-theme');
+      const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', newTheme);
+      localStorage.setItem('theme', newTheme);
+    }
+
+    function loadTheme() {
+      const savedTheme = localStorage.getItem('theme') || 'light';
+      document.documentElement.setAttribute('data-theme', savedTheme);
+    }
+
+    // Sidebar handling
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar');
+      const overlay = document.getElementById('sidebarOverlay');
+      sidebar.classList.toggle('open');
+      overlay.classList.toggle('visible');
+    }
+
+    // Voice settings
+    let voiceOutputEnabled = localStorage.getItem('voiceOutput') === 'true';
+    let isRecording = false;
+    let recognition = null;
+    let synthesis = window.speechSynthesis;
+
+    // Initialize Web Speech API
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        isRecording = true;
+        document.getElementById('voiceInputBtn').classList.add('recording');
+        setVoiceStatus('🎤 Listening...');
+      };
+
+      recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        document.getElementById('input').value = transcript;
+        setVoiceStatus('Recognized: ' + transcript);
+        // Auto-send
+        setTimeout(() => sendMsg(), 500);
+      };
+
+      recognition.onerror = (event) => {
+        setVoiceStatus('❌ Error: ' + event.error);
+        stopRecording();
+      };
+
+      recognition.onend = () => {
+        stopRecording();
+      };
+    }
+
+    function toggleVoiceInput() {
+      if (!recognition) {
+        alert('Speech recognition not supported in this browser');
+        return;
+      }
+
+      if (isRecording) {
+        recognition.stop();
+      } else {
+        recognition.start();
+      }
+    }
+
+    function stopRecording() {
+      isRecording = false;
+      document.getElementById('voiceInputBtn').classList.remove('recording');
+      if (document.getElementById('voiceStatus').textContent.includes('Listening')) {
+        setVoiceStatus('');
+      }
+    }
+
+    function toggleVoiceOutput() {
+      voiceOutputEnabled = !voiceOutputEnabled;
+      localStorage.setItem('voiceOutput', voiceOutputEnabled);
+      document.getElementById('voiceOutputBtn').textContent = voiceOutputEnabled ? '🔊' : '🔇';
+      setVoiceStatus(voiceOutputEnabled ? '🔊 Voice output enabled' : '🔇 Voice output disabled');
+      setTimeout(() => setVoiceStatus(''), 2000);
+    }
+
+    function updateVoiceButtonStates() {
+      document.getElementById('voiceOutputBtn').textContent = voiceOutputEnabled ? '🔊' : '🔇';
+    }
+
+    function speak(text) {
+      if (!voiceOutputEnabled || !synthesis) return;
+
+      // Cancel any ongoing speech
+      synthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+
+      synthesis.speak(utterance);
+    }
+
+    function setVoiceStatus(text) {
+      document.getElementById('voiceStatus').textContent = text;
+    }
+
+    // HTTP API handling (replaces WebSocket for ngrok compatibility)
+    let isConnected = false;
+    let isProcessing = false;
+    let currentAbortController = null;
+
+    // ── API Key: automatically inject X-API-Key header for all /api/* requests ──
+    // Key is passed from server via data-mira-api-key attribute and saved to localStorage.
+    (function() {
+      const serverKey = document.body.dataset.miraApiKey || '';
+      if (serverKey) {
+        localStorage.setItem('miraApiKey', serverKey);
+      }
+    })();
+    function miraSetApiKey(key) {
+      localStorage.setItem('miraApiKey', key);
+      console.log('[MIRA] API key saved. Reload the page to activate.');
+    }
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = (url, opts = {}) => {
+      const key = localStorage.getItem('miraApiKey') || '';
+      if (key && typeof url === 'string' && url.startsWith('/api/')) {
+        opts = { ...opts, headers: { 'X-API-Key': key, ...(opts.headers || {}) } };
+      }
+      return _origFetch(url, opts);
+    };
+    // ────────────────────────────────────────────────────────────────────────────
+
+    async function checkConnection() {
+      try {
+        // Test connection by sending a simple ping
+        const response = await fetch('/api/invoke', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'ping' })
+        });
+
+        const data = await response.json();
+        if (response.ok && data.status !== "error") {
+          isConnected = true;
+          document.getElementById('status').textContent = 'Connected';
+        } else {
+          isConnected = false;
+          document.getElementById('status').textContent = 'Connection error: ' + (data.error || 'Check MCP Server');
+        }
+      } catch (e) {
+        isConnected = false;
+        document.getElementById('status').textContent = 'Connection failed: Server offline';
+      }
+    }
+
+    // Model selection state
+    let currentModel = localStorage.getItem('aiModel') || 'qwen2.5:3b';
+
+    function switchModel() {
+      const select = document.getElementById('modelSelect');
+      currentModel = select.value;
+      localStorage.setItem('aiModel', currentModel);
+
+      // Update icon based on model
+      const icon = document.querySelector('.model-icon');
+      if (currentModel === 'qwen2.5:3b') {
+        icon.textContent = '⚡'; // Fast local
+      } else if (currentModel.startsWith('groq:')) {
+        icon.textContent = '⚡☁️'; // Cloud ultra-fast
+      } else {
+        icon.textContent = '🧠'; // Thinking local
+      }
+
+      document.getElementById('status').textContent = `Switched to ${select.options[select.selectedIndex].text} mode`;
+      setTimeout(() => checkConnection(), 1000);
+    }
+
+    // Initialize model selection on load
+    window.addEventListener('DOMContentLoaded', () => {
+      const select = document.getElementById('modelSelect');
+      select.value = currentModel;
+      switchModel(); // Update icon
+    });
+
+    async function resetSession() {
+      try {
+        document.getElementById('status').textContent = 'Resetting...';
+        const response = await fetch('/api/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: activeSessionId })
+        });
+        if (response.ok) {
+          // Clear chat container
+          const chatContainer = document.getElementById('chatContainer');
+          chatContainer.innerHTML = '<div class="empty-state"></div>';
+          document.getElementById('status').textContent = 'Connected';
+          // Clear stored session so a fresh one is created on next message
+          activeSessionId = null;
+          localStorage.removeItem('miraSessionId');
+          // If sidebar is open, close it
+          const sidebar = document.getElementById('sidebar');
+          if (sidebar.classList.contains('open')) toggleSidebar();
+        }
+      } catch (e) {
+        console.error("Reset failed", e);
+      }
+    }
+
+    function addMessage(sender, text) {
+      const chatContainer = document.getElementById('chatContainer');
+
+      // Remove empty state if present
+      const emptyState = chatContainer.querySelector('.empty-state');
+      if (emptyState) {
+        emptyState.remove();
+      }
+
+      // Create message bubble
+      const messageDiv = document.createElement('div');
+      messageDiv.className = `message ${sender}`;
+
+      const icon = document.createElement('div');
+      icon.className = 'message-icon';
+      icon.textContent = sender === 'user' ? '👤' : '🤖';
+
+      const content = document.createElement('div');
+      content.className = 'message-content';
+
+      // Safety: Escape HTML first to prevent XSS
+      let safeText = text.replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+
+      // Convert URLs and markdown links to clickable links
+      let processedText = safeText;
+
+      // 1. Separate Markdown links to protect them from bare URL processing
+      const markdownLinks = [];
+      processedText = processedText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (match, linkText, url) => {
+        const placeholder = `__MD_LINK_${markdownLinks.length}__`;
+        markdownLinks.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${linkText}</a>`);
+        return placeholder;
+      });
+
+      // 2. Handle bare URLs (http://, https://)
+      processedText = processedText.replace(
+        /(https?:\/\/[^\s<]+)/g,
+        '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+      );
+
+      // 3. Put back protected Markdown links
+      markdownLinks.forEach((htmlLink, i) => {
+        processedText = processedText.replace(`__MD_LINK_${i}__`, htmlLink);
+      });
+
+      // 4. Preserve line breaks
+      processedText = processedText.replace(/\n/g, '<br>');
+
+      // Use innerHTML safely now that we've escaped and controlled the link injection
+      content.innerHTML = processedText;
+
+      messageDiv.appendChild(icon);
+      messageDiv.appendChild(content);
+      chatContainer.appendChild(messageDiv);
+
+      // Auto-scroll to bottom
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    // ── Meta commands ────────────────────────────────────────────────────
+    const META_COMMANDS = {
+      '/miraclr':   { desc: 'Clear session context and start fresh', handler: async () => { await resetSession(); addMessage('mira', '🧹 Session cleared. Starting fresh!'); } },
+      '/mirastop':  { desc: 'Stop the current running task',         handler: async () => { await stopExecution(); addMessage('mira', '⏹ Task stopped.'); } },
+      '/mirahelp':  { desc: 'Show available slash commands',         handler: () => {
+        const lines = Object.entries(META_COMMANDS).map(([cmd, m]) => `<b>${cmd}</b> — ${m.desc}`).join('<br>');
+        addMessage('mira', '📋 Available commands:<br>' + lines);
+      }},
+      '/miramodel': { desc: 'Show current model',                    handler: () => { const m = document.getElementById('modelSelect')?.value || 'unknown'; addMessage('mira', `🤖 Current model: <b>${m}</b>`); } },
+    };
+
+    async function sendMsg() {
+      const input = document.getElementById('input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      // ── Check for meta command ──
+      const cmdKey = text.split(/\s+/)[0].toLowerCase();
+      if (META_COMMANDS[cmdKey]) {
+        input.value = '';
+        autoResize(input);
+        addMessage('user', text);
+        await META_COMMANDS[cmdKey].handler();
+        return;
+      }
+
+      // Add user message
+      addMessage('user', text);
+      input.value = '';
+      autoResize(input); // Reset textarea height after sending
+
+      await sendRequest(text);
+    }
+
+    // Toggle send button between Send and Stop states
+    function toggleSendButton(processing) {
+      isProcessing = processing;
+      const btn = document.getElementById('sendBtn');
+      if (processing) {
+        btn.textContent = 'Stop';
+        btn.style.backgroundColor = 'rgba(248,113,113,0.15)';
+        btn.style.color = 'var(--red)';
+        btn.style.borderColor = 'var(--red)';
+      } else {
+        btn.textContent = 'Send';
+        btn.style.backgroundColor = '';
+        btn.style.color = '';
+        btn.style.borderColor = '';
+      }
+    }
+
+    // Handler for the combined Send/Stop button
+    function handleSendStop() {
+      if (isProcessing) {
+        stopExecution();
+      } else {
+        sendMsg();
+      }
+    }
+
+    // Stop the current execution
+    async function stopExecution() {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+
+      // Signal backend to stop the agent loop (target by task_id for deterministic abort)
+      try {
+        const abortBody = {};
+        if (activeTaskId !== null) abortBody.task_id = activeTaskId;
+        if (activeRunId)           abortBody.run_id  = activeRunId;
+        if (activeSessionId)       abortBody.session_id = activeSessionId;
+        await fetch('/api/abort', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(abortBody)
+        });
+      } catch (e) {
+        console.error("Failed to signal backend abort", e);
+      }
+
+      addMessage('mira', '⏹️ Execution stopped by user.');
+      toggleSendButton(false);
+    }
+
+    function createStreamingMessage() {
+      const chatContainer = document.getElementById('chatContainer');
+      const emptyState = chatContainer.querySelector('.empty-state');
+      if (emptyState) emptyState.remove();
+
+      const messageDiv = document.createElement('div');
+      messageDiv.className = 'message mira';
+
+      const icon = document.createElement('div');
+      icon.className = 'message-icon';
+      icon.textContent = '🤖';
+
+      const content = document.createElement('div');
+      content.className = 'message-content';
+
+      const stepsContainer = document.createElement('div');
+      stepsContainer.className = 'stream-steps';
+      content.appendChild(stepsContainer);
+
+      const finalDiv = document.createElement('div');
+      finalDiv.className = 'stream-final';
+      finalDiv.style.display = 'none';
+      content.appendChild(finalDiv);
+
+      messageDiv.appendChild(icon);
+      messageDiv.appendChild(content);
+      chatContainer.appendChild(messageDiv);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      return { stepsContainer, finalDiv, messageDiv };
+    }
+
+    function addStreamStep(container, type, content) {
+      const step = document.createElement('div');
+      step.className = 'stream-step ' + type;
+
+      if (type === 'thought') {
+        step.innerHTML = '💭 ' + escapeHtml(content);
+      } else if (type === 'tool-call') {
+        step.innerHTML = '<span class="spinner"></span>Using <strong>' + escapeHtml(content.tool) + '</strong>...';
+        step.dataset.tool = content.tool;
+      } else if (type === 'tool-result') {
+        const resultText = typeof content.result === 'string' ? content.result : JSON.stringify(content.result);
+        const truncated = resultText.length > 120 ? resultText.substring(0, 120) + '...' : resultText;
+        const statusIcon = content.status === 'error' ? '' : '';
+        step.innerHTML = escapeHtml(content.tool) + ': ' + escapeHtml(truncated);
+        if (content.status === 'error') step.classList.add('error');
+        if (resultText.length > 120) {
+          step.title = 'Click to expand';
+          step.dataset.fullText = resultText;
+          step.onclick = () => {
+            if (step.classList.contains('expanded')) {
+              step.classList.remove('expanded');
+              step.innerHTML = escapeHtml(content.tool) + ': ' + escapeHtml(truncated);
+            } else {
+              step.classList.add('expanded');
+              step.innerHTML = escapeHtml(content.tool) + ': ' + escapeHtml(resultText);
+            }
+          };
+        }
+      }
+
+      container.appendChild(step);
+
+      // Remove spinner from previous tool-call step if this is a result
+      if (type === 'tool-result') {
+        const toolCalls = container.querySelectorAll('.stream-step.tool-call');
+        toolCalls.forEach(tc => {
+          const spinner = tc.querySelector('.spinner');
+          if (spinner) spinner.remove();
+        });
+      }
+
+      // Auto-scroll
+      const chatContainer = document.getElementById('chatContainer');
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function sendRequest(text, isWorkflowContinuation = false) {
+      currentAbortController = new AbortController();
+      toggleSendButton(true);
+
+      const { stepsContainer, finalDiv, messageDiv } = createStreamingMessage();
+
+      try {
+        const _apiKey = localStorage.getItem('miraApiKey') || '';
+        const _apiKeyParam = _apiKey ? `&api_key=${encodeURIComponent(_apiKey)}` : '';
+        const _sessionParam = activeSessionId ? `&session_id=${encodeURIComponent(activeSessionId)}` : '';
+        const url = `/api/stream?text=${encodeURIComponent(text)}&model=${encodeURIComponent(currentModel)}${_apiKeyParam}${_sessionParam}`;
+        const eventSource = new EventSource(url);
+        let finalText = '';
+
+        await new Promise((resolve, reject) => {
+          // Handle abort
+          currentAbortController.signal.addEventListener('abort', () => {
+            eventSource.close();
+            resolve();
+          });
+
+          eventSource.onmessage = (e) => {
+            try {
+              const event = JSON.parse(e.data);
+
+              switch (event.type) {
+                case 'task_created':
+                  activeTaskId = event.task_id;
+                  activeSessionId = event.session_id || activeSessionId;
+                  if (activeSessionId) localStorage.setItem('miraSessionId', activeSessionId);
+                  activeRunId = event.run_id || null;
+                  break;
+                case 'thought':
+                  addStreamStep(stepsContainer, 'thought', event.content);
+                  break;
+                case 'tool_call':
+                  addStreamStep(stepsContainer, 'tool-call', { tool: event.tool });
+                  break;
+                case 'tool_result':
+                  addStreamStep(stepsContainer, 'tool-result', {
+                    tool: event.tool,
+                    result: event.result,
+                    status: event.status
+                  });
+                  break;
+                case 'need_input': {
+                  // Agent is paused — show inline question + input widget
+                  const taskIdForNI = activeTaskId;
+                  const niWidget = document.createElement('div');
+                  niWidget.className = 'need-input-widget';
+                  niWidget.innerHTML = `
+                    <div class="ni-label">❓ Input needed (step ${event.step || ''})</div>
+                    <div class="ni-question">${event.question ? event.question.replace(/</g,'&lt;') : ''}</div>
+                    <div class="ni-row">
+                      <input class="ni-input" type="text" placeholder="Type your answer..." />
+                      <button class="ni-send">Send</button>
+                    </div>
+                  `;
+                  const niInput = niWidget.querySelector('.ni-input');
+                  const niBtn   = niWidget.querySelector('.ni-send');
+                  const submitNI = async () => {
+                    const val = niInput.value.trim();
+                    if (!val) return;
+                    niBtn.disabled = true;
+                    niInput.disabled = true;
+                    niWidget.classList.add('answered');
+                    niWidget.querySelector('.ni-label').textContent = '\u2714 Answered';
+                    niWidget.querySelector('.ni-row').innerHTML =
+                      `<span style="color:var(--text-muted);font-size:0.78rem">${val.replace(/</g,'&lt;')}</span>`;
+                    try {
+                      await fetch('/api/answer', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ task_id: taskIdForNI, answer: val })
+                      });
+                    } catch(e) { console.error('answer delivery failed:', e); }
+                  };
+                  niBtn.addEventListener('click', submitNI);
+                  niInput.addEventListener('keydown', e => { if (e.key === 'Enter') submitNI(); });
+                  stepsContainer.appendChild(niWidget);
+                  // Ensure steps are visible and scroll into view
+                  stepsContainer.style.display = 'flex';
+                  setTimeout(() => niInput.focus(), 50);
+                  break;
+                }
+                case 'final':
+                  finalText = event.content;
+                  break;
+                case 'iteration_limit':
+                case 'step_limit':
+                  finalText = '⚠ Step limit reached. ' + (event.content || '');
+                  break;
+                case 'aborted':
+                  finalText = '⊘ Aborted. ' + (event.content || '');
+                  break;
+                case 'error':
+                  finalText = '✗ Error: ' + event.content;
+                  break;
+                case 'done':
+                  eventSource.close();
+                  resolve();
+                  return;
+              }
+            } catch (parseErr) {
+              console.error('SSE parse error:', parseErr);
+            }
+          };
+
+          eventSource.onerror = (err) => {
+            console.error('SSE error:', err);
+            eventSource.close();
+            if (!finalText) finalText = 'Connection error — check if MCP server is running.';
+            resolve();
+          };
+        });
+
+        // Show final answer
+        if (finalText) {
+          // Process text same as addMessage
+          let safeText = finalText.replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+
+          let processedText = safeText;
+          const markdownLinks = [];
+          processedText = processedText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (match, linkText, url) => {
+            const placeholder = `__MD_LINK_${markdownLinks.length}__`;
+            markdownLinks.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${linkText}</a>`);
+            return placeholder;
+          });
+          processedText = processedText.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+          markdownLinks.forEach((htmlLink, i) => {
+            processedText = processedText.replace(`__MD_LINK_${i}__`, htmlLink);
+          });
+          processedText = processedText.replace(/\n/g, '<br>');
+
+          finalDiv.innerHTML = processedText;
+          finalDiv.style.display = 'block';
+        }
+
+        // Collapse steps if there's a final answer
+        if (finalText && stepsContainer.children.length > 0) {
+          const toggle = document.createElement('div');
+          toggle.style.cssText = 'font-size:0.65rem;color:var(--text-muted);cursor:pointer;margin-top:4px;font-family:var(--font-mono);';
+          toggle.textContent = `▸ ${stepsContainer.children.length} steps (click to toggle)`;
+          toggle.onclick = () => {
+            const isHidden = stepsContainer.style.display === 'none';
+            stepsContainer.style.display = isHidden ? 'flex' : 'none';
+            toggle.textContent = isHidden
+              ? `▾ ${stepsContainer.children.length} steps (click to toggle)`
+              : `▸ ${stepsContainer.children.length} steps (click to toggle)`;
+          };
+          // Insert toggle before final div
+          finalDiv.parentNode.insertBefore(toggle, finalDiv);
+        }
+
+        if (voiceOutputEnabled && finalText) speak(finalText);
+
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log('Request aborted by user.');
+        } else {
+          finalDiv.innerHTML = '✗ ERROR: ' + escapeHtml(e.toString());
+          finalDiv.style.display = 'block';
+        }
+      } finally {
+        toggleSendButton(false);
+        currentAbortController = null;
+        document.getElementById('chatContainer').scrollTop = document.getElementById('chatContainer').scrollHeight;
+      }
+    }
+
+    // Auto-resize textarea
+    function autoResize(textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight,
+        window.innerWidth <= 768 ? 7 * 1.5 * 16 + 24 : 8 * 1.5 * 16 + 20) + 'px';
+    }
+
+    // Handle Enter key (send) vs Shift+Enter (new line)
+    function handleInputKeydown(event) {
+      // Mobile-friendly: Enter creates new line, Shift+Enter sends
+      if (event.key === 'Enter' && event.shiftKey) {
+        event.preventDefault();
+        sendMsg();
+      }
+      // Regular Enter just creates new line (default textarea behavior)
+    }
+
+    // File Browser Functions
+    function toggleFileBrowser() {
+      const content = document.getElementById('fileBrowserContent');
+      content.classList.toggle('show');
+
+      // Refresh files when opening
+      if (content.classList.contains('show')) {
+        refreshFiles();
+      }
+    }
+
+    async function refreshFiles() {
+      const fileList = document.getElementById('fileList');
+      fileList.innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280;font-size:0.72rem;">Loading...</div>';
+
+      try {
+        const response = await fetch('/api/list-files');
+        const data = await response.json();
+
+        if (data.files && data.files.length > 0) {
+          fileList.innerHTML = data.files.map(file => `
+            <div class="file-item">
+              <div class="file-info">
+                <div class="file-name" title="${file}">${file}</div>
+              </div>
+              <div class="file-actions">
+                <button class="file-btn insert" onclick="insertFileContent('${file}')">Insert</button>
+                <button class="file-btn download" onclick="downloadFile('${file}')">Download</button>
+                <button class="file-btn delete" onclick="deleteFile('${file}')">Delete</button>
+              </div>
+            </div>
+          `).join('');
+        } else {
+          fileList.innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280;font-size:0.72rem;">No files found</div>';
+        }
+      } catch (error) {
+        console.error('Error loading files:', error);
+        fileList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--red);font-size:0.72rem;">Error loading files</div>';
+      }
+    }
+
+    async function insertFileContent(filename) {
+      try {
+        const response = await fetch('/api/read-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename })
+        });
+
+        const data = await response.json();
+
+        if (data.content) {
+          const input = document.getElementById('input');
+          const prefix = `[File: ${filename}]\n${data.content}\n\n`;
+          input.value = prefix + input.value;
+          autoResize(input);
+          input.focus();
+
+          // Show notification
+          showNotification(`✓ Inserted content from ${filename}`);
+        }
+      } catch (error) {
+        console.error('Error reading file:', error);
+        showNotification(`✗ Error reading ${filename}`, 'error');
+      }
+    }
+
+    async function deleteFile(filename) {
+      if (!confirm(`Delete ${filename}?`)) return;
+
+      try {
+        const response = await fetch('/api/delete-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename })
+        });
+
+        const data = await response.json();
+
+        if (data.status === 'success') {
+          showNotification(`✓ Deleted ${filename}`);
+          refreshFiles();
+        } else {
+          showNotification(`✗ Error: ${data.error}`, 'error');
+        }
+      } catch (error) {
+        console.error('Error deleting file:', error);
+        showNotification(`✗ Error deleting ${filename}`, 'error');
+      }
+    }
+
+    function downloadFile(filename) {
+      // Direct download link
+      window.location.href = `/api/download-file/${encodeURIComponent(filename)}`;
+      showNotification(`⬇ Downloading ${filename}`);
+    }
+
+    function showNotification(message, type = 'success') {
+      const notification = document.createElement('div');
+      notification.textContent = message;
+      notification.className = 'term-notification' + (type === 'error' ? ' error' : '');
+
+      document.body.appendChild(notification);
+
+      setTimeout(() => {
+        notification.style.opacity = '0';
+        notification.style.transition = 'opacity 0.25s';
+        setTimeout(() => notification.remove(), 280);
+      }, 2800);
+    }
+
+    // ── TASKS PANEL ────────────────────────────────────────────────────
+    let activeTaskId = null;
+    // Restore session_id from localStorage so conversation history persists across reloads
+    let activeSessionId = localStorage.getItem('miraSessionId') || null;
+    let activeRunId = null;
+
+    function toggleTasksPanel() {
+      const panel = document.getElementById('tasksPanel');
+      const overlay = document.getElementById('tasksPanelOverlay');
+      const isOpening = !panel.classList.contains('open');
+      panel.classList.toggle('open');
+      overlay.classList.toggle('visible');
+      if (isOpening) {
+        loadTasks();
+        clearNotificationBadge();
+      }
+    }
+
+    function formatRelativeTime(isoStr) {
+      if (!isoStr) return '—';
+      const date = new Date(isoStr);
+      const diffMs = Date.now() - date.getTime();
+      const diffSec = Math.floor(diffMs / 1000);
+      if (diffSec < 60) return diffSec + 's ago';
+      const diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return diffMin + ' min ago';
+      const diffHr = Math.floor(diffMin / 60);
+      if (diffHr < 24) return diffHr + 'h ago';
+      const diffDay = Math.floor(diffHr / 24);
+      if (diffDay === 1) return 'yesterday';
+      return diffDay + ' days ago';
+    }
+
+    function taskStatusMeta(status) {
+      switch (status) {
+        case 'running': return { icon: '◌', css: 'running' };
+        case 'completed': return { icon: '✓', css: 'completed' };
+        case 'failed': return { icon: '✗', css: 'failed' };
+        default: return { icon: '…', css: 'pending' };
+      }
+    }
+
+    async function loadTasks() {
+      try {
+        const res = await fetch('/api/tasks');
+        if (!res.ok) return;
+        const tasks = await res.json();
+        renderTasksList(tasks);
+        checkTaskNotifications(tasks);
+      } catch (e) {
+        console.error('loadTasks error:', e);
+      }
+    }
+
+    function renderTasksList(tasks) {
+      const container = document.getElementById('tasksList');
+      if (!tasks || tasks.length === 0) {
+        container.innerHTML =
+          '<div style="text-align:center;padding:20px;color:var(--text-dim);font-size:0.71rem;">No tasks yet</div>';
+        return;
+      }
+      container.innerHTML = '';
+      for (const task of tasks) {
+        const { icon, css } = taskStatusMeta(task.status);
+        const truncated = (task.text || '').length > 60
+          ? task.text.substring(0, 60) + '…'
+          : task.text;
+        const item = document.createElement('div');
+        item.className = 'task-item';
+        item.dataset.taskId = task.id;
+        item.onclick = (e) => {
+          if (!e.target.classList.contains('task-del-btn')) viewTaskDetail(task.id);
+        };
+        item.innerHTML =
+          '<span class="task-status-icon ' + css + '">' + icon + '</span>' +
+          '<div class="task-body">' +
+          '<span class="task-text" title="' + escapeHtml(task.text || '') + '">' +
+          escapeHtml(truncated) + '</span>' +
+          '<span class="task-meta">' +
+          escapeHtml(formatRelativeTime(task.created_at)) +
+          ' · ' + escapeHtml(task.model || '') +
+          '</span>' +
+          '</div>' +
+          '<button class="task-del-btn" onclick="deleteTaskById(' + task.id + ', event)" title="Delete">✕</button>';
+        container.appendChild(item);
+      }
+    }
+
+    function checkTaskNotifications(tasks) {
+      const badge = document.getElementById('tasksBadge');
+      if (!badge || !tasks) return;
+      const lastVisit = localStorage.getItem('mira_last_visit');
+      if (!lastVisit) {
+        localStorage.setItem('mira_last_visit', new Date().toISOString());
+        return;
+      }
+      const lastVisitDate = new Date(lastVisit);
+      const newDone = tasks.filter(t =>
+        t.status === 'completed' && t.completed_at &&
+        new Date(t.completed_at) > lastVisitDate
+      );
+      if (newDone.length > 0) {
+        badge.textContent = newDone.length > 9 ? '9+' : String(newDone.length);
+        badge.style.display = 'flex';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    function clearNotificationBadge() {
+      const badge = document.getElementById('tasksBadge');
+      if (badge) badge.style.display = 'none';
+      localStorage.setItem('mira_last_visit', new Date().toISOString());
+    }
+
+    async function viewTaskDetail(taskId) {
+      document.getElementById('tasksPanel').classList.remove('open');
+      document.getElementById('tasksPanelOverlay').classList.remove('visible');
+      clearNotificationBadge();
+      try {
+        const res = await fetch('/api/tasks/' + taskId);
+        if (!res.ok) { showNotification('Task not found', 'error'); return; }
+        const data = await res.json();
+        if (data.status === 'error') { showNotification('✗ ' + data.error, 'error'); return; }
+        renderTaskInChat(data.task, data.events);
+        activeTaskId = taskId;
+      } catch (e) {
+        showNotification('✗ Failed to load task', 'error');
+      }
+    }
+
+    function renderTaskInChat(task, events) {
+      const chatContainer = document.getElementById('chatContainer');
+      chatContainer.innerHTML = '';
+
+      // Back navigation bar
+      const backBar = document.createElement('div');
+      backBar.className = 'task-detail-back';
+      backBar.innerHTML =
+        '← Task #' + task.id + ' &nbsp;·&nbsp; ' +
+        escapeHtml(formatRelativeTime(task.created_at)) +
+        ' &nbsp;·&nbsp; <span style="color:var(--text-dim)">' +
+        escapeHtml(task.model || '') + '</span>';
+      backBar.onclick = () => {
+        chatContainer.innerHTML = '<div class="empty-state"></div>';
+        activeTaskId = null;
+      };
+      chatContainer.appendChild(backBar);
+
+      // User message bubble
+      addMessage('user', task.text || '');
+
+      // MIRA response container
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'message mira';
+      const iconDiv = document.createElement('div');
+      iconDiv.className = 'message-icon';
+      iconDiv.textContent = '🤖';
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'message-content';
+      const stepsContainer = document.createElement('div');
+      stepsContainer.className = 'stream-steps';
+      contentDiv.appendChild(stepsContainer);
+      const finalDiv = document.createElement('div');
+      finalDiv.className = 'stream-final';
+      finalDiv.style.display = 'none';
+      contentDiv.appendChild(finalDiv);
+      msgDiv.appendChild(iconDiv);
+      msgDiv.appendChild(contentDiv);
+      chatContainer.appendChild(msgDiv);
+
+      // Replay stored events using existing addStreamStep
+      let finalText = '';
+      for (const ev of events) {
+        let ed;
+        try { ed = ev.event_data || JSON.parse(ev.event_json); } catch (e) { continue; }
+        switch (ed.type) {
+          case 'thought':
+            addStreamStep(stepsContainer, 'thought', ed.content);
+            break;
+          case 'tool_call':
+            addStreamStep(stepsContainer, 'tool-call', { tool: ed.tool });
+            stepsContainer.querySelectorAll('.spinner').forEach(s => s.remove());
+            break;
+          case 'tool_result':
+            addStreamStep(stepsContainer, 'tool-result',
+              { tool: ed.tool, result: ed.result, status: ed.status });
+            break;
+          case 'final':
+          case 'step_limit':
+            finalText = ed.content || '';
+            break;
+        }
+      }
+
+      // Collapsible steps toggle (start collapsed in history view)
+      if (stepsContainer.children.length > 0) {
+        stepsContainer.style.display = 'none';
+        const toggle = document.createElement('div');
+        toggle.style.cssText =
+          'font-size:0.65rem;color:var(--text-muted,#666);cursor:pointer;' +
+          'margin-top:4px;font-family:var(--font-mono);';
+        toggle.textContent = '▸ ' + stepsContainer.children.length + ' steps (click to toggle)';
+        toggle.onclick = () => {
+          const hidden = stepsContainer.style.display === 'none';
+          stepsContainer.style.display = hidden ? 'flex' : 'none';
+          toggle.textContent =
+            (hidden ? '▾ ' : '▸ ') + stepsContainer.children.length + ' steps (click to toggle)';
+        };
+        finalDiv.parentNode.insertBefore(toggle, finalDiv);
+      }
+
+      // Final answer / running indicator / error
+      if (task.status === 'running') {
+        const runBand = document.createElement('div');
+        runBand.className = 'task-running-band';
+        runBand.textContent = '◌ Still running — result will appear when complete';
+        contentDiv.appendChild(runBand);
+      } else if (finalText) {
+        let safeText = finalText
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+        const mdLinks = [];
+        safeText = safeText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (m, lt, url) => {
+          mdLinks.push('<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + lt + '</a>');
+          return '__LNK_' + (mdLinks.length - 1) + '__';
+        });
+        safeText = safeText.replace(/(https?:\/\/[^\s<]+)/g,
+          '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+        mdLinks.forEach((lnk, i) => { safeText = safeText.replace('__LNK_' + i + '__', lnk); });
+        safeText = safeText.replace(/\n/g, '<br>');
+        finalDiv.innerHTML = safeText;
+        finalDiv.style.display = 'block';
+      } else if (task.status === 'failed') {
+        finalDiv.innerHTML =
+          '<span style="color:var(--red)">✗ Task failed: ' +
+          escapeHtml(task.error || 'Unknown error') + '</span>';
+        finalDiv.style.display = 'block';
+      }
+
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    async function deleteTaskById(taskId, event) {
+      event.stopPropagation();
+      try {
+        await fetch('/api/tasks/' + taskId, { method: 'DELETE' });
+        if (activeTaskId === taskId) {
+          document.getElementById('chatContainer').innerHTML = '<div class="empty-state"></div>';
+          activeTaskId = null;
+        }
+        loadTasks();
+      } catch (e) {
+        showNotification('✗ Failed to delete task', 'error');
+      }
+    }
+    // ── END TASKS PANEL ────────────────────────────────────────────────
+
+    // ── WHATSAPP PANEL ─────────────────────────────────────────────────
+    let _waTimer = null
+    let _waMsgTimer = null
+    let _waLastTs = 0
+
+    function toggleWAModal() {
+      const overlay = document.getElementById('waOverlay')
+      const btn = document.getElementById('waToggleBtn')
+      const open = overlay.classList.toggle('open')
+      btn.classList.toggle('wa-active', open)
+
+      if (open) {
+        loadWAStatus()
+        _waTimer = setInterval(loadWAStatus, 4000)
+      } else {
+        clearInterval(_waTimer); _waTimer = null
+        clearInterval(_waMsgTimer); _waMsgTimer = null
+      }
+    }
+
+    async function loadWAStatus() {
+      try {
+        const r = await fetch('/api/whatsapp/qr')
+        const data = await r.json()
+        _renderWA(data)
+      } catch (e) {
+        _renderWA({ status: 'error', error: 'Bridge unreachable: ' + e.message })
+      }
+    }
+
+    function _renderWA(data) {
+      const statusLine = document.getElementById('waStatusLine')
+      const qrImg = document.getElementById('waQrImg')
+      const connectedBox = document.getElementById('waConnectedBox')
+      const convArea = document.getElementById('waConvArea')
+      const hint = document.getElementById('waHint')
+      const dot = document.getElementById('waDot')
+      const modal = document.getElementById('waModal')
+
+      // Reset
+      qrImg.style.display = 'none'
+      connectedBox.style.display = 'none'
+      convArea.style.display = 'none'
+      modal.classList.remove('wa-chat-mode')
+      hint.textContent = ''
+      dot.className = 'wa-dot'
+
+      if (data.status === 'connected') {
+        statusLine.textContent = '● Connected'
+        statusLine.style.color = '#25d366'
+        statusLine.style.borderColor = '#25d36644'
+        connectedBox.style.display = 'block'
+        const num = data.jid ? data.jid.split(':')[0].split('@')[0] : 'unknown'
+        connectedBox.innerHTML = `✅ Linked as +${num}`
+        hint.textContent = 'To unlink: delete whatsapp_bridge/auth_whatsapp/ and restart.'
+        dot.classList.add('connected')
+        convArea.style.display = 'flex'
+        convArea.style.flexDirection = 'column'
+        modal.classList.add('wa-chat-mode')
+        // Start polling messages
+        if (!_waMsgTimer) {
+          loadWAMessages()
+          _waMsgTimer = setInterval(loadWAMessages, 3000)
+        }
+        // Stop QR polling
+        clearInterval(_waTimer); _waTimer = null
+      } else if (data.status === 'qr' && data.qr) {
+        statusLine.textContent = '○ Waiting for scan...'
+        statusLine.style.color = 'var(--yellow)'
+        statusLine.style.borderColor = 'rgba(253,224,71,0.3)'
+        qrImg.src = data.qr
+        qrImg.style.display = 'block'
+        hint.innerHTML = 'Open WhatsApp → Settings → Linked Devices → Link a Device<br>Then scan the QR above.'
+        dot.classList.add('qr')
+      } else if (data.status === 'connecting') {
+        statusLine.textContent = '◌ Connecting...'
+        statusLine.style.color = 'var(--cyan)'
+        statusLine.style.borderColor = 'var(--border)'
+        hint.textContent = 'Bridge is establishing connection...'
+      } else if (data.status === 'error' || data.error) {
+        const msg = data.error || 'Unknown error'
+        statusLine.textContent = '✕ ' + msg
+        statusLine.style.color = 'var(--red)'
+        statusLine.style.borderColor = 'rgba(248,113,113,0.3)'
+        hint.innerHTML = 'Start the bridge:<br><code style="color:var(--green);font-size:0.65rem;">cd whatsapp_bridge &amp;&amp; npm install &amp;&amp; npm start</code>'
+      } else {
+        statusLine.textContent = '◌ Bridge not running'
+        statusLine.style.color = 'var(--text-dim)'
+        statusLine.style.borderColor = 'var(--border)'
+        hint.innerHTML = 'Start the bridge:<br><code style="color:var(--green);font-size:0.65rem;">cd whatsapp_bridge &amp;&amp; npm install &amp;&amp; npm start</code>'
+      }
+    }
+
+    async function loadWAMessages() {
+      try {
+        const r = await fetch(`/api/whatsapp/messages?since=${_waLastTs}`)
+        const data = await r.json()
+        if (data.messages && data.messages.length > 0) {
+          _appendWAMessages(data.messages)
+          _waLastTs = data.messages[data.messages.length - 1].ts
+        }
+      } catch (_) { }
+    }
+
+    function _appendWAMessages(msgs) {
+      const list = document.getElementById('waMsgList')
+      const empty = document.getElementById('waEmptyConv')
+      if (empty) empty.remove()
+
+      msgs.forEach(m => {
+        const isUser = m.role === 'user'
+        const time = new Date(m.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        const label = isUser
+          ? (m.group ? `${m.from} @ ${m.group}` : `+${m.from}`)
+          : 'MIRA'
+
+        const wrap = document.createElement('div')
+        wrap.style.display = 'flex'
+        wrap.style.flexDirection = 'column'
+        wrap.style.alignItems = isUser ? 'flex-start' : 'flex-end'
+
+        const meta = document.createElement('div')
+        meta.className = 'wa-bubble-meta'
+        meta.textContent = `${label} · ${time}`
+
+        const bubble = document.createElement('div')
+        bubble.className = `wa-bubble ${isUser ? 'user' : 'agent'}`
+        bubble.textContent = m.text
+
+        wrap.appendChild(meta)
+        wrap.appendChild(bubble)
+        list.appendChild(wrap)
+      })
+      // Auto-scroll to bottom
+      list.scrollTop = list.scrollHeight
+    }
+
+    async function sendWAMessage() {
+      const to = document.getElementById('waRecipient').value.trim()
+      const message = document.getElementById('waTextInput').value.trim()
+      if (!to || !message) return
+
+      const btn = document.querySelector('.wa-send-btn')
+      btn.disabled = true
+      btn.textContent = '...'
+
+      try {
+        const r = await fetch('/api/whatsapp/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to, message })
+        })
+        const data = await r.json()
+        if (data.status === 'sent' || data.status === 'success') {
+          document.getElementById('waTextInput').value = ''
+          // Optimistically show the sent message
+          _appendWAMessages([{
+            role: 'agent', from: 'MIRA (you)', text: message, ts: Date.now() / 1000
+          }])
+        } else {
+          alert('Send failed: ' + (data.error || JSON.stringify(data)))
+        }
+      } catch (e) {
+        alert('Error: ' + e.message)
+      } finally {
+        btn.disabled = false
+        btn.textContent = 'Send ↑'
+      }
+    }
+    // ── END WHATSAPP PANEL ─────────────────────────────────────────────
+
+    // Initialize
+    window.onload = () => {
+      loadTheme();
+      updateVoiceButtonStates();
+      // ⚠️  resetSession() was intentionally removed from here — calling it on every
+      //    page reload wiped the agent's conversation history and broke continuity.
+      //    History is now preserved across reloads until the user clicks "Reset".
+      checkConnection();
+      autoResize(document.getElementById('input')); // Initialize textarea size
+
+      // Periodically check connection and task statuses
+      setInterval(checkConnection, 30000); // Every 30 seconds
+      setInterval(loadTasks, 15000);       // Every 15 seconds — poll task statuses
+
+      // Initial load: check for completed background tasks since last visit
+      loadTasks();
+    };
+  </script>
+</body>
+
+</html>
