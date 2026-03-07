@@ -1058,6 +1058,327 @@
   </style>
 
   <style>
+    /* ── VOICE MODE SPLIT SCREEN ─────────────────────────────────────── */
+    .container {
+      transition: margin-left 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+                  max-width  0.45s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    body.voice-mode .container {
+      margin-left: 56vw;
+      margin-right: 0;
+      max-width: calc(44vw - 8px);
+    }
+
+    /* Voice panel — slides in from left */
+    #voicePanel {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 55vw;
+      height: 100vh;
+      background: radial-gradient(ellipse at 50% 55%,
+        rgba(74,222,128,0.05) 0%,
+        rgba(13,15,14,0.97) 55%,
+        var(--bg) 100%);
+      z-index: 500;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      transform: translateX(-100%);
+      transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    #voicePanel.active {
+      transform: translateX(0);
+      pointer-events: all;
+    }
+
+    /* Subtle scan-line overlay */
+    #voicePanel::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(74,222,128,0.015) 2px,
+        rgba(74,222,128,0.015) 4px
+      );
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .voice-panel-label {
+      position: relative;
+      z-index: 1;
+      font-size: 0.63rem;
+      font-weight: 700;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .voice-orb-wrap {
+      position: relative;
+      z-index: 1;
+      width: 200px;
+      height: 200px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .voice-ring {
+      position: absolute;
+      border-radius: 50%;
+      border: 1px solid rgba(74, 222, 128, 0.22);
+      animation: voiceRingExpand 2.8s ease-out infinite;
+    }
+    .voice-ring:nth-child(1) { width:  96px; height:  96px; animation-delay: 0.0s; }
+    .voice-ring:nth-child(2) { width: 136px; height: 136px; animation-delay: 0.7s; border-color: rgba(74,222,128,0.14); }
+    .voice-ring:nth-child(3) { width: 172px; height: 172px; animation-delay: 1.4s; border-color: rgba(74,222,128,0.08); }
+    .voice-ring:nth-child(4) { width: 210px; height: 210px; animation-delay: 2.1s; border-color: rgba(74,222,128,0.04); }
+
+    @keyframes voiceRingExpand {
+      0%   { transform: scale(0.7); opacity: 0; }
+      25%  { opacity: 1; }
+      100% { transform: scale(1.3); opacity: 0; }
+    }
+
+    .voice-orb {
+      width: 92px;
+      height: 92px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 38% 38%,
+        rgba(74,222,128,0.18) 0%,
+        rgba(74,222,128,0.05) 55%,
+        transparent 100%);
+      border: 1.5px solid rgba(74,222,128,0.5);
+      box-shadow:
+        0 0 32px rgba(74,222,128,0.12),
+        0 0 72px rgba(74,222,128,0.06),
+        inset 0 0 28px rgba(74,222,128,0.08);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      z-index: 2;
+      animation: orbBreath 2.8s ease-in-out infinite;
+      cursor: pointer;
+      transition: box-shadow 0.3s;
+    }
+
+    .voice-orb:hover {
+      box-shadow:
+        0 0 52px rgba(74,222,128,0.24),
+        0 0 96px rgba(74,222,128,0.10),
+        inset 0 0 36px rgba(74,222,128,0.14);
+    }
+
+    @keyframes orbBreath {
+      0%,100% {
+        box-shadow:
+          0 0 28px rgba(74,222,128,0.10),
+          0 0 60px rgba(74,222,128,0.05),
+          inset 0 0 22px rgba(74,222,128,0.07);
+        transform: scale(1);
+      }
+      50% {
+        box-shadow:
+          0 0 48px rgba(74,222,128,0.22),
+          0 0 88px rgba(74,222,128,0.10),
+          inset 0 0 36px rgba(74,222,128,0.12);
+        transform: scale(1.05);
+      }
+    }
+
+    body.voice-recording .voice-orb {
+      border-color: rgba(74,222,128,0.85);
+      animation: orbPulseRecord 1s ease-in-out infinite;
+    }
+    body.voice-recording .voice-ring {
+      animation-duration: 1.3s;
+      border-color: rgba(74,222,128,0.35);
+    }
+
+    @keyframes orbPulseRecord {
+      0%,100% {
+        box-shadow:
+          0 0 52px rgba(74,222,128,0.30),
+          0 0 100px rgba(74,222,128,0.14),
+          inset 0 0 36px rgba(74,222,128,0.18);
+        transform: scale(1);
+      }
+      50% {
+        box-shadow:
+          0 0 80px rgba(74,222,128,0.50),
+          0 0 140px rgba(74,222,128,0.22),
+          inset 0 0 52px rgba(74,222,128,0.24);
+        transform: scale(1.07);
+      }
+    }
+
+    .voice-orb-icon {
+      font-size: 1.85rem;
+      user-select: none;
+      filter: drop-shadow(0 0 10px rgba(74,222,128,0.55));
+    }
+
+    .voice-waveform {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      height: 36px;
+    }
+
+    .voice-bar {
+      width: 3px;
+      border-radius: 2px;
+      background: var(--green-dim);
+      animation: voiceBarIdle 2s ease-in-out infinite;
+      opacity: 0.35;
+    }
+    .voice-bar:nth-child(1) { height:  7px; animation-delay: 0.00s; }
+    .voice-bar:nth-child(2) { height: 13px; animation-delay: 0.10s; }
+    .voice-bar:nth-child(3) { height: 22px; animation-delay: 0.20s; }
+    .voice-bar:nth-child(4) { height: 30px; animation-delay: 0.30s; }
+    .voice-bar:nth-child(5) { height: 22px; animation-delay: 0.20s; }
+    .voice-bar:nth-child(6) { height: 13px; animation-delay: 0.10s; }
+    .voice-bar:nth-child(7) { height:  7px; animation-delay: 0.00s; }
+
+    @keyframes voiceBarIdle {
+      0%,100% { transform: scaleY(0.35); opacity: 0.25; }
+      50%      { transform: scaleY(1);    opacity: 0.60; }
+    }
+
+    body.voice-recording .voice-bar {
+      opacity: 1;
+      animation: voiceBarActive 0.35s ease-in-out infinite alternate;
+    }
+    body.voice-recording .voice-bar:nth-child(1) { animation-delay: 0.00s; }
+    body.voice-recording .voice-bar:nth-child(2) { animation-delay: 0.07s; }
+    body.voice-recording .voice-bar:nth-child(3) { animation-delay: 0.14s; }
+    body.voice-recording .voice-bar:nth-child(4) { animation-delay: 0.04s; }
+    body.voice-recording .voice-bar:nth-child(5) { animation-delay: 0.11s; }
+    body.voice-recording .voice-bar:nth-child(6) { animation-delay: 0.08s; }
+    body.voice-recording .voice-bar:nth-child(7) { animation-delay: 0.16s; }
+
+    @keyframes voiceBarActive {
+      0%   { transform: scaleY(0.25); }
+      100% { transform: scaleY(1);    }
+    }
+
+    #voiceTranscript {
+      position: relative;
+      z-index: 1;
+      font-size: 0.84rem;
+      font-family: var(--font-mono);
+      color: var(--green);
+      text-align: center;
+      max-width: 68%;
+      min-height: 2.4em;
+      line-height: 1.65;
+      letter-spacing: 0.02em;
+      padding: 0 16px;
+      transition: color 0.2s;
+      font-weight: 500;
+    }
+    #voiceTranscript.interim {
+      color: var(--text-dim);
+      font-style: italic;
+    }
+
+    .voice-state-text {
+      position: relative;
+      z-index: 1;
+      font-size: 0.63rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .voice-state-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      flex-shrink: 0;
+    }
+    body.voice-recording .voice-state-dot {
+      background: var(--green);
+      animation: voiceDotBlink 1s ease-in-out infinite;
+    }
+    @keyframes voiceDotBlink {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0.15; }
+    }
+
+    .voice-cancel-btn {
+      position: relative;
+      z-index: 1;
+      font-size: 0.65rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      background: transparent;
+      border: 1px solid var(--border);
+      padding: 6px 18px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-weight: 600;
+      transition: border-color 0.15s, color 0.15s;
+      min-width: unset;
+      min-height: unset;
+    }
+    .voice-cancel-btn:hover {
+      border-color: var(--red);
+      color: var(--red);
+    }
+
+    .voice-divider {
+      position: fixed;
+      left: 55vw;
+      top: 0;
+      width: 1px;
+      height: 100vh;
+      background: linear-gradient(
+        to bottom,
+        transparent 0%,
+        rgba(74,222,128,0.40) 30%,
+        rgba(74,222,128,0.55) 50%,
+        rgba(74,222,128,0.40) 70%,
+        transparent 100%
+      );
+      z-index: 501;
+      opacity: 0;
+      transition: opacity 0.45s 0.2s;
+      pointer-events: none;
+    }
+    body.voice-mode .voice-divider { opacity: 1; }
+
+    #voiceInputBtn.voice-mode-active {
+      border-color: var(--green);
+      color: var(--green);
+      background: var(--green-faint);
+    }
+  </style>
+
+  <style>
     /* ── TASKS PANEL (right-side drawer) ─────────────────────────────── */
     .tasks-panel {
       position: fixed;
@@ -1543,6 +1864,44 @@
 </head>
 
 <body data-mira-api-key="{{ mira_api_key }}">
+
+  <!-- Glowing vertical divider for voice split -->
+  <div class="voice-divider"></div>
+
+  <!-- Voice Mode Panel -->
+  <div id="voicePanel">
+    <div class="voice-panel-label">◆ mira — voice input</div>
+
+    <div class="voice-orb-wrap">
+      <div class="voice-ring"></div>
+      <div class="voice-ring"></div>
+      <div class="voice-ring"></div>
+      <div class="voice-ring"></div>
+      <div class="voice-orb" onclick="toggleVoiceInput()" title="Tap to speak">
+        <span class="voice-orb-icon">🎤</span>
+      </div>
+    </div>
+
+    <div class="voice-waveform">
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+      <div class="voice-bar"></div>
+    </div>
+
+    <div id="voiceTranscript">Say something...</div>
+
+    <div class="voice-state-text">
+      <div class="voice-state-dot"></div>
+      <span id="voiceStateLabel">Tap mic to speak</span>
+    </div>
+
+    <button class="voice-cancel-btn" onclick="exitVoiceMode()">✕ Cancel</button>
+  </div>
+
   <!-- Sidebar for Capabilities -->
   <div id="sidebarOverlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
   <button class="sidebar-toggle" onclick="toggleSidebar()">⌥</button>
@@ -1742,26 +2101,47 @@
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       recognition = new SpeechRecognition();
       recognition.continuous = false;
-      recognition.interimResults = false;
+      recognition.interimResults = true;
       recognition.lang = 'en-US';
 
       recognition.onstart = () => {
         isRecording = true;
         document.getElementById('voiceInputBtn').classList.add('recording');
         setVoiceStatus('🎤 Listening...');
+        enterVoiceMode();
       };
 
       recognition.onresult = (event) => {
-        const transcript = event.results[0][0].transcript;
-        document.getElementById('input').value = transcript;
-        setVoiceStatus('Recognized: ' + transcript);
-        // Auto-send
-        setTimeout(() => sendMsg(), 500);
+        let interim = '';
+        let final = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            final += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
+        }
+        const transcriptEl = document.getElementById('voiceTranscript');
+        if (final) {
+          transcriptEl.textContent = final;
+          transcriptEl.classList.remove('interim');
+          document.getElementById('input').value = final;
+          setVoiceStatus('Recognized: ' + final);
+          document.getElementById('voiceStateLabel').textContent = 'Sending...';
+          setTimeout(() => {
+            exitVoiceMode();
+            sendMsg();
+          }, 650);
+        } else if (interim) {
+          transcriptEl.textContent = interim;
+          transcriptEl.classList.add('interim');
+        }
       };
 
       recognition.onerror = (event) => {
         setVoiceStatus('❌ Error: ' + event.error);
         stopRecording();
+        exitVoiceMode();
       };
 
       recognition.onend = () => {
@@ -1784,9 +2164,35 @@
 
     function stopRecording() {
       isRecording = false;
+      document.body.classList.remove('voice-recording');
       document.getElementById('voiceInputBtn').classList.remove('recording');
       if (document.getElementById('voiceStatus').textContent.includes('Listening')) {
         setVoiceStatus('');
+      }
+    }
+
+    /* ── VOICE MODE UI ─────────────────────────────────────────────── */
+    function enterVoiceMode() {
+      document.body.classList.add('voice-mode', 'voice-recording');
+      document.getElementById('voicePanel').classList.add('active');
+      document.getElementById('voiceInputBtn').classList.add('voice-mode-active');
+      const el = document.getElementById('voiceTranscript');
+      el.textContent = 'Listening...';
+      el.classList.remove('interim');
+      document.getElementById('voiceStateLabel').textContent = 'Listening...';
+    }
+
+    function exitVoiceMode() {
+      document.body.classList.remove('voice-mode', 'voice-recording');
+      document.getElementById('voicePanel').classList.remove('active');
+      document.getElementById('voiceInputBtn').classList.remove('voice-mode-active', 'recording');
+      document.getElementById('voiceStateLabel').textContent = 'Tap mic to speak';
+      const el = document.getElementById('voiceTranscript');
+      el.textContent = 'Say something...';
+      el.classList.remove('interim');
+      if (isRecording) {
+        isRecording = false;
+        try { recognition && recognition.stop(); } catch(_) {}
       }
     }
 
