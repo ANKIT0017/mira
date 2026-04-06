@@ -63,7 +63,7 @@ PROVIDER_CONTEXT_WINDOWS: dict[str, int] = {
     "cerebras": 32768,     # llama-3.3-70b
     "sambanova": 32768,    # llama-3.3-70b-instruct
     "openrouter": 32768,   # default, varies by model
-    "ollama": 8192,        # typical local 4B model
+    "llamacpp": 16384,     # gemma-4-E2B-it with --ctx-size 16384
 }
 
 
@@ -76,8 +76,8 @@ def get_context_window(model: str) -> int:
     # Gemini models have huge context
     if "gemini" in model_lower:
         return 1048576
-    # Default for local/unknown models
-    return int(os.getenv("MIRA_DEFAULT_CONTEXT_WINDOW", "8192"))
+    # Default for local/unknown models — matches --ctx-size 16384 server flag
+    return int(os.getenv("MIRA_DEFAULT_CONTEXT_WINDOW", "16384"))
 
 
 # ── Budget allocation engine ─────────────────────────────────────────────

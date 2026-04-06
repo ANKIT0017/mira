@@ -10,6 +10,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
+# llama.cpp SERVER CONFIG
+# The local model runs via llama.cpp server (OpenAI-compatible API).
+# Start it with start_llama_server.bat before running MIRA.
+# Override via .env: LLAMA_SERVER_URL, LLAMA_MODEL_NAME
+# ============================================================
+LLAMA_BASE_URL  = os.getenv("LLAMA_SERVER_URL",  "http://127.0.0.1:8080")
+LLAMA_MODEL_NAME = os.getenv("LLAMA_MODEL_NAME", "gemma-4-E2B-it")  # label only
+
+
+# ============================================================
 # SMART RATE LIMIT MANAGEMENT
 # Tracks cooldowns per provider so we skip rate-limited ones
 # instead of wasting requests.
@@ -287,10 +297,77 @@ def _try_fallback_chain(prompt: str, max_tokens: int, skip_provider: str = None,
 
 
 # ============================================================
+# llama.cpp LOCAL BACKEND HELPER
+# Shared by generate(), generate_with_messages(), generate_with_native_tools().
+# Context size, KV cache quant, RoPE, and GPU layers are set at SERVER start
+# (start_llama_server.bat) — not repeated per request.
+# ============================================================
+
+def _generate_llamacpp_chat(
+    messages: list[dict],
+    max_tokens: int = 2048,
+    timeout: int = 240,
+    temperature: float = 0.1,
+    tools: list[dict] | None = None,
+) -> str | dict:
+    """
+    POST to llama.cpp server /v1/chat/completions (OpenAI-compatible).
+
+    Returns str on plain generation, dict when tools are supplied
+    (mirrors generate_with_native_tools return shape).
+    """
+    import re as _re
+    try:
+        print(f"[PROVIDER] llama.cpp → {LLAMA_MODEL_NAME}")
+        body: dict = {
+            "model": LLAMA_MODEL_NAME,
+            "messages": messages,
+            "max_tokens": min(max_tokens, 2048),
+            "temperature": temperature,
+            "stream": False,
+        }
+        if tools:
+            body["tools"] = tools
+
+        resp = requests.post(
+            f"{LLAMA_BASE_URL}/v1/chat/completions",
+            json=body,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+
+        if tools:
+            content = (msg.get("content") or "").strip()
+            tool_calls = msg.get("tool_calls") or []
+            return {"content": content, "tool_calls": tool_calls}
+
+        result = (msg.get("content") or "").strip()
+        # Strip residual <think>...</think> blocks (some models emit them)
+        result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+        return result
+
+    except requests.exceptions.Timeout:
+        err = "[Error: llama.cpp server call timed out]"
+        return {"error": err} if tools else err
+    except requests.exceptions.ConnectionError:
+        err = (
+            "[Error: Could not connect to llama.cpp server. "
+            f"Run start_llama_server.bat first (or set LLAMA_SERVER_URL in .env). "
+            f"Expected at: {LLAMA_BASE_URL}]"
+        )
+        return {"error": err} if tools else err
+    except Exception as e:
+        err = f"[Error running llama.cpp: {e}]"
+        return {"error": err} if tools else err
+
+
+# ============================================================
 # MAIN ENTRY POINT
 # ============================================================
 
-def generate(prompt: str, model: str = "qwen3:4b-instruct", max_tokens: int = 92024, timeout: int = 240, temperature: float = 0.1):
+def generate(prompt: str, model: str = "local", max_tokens: int = 92024, timeout: int = 240, temperature: float = 0.1):
     """
     Universal generation function with automatic multi-provider rotation.
     
@@ -300,7 +377,7 @@ def generate(prompt: str, model: str = "qwen3:4b-instruct", max_tokens: int = 92
     - 'cerebras:*'   → Cerebras API (fastest, 70B)
     - 'sambanova:*'  → SambaNova API (405B)
     - 'openrouter:*' → OpenRouter (aggregator, free models)
-    - Local models   → Ollama
+    - Local models   → llama.cpp server
     
     Smart rotation: If the chosen provider is rate-limited, tries the
     entire fallback chain before giving up. Cooldown tracking ensures
@@ -341,97 +418,57 @@ def generate(prompt: str, model: str = "qwen3:4b-instruct", max_tokens: int = 92
             
             return result
     
-    # Otherwise use local Ollama
-    # --- Local Ollama via HTTP API (keeps model in VRAM, no cold-start) ---
+    # ── Local llama.cpp server (OpenAI-compatible API) ────────────────────
+    # Context size, KV cache quant, RoPE scaling, and GPU layers are all
+    # configured at server startup via start_llama_server.bat — not here.
+    return _generate_llamacpp_chat(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        timeout=timeout,
+        temperature=temperature,
+    )
+
+
+def generate_streaming(prompt: str, model: str = "local", max_tokens: int = 512):
+    """
+    Stream tokens from the llama.cpp server via SSE for real-time voice output.
+    Yields text chunks as they arrive over the Server-Sent Events stream.
+
+    Requires the llama.cpp server to be running (start_llama_server.bat).
+    """
     try:
-        print(f"[PROVIDER] Ollama HTTP → {model}")
-
-        # Detect Qwen3 family: qwen3:4b-instruct, qwen3.5:4b, etc.
-        is_qwen3 = "qwen3" in model.lower()
-        # qwen3.5 supports 32k context; qwen3 (non-3.5) use 16k to save VRAM
-        _num_ctx = 32768 if "qwen3.5" in model.lower() else 16384
-
-        import re
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "num_ctx": _num_ctx,
-                "num_predict": 2048,
-                "temperature": temperature,
-            }
-        }
-        if is_qwen3:
-            payload["think"] = False  # Qwen3-specific: skip the <think> reasoning block
-
+        print(f"[PROVIDER] llama.cpp SSE stream → {LLAMA_MODEL_NAME}")
         resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json=payload,
-            timeout=timeout,
+            f"{LLAMA_BASE_URL}/v1/chat/completions",
+            json={
+                "model": LLAMA_MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+                "stream": True,
+            },
+            stream=True,
+            timeout=120,
         )
         resp.raise_for_status()
-        data = resp.json()
-        result = data.get("response", "").strip()
-
-        # Strip any residual <think>...</think> blocks just in case
-        result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
-
-        return result
-    except requests.exceptions.Timeout:
-        return "[Error: Ollama call timed out]"
-    except requests.exceptions.ConnectionError:
-        return "[Error: Could not connect to Ollama. Is it running on localhost:11434?]"
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                if delta:
+                    yield delta
+            except Exception:
+                continue
     except Exception as e:
-        return f"[Error running Ollama: {e}]"
-
-
-
-def generate_streaming(prompt: str, model: str = "deepseek-r1:1.5b", max_tokens: int = 512):
-    """
-    Stream tokens from Ollama for real-time voice output.
-    Yields tokens as they are generated.
-    """
-    try:
-        cmd = ["ollama", "run", model, "--nowordwrap"]
-        
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        proc.stdin.write(prompt + "\n")
-        proc.stdin.flush()
-        proc.stdin.close()
-        
-        buffer = ""
-        for line in proc.stdout:
-            buffer += line
-            while ' ' in buffer or '\n' in buffer:
-                if ' ' in buffer:
-                    idx = buffer.index(' ')
-                    token = buffer[:idx + 1]
-                    buffer = buffer[idx + 1:]
-                elif '\n' in buffer:
-                    idx = buffer.index('\n')
-                    token = buffer[:idx + 1]
-                    buffer = buffer[idx + 1:]
-                
-                if token.strip():
-                    yield token
-        
-        if buffer.strip():
-            yield buffer
-            
-        proc.wait()
-        
-    except Exception as e:
-        yield f"[Error: {e}]"
+        yield f"[Stream error: {e}]"
 
 
 # ============================================================
@@ -442,7 +479,7 @@ def generate_streaming(prompt: str, model: str = "deepseek-r1:1.5b", max_tokens:
 
 def generate_with_messages(
     messages: list[dict],
-    model: str = "qwen3:4b-instruct",
+    model: str = "local",
     max_tokens: int = 92024,
     timeout: int = 240,
     temperature: float = 0.1,
@@ -458,11 +495,8 @@ def generate_with_messages(
     - Better instruction following through role clarity
     - Reduced per-request token costs for stable prefixes
 
-    For local Ollama models, uses /api/chat (not /api/generate) so the
+    For local llama.cpp models, uses /v1/chat/completions so the
     model's proper chat template is applied to the message list.
-
-    thinking=True enables Qwen3's extended reasoning on PLAN/REPLAN calls
-    only. ACT/SYNTH calls should pass thinking=False (default) for speed.
     """
     # Map of cloud provider prefixes to their functions and capabilities
     provider_map = {
@@ -494,85 +528,69 @@ def generate_with_messages(
                 flat = _flatten_messages(messages) if isinstance(messages, list) and messages else ""
                 return gen_fn(flat, model=actual_model, max_tokens=max_tokens, temperature=temperature)
 
-    # ── Local Ollama via /api/chat (preserves model's chat template) ──────────────
-    # Using /api/chat instead of /api/generate ensures the system/user roles
-    # are fed through the model's proper Jinja chat template rather than being
-    # concatenated as raw text, which significantly improves tool-call reliability.
-    is_qwen3 = "qwen3" in model.lower()
-    use_think = thinking and is_qwen3  # only Qwen3 supports the think flag
-    # qwen3.5 supports 32k context; qwen3 (non-3.5) use 16k to save VRAM
-    _num_ctx = 32768 if "qwen3.5" in model.lower() else 16384
-
-    import re as _re
+    # ── Local llama.cpp server (OpenAI-compatible /v1/chat/completions) ────
+    # The llama.cpp server applies the model's proper chat template server-side.
+    # Context size / KV cache quant / RoPE / GPU layers are set at server start.
     try:
-        print(f"[PROVIDER] Ollama /api/chat → {model} (think={use_think})")
-        payload = {
-            "model": model,
-            "messages": messages if isinstance(messages, list) else [],
-            "stream": False,
-            "options": {
-                "num_ctx": _num_ctx,
-                # Give thinking calls more room to reason; ACT calls stay tight
-                "num_predict": min(max_tokens, 4096) if use_think else min(max_tokens, 2048),
-                "temperature": temperature,
-            },
-        }
-        if is_qwen3:
-            payload["think"] = use_think  # Qwen3 flag: emit or suppress <think> block
-
-        resp = requests.post(
-            "http://localhost:11434/api/chat",
-            json=payload,
+        result = _generate_llamacpp_chat(
+            messages=messages if isinstance(messages, list) else [],
+            max_tokens=max_tokens,
             timeout=timeout,
+            temperature=temperature,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        # /api/chat returns {"message": {"role": "assistant", "content": "...", "thinking": "..."}}
-        # The "content" field already excludes the thinking block when think=True
-        result = data.get("message", {}).get("content", "").strip()
-        # Safety-net: strip any residual <think> blocks (e.g. models that ignore the flag)
-        if not use_think:
-            result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+        if isinstance(result, dict) and "error" in result:
+            return result["error"]
         return result
-
-    except requests.exceptions.Timeout:
-        return "[Error: Ollama call timed out]"
-    except requests.exceptions.ConnectionError:
-        return "[Error: Could not connect to Ollama. Is it running on localhost:11434?]"
     except Exception as e:
-        # Last-resort fallback: flat prompt via /api/generate
-        print(f"[PROVIDER] Ollama /api/chat failed ({e}), falling back to /api/generate")
+        # Last-resort: flatten to single-user prompt and retry
+        print(f"[PROVIDER] llama.cpp /chat failed ({e}), retrying as flat prompt")
         flat = _flatten_messages(messages) if isinstance(messages, list) and messages else ""
-        return generate(flat, model=model, max_tokens=max_tokens, timeout=timeout, temperature=temperature)
+        return _generate_llamacpp_chat(
+            [{"role": "user", "content": flat}],
+            max_tokens=max_tokens,
+            timeout=timeout,
+            temperature=temperature,
+        )
 
 
-def supports_ollama_native_tools(model: str) -> bool:
+def supports_local_native_tools(model: str) -> bool:
     """
-    Return True when the local Ollama model likely supports native tool calling.
+    Return True when the local llama.cpp model supports native tool calling.
+
+    llama.cpp server exposes the OpenAI tools API for virtually all modern
+    instruction-tuned models, including Gemma 4, Llama 3, Mistral, and Qwen.
+    Cloud-prefixed models (groq:, gemini:, etc.) are excluded — they use
+    their own cloud adapters.
     """
     m = (model or "").lower().strip()
     if not m:
         return False
-    # Provider-prefixed models are routed through cloud adapters, not local Ollama.
+    # Cloud-prefixed models skip local inference entirely
     if any(m.startswith(p) for p in ("groq:", "gemini:", "cerebras:", "sambanova:", "openrouter:")):
         return False
-    return any(tag in m for tag in ("qwen2.5", "llama3.2", "mistral"))
+    # llama.cpp tool-call support is near-universal for instruct models
+    return True
+
+
+# Backwards-compatibility alias (previously named after Ollama)
+supports_ollama_native_tools = supports_local_native_tools
 
 
 def generate_with_native_tools(
     messages: list[dict],
     tools: list[dict],
-    model: str = "qwen2.5:7b-instruct",
+    model: str = "local",
     timeout: int = 240,
     temperature: float = 0.1,
 ) -> dict:
     """
-    Local Ollama /api/chat call with native tool-calling enabled.
+    Local llama.cpp /v1/chat/completions call with native tool-calling enabled.
+    Uses the OpenAI-compatible tools API exposed by llama.cpp server.
 
     Returns:
       {
         "content": "...assistant text...",
-        "tool_calls": [...],   # optional
+        "tool_calls": [...],   # optional list of tool call objects
       }
     """
     if not isinstance(messages, list) or not messages:
@@ -580,38 +598,17 @@ def generate_with_native_tools(
     if not isinstance(tools, list) or not tools:
         return {"error": "tools must be a non-empty list"}
 
-    # qwen3.5 supports 32k context; others default to 16k for local stability.
-    _num_ctx = 32768 if "qwen3.5" in model.lower() else 16384
-    try:
-        print(f"[PROVIDER] Ollama /api/chat(native-tools) -> {model} tools={len(tools)}")
-        payload = {
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "stream": False,
-            "options": {
-                "num_ctx": _num_ctx,
-                "num_predict": 1024,
-                "temperature": temperature,
-            },
-        }
-        resp = requests.post(
-            "http://localhost:11434/api/chat",
-            json=payload,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        msg = data.get("message", {}) if isinstance(data, dict) else {}
-        tool_calls = msg.get("tool_calls", []) if isinstance(msg, dict) else []
-        content = (msg.get("content", "") if isinstance(msg, dict) else "") or ""
-        return {"content": content.strip(), "tool_calls": tool_calls}
-    except requests.exceptions.Timeout:
-        return {"error": "Ollama native tool call timed out"}
-    except requests.exceptions.ConnectionError:
-        return {"error": "Could not connect to Ollama on localhost:11434"}
-    except Exception as e:
-        return {"error": f"Ollama native tool call failed: {e}"}
+    result = _generate_llamacpp_chat(
+        messages=messages,
+        max_tokens=1024,
+        timeout=timeout,
+        temperature=temperature,
+        tools=tools,
+    )
+    if isinstance(result, dict):
+        return result
+    # Shouldn't happen when tools are supplied, but handle gracefully
+    return {"content": str(result), "tool_calls": []}
 
 
 def _flatten_messages(messages: list[dict]) -> str:

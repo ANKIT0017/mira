@@ -1,69 +1,120 @@
-# Recommended Models for MIRA
+# MIRA — Recommended Local Models
 
-## Current Issue with qwen2.5:3b
+MIRA uses **llama.cpp** as its local inference engine (replaces Ollama).
+The llama.cpp server runs on `http://localhost:8080` and exposes an
+OpenAI-compatible API — no changes to agent logic needed per model swap.
 
-You're currently using `qwen2.5:3b` (3 billion parameters), which is experiencing hallucination issues:
-- Invents follow-up user messages
-- Claims actions were taken when they weren't
-- Generates fake conversation continuations
+---
 
-**This is a model capacity problem.** 3B is too small for reliable tool calling and conversation management.
+## Current Default Model
 
-## Recommended Upgrades (in order of preference)
+### ✅ Gemma 4 E2B Instruct — `gemma-4-E2B-it-Q4_K_M.gguf`
+- **Size**: ~3.1 GB (Q4_K_M quantization)
+- **Context**: 16 384 tokens native, effective 32 768 with `--rope-scale 2`
+- **Why**: Excellent instruction-following for a 2B model; fits in 4–6 GB VRAM
+- **KV cache**: `--cache-type-k q4_0 --cache-type-v q4_0` saves ~40% VRAM
+- **Download**:
+  ```
+  https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF
+  https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF
+  ```
+- **File**: `gemma-4-E2B-it-Q4_K_M.gguf` → place in `MIRA-Windows/`
+- **Start**: `start_llama_server.bat` (already configured)
 
-### Best Performance
-1. **`mistral:7b`** ⭐ RECOMMENDED
-   - 7 billion parameters
-   - Excellent instruction following
-   - Very good at tool calling
-   - Fast on modern hardware
-   - **Install:** `ollama pull mistral:7b`
+---
 
-2. **`llama3.2:8b`**
-   - 8 billion parameters  
-   - Great tool calling accuracy
-   - Meta's latest architecture
-   - **Install:** `ollama pull llama3.2:8b`
+## Quantization Guide
 
-### Good Balance
-3. **`qwen2.5:7b`**
-   - 7 billion parameters
-   - Better than 3b version
-   - **Install:** `ollama pull qwen2.5:7b`
+| Quant | Size | Quality | Recommended? |
+|-------|------|---------|--------------|
+| Q4_K_M | ~3.1 GB | ⭐⭐⭐⭐ Best balance | ✅ **Use this** |
+| Q4_0 | ~2.9 GB | ⭐⭐⭐½ Slightly lower | ✅ OK if tight on VRAM |
+| IQ4_XS | ~2.7 GB | ⭐⭐⭐½ Imatrix quant | ✅ Good alternative |
+| Q3_K_M | ~2.3 GB | ⭐⭐⭐ Noticeable drop | ⚠ Avoid if possible |
+| Q2_K | ~1.8 GB | ⭐⭐ Poor reasoning | ❌ Not recommended |
 
-4. **`gemma2:9b`**
-   - 9 billion parameters
-   - Google's model
-   - **Install:** `ollama pull gemma2:9b`
+---
 
-### Minimum Acceptable
-5. **`phi3:mini`** (3.8B)
-   - Still small but better instruction tuning than qwen2.5:3b
-   - **Install:** `ollama pull phi3:mini`
+## Alternative Models (drop-in compatible)
 
-## How to Change Model
+All models below work with the same `start_llama_server.bat` — just change
+`--model` path and optionally adjust `--ctx-size`.
 
-1. Pull the new model:
-   ```bash
-   ollama pull mistral:7b
-   ```
+### Llama 3.2 3B Instruct — `Llama-3.2-3B-Instruct-Q4_K_M.gguf`
+- **Size**: ~2.0 GB  |  **Context**: 8 192
+- **Download**: `bartowski/Llama-3.2-3B-Instruct-GGUF` on HuggingFace
+- **Good for**: Very fast responses, limited memory systems
 
-2. Edit `agent/model_adapter.py` line 18:
-   ```python
-   # Change from:
-   model: str = "qwen2.5:3b"
-   
-   # To:
-   model: str = "mistral:7b"
-   ```
+### Phi-3.5 Mini Instruct — `Phi-3.5-mini-instruct-Q4_K_M.gguf`
+- **Size**: ~2.2 GB  |  **Context**: 4 096
+- **Download**: `bartowski/Phi-3.5-mini-instruct-GGUF` on HuggingFace
+- **Good for**: Microsoft ecosystem, structured output tasks
 
-3. Restart the servers
+### Mistral 7B Instruct v0.3 — `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`
+- **Size**: ~4.4 GB  |  **Context**: 32 768
+- **Download**: `bartowski/Mistral-7B-Instruct-v0.3-GGUF` on HuggingFace
+- **Good for**: Stronger reasoning, 8+ GB VRAM systems
 
-## Why Bigger Models Work Better
+---
 
-- **Tool Calling**: Requires understanding context and exact JSON formatting
-- **Conversation Memory**: Needs to track what was said vs what wasn't
-- **Following Instructions**: Small models struggle with complex system prompts
-- **Less Hallucination**: Bigger models have more capacity to "think" accurately
+## Setup Instructions
 
-**Bottom line**: Upgrade to at least 7B parameters for stable, reliable MIRA performance.
+### 1. Download llama.cpp server binary
+```
+https://github.com/ggml-org/llama.cpp/releases
+```
+- **NVIDIA GPU**: `llama-b****-bin-win-cuda-cu12.x.x-x64.zip`
+- **AMD GPU / iGPU**: `llama-b****-bin-win-vulkan-x64.zip`
+- **CPU only**: `llama-b****-bin-win-noavx-x64.zip`
+
+Extract `llama-server.exe` into `MIRA-Windows/` (excluded from git).
+
+### 2. Place model file
+```
+MIRA-Windows/gemma-4-E2B-it-Q4_K_M.gguf   ← already here ✅
+```
+
+### 3. Add to `.env`
+```env
+LLAMA_SERVER_URL=http://127.0.0.1:8080
+LLAMA_MODEL_NAME=gemma-4-E2B-it
+MIRA_DEFAULT_CONTEXT_WINDOW=16384
+```
+
+### 4. Start MIRA
+```bat
+run.bat          ← auto-starts llama server + MCP bridge + UI
+```
+Or launch the server manually first:
+```bat
+start_llama_server.bat     ← then run.bat separately
+```
+
+---
+
+## Server Flags Reference
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `--ctx-size` | `16384` | Context window (tokens) |
+| `--n-gpu-layers` | `999` | Offload all layers to GPU |
+| `--cache-type-k` | `q4_0` | KV key cache quantization |
+| `--cache-type-v` | `q4_0` | KV value cache quantization |
+| `--rope-scale` | `2` | Effective context × 2 (32 768) |
+| `-t` | `8` | CPU threads (adjust to your CPU) |
+| `--temp` | `0.7` | Sampling temperature |
+| `--repeat-penalty` | `1.1` | Anti-repetition penalty |
+
+---
+
+## Cloud Fallback
+
+If the llama.cpp server is unreachable, MIRA automatically falls back to
+cloud providers in this priority order:
+1. **Groq** — llama-3.3-70b-versatile (fastest)
+2. **Gemini** — gemini-2.5-flash-lite
+3. **Cerebras** — llama-3.3-70b
+4. **SambaNova** — Meta-Llama-3.3-70B-Instruct
+5. **OpenRouter** — meta-llama/llama-3.3-70b-instruct:free
+
+Set keys in `.env` to enable fallback providers.

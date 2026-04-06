@@ -167,7 +167,7 @@ class ProviderStateManager:
         for prefix in prefixes:
             if model.startswith(prefix):
                 return prefix.rstrip(":")
-        return "ollama"
+        return "llamacpp"
 
     @staticmethod
     def supports_system_role(provider: str) -> bool:
