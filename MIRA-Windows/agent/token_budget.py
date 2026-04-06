@@ -83,7 +83,7 @@ def get_context_window(model: str) -> int:
 # ── Budget allocation engine ─────────────────────────────────────────────
 
 # Default soft limit as env-overridable
-DEFAULT_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "8000"))
+DEFAULT_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "2000"))
 
 
 class TokenBudget:
@@ -120,37 +120,45 @@ class TokenBudget:
     # Adaptive limits per step type (tokens, not chars)
     STEP_TYPE_ALLOCATIONS = {
         "plan": {
-            "system": 600, "profile": 800, "memory": 600,
-            "history": 1200, "step_tools": 1000, "recent_outputs": 200,
-            "done_block": 200, "buffer": 200,
-            "short_term": 200, "tool_history": 200,
-            "goal": 400, "task_contract": 800, "working_state": 250,
-            "constraints": 200,
+            "system": 120, "profile": 140, "memory": 220,
+            "history": 260, "step_tools": 160, "recent_outputs": 0,
+            "done_block": 80, "buffer": 60,
+            "short_term": 0, "tool_history": 0,
+            "goal": 260, "task_contract": 120, "working_state": 80,
+            "constraints": 80,
         },
         "act": {
-            "system": 500, "profile": 600, "memory": 500,
-            "history": 800, "step_tools": 1500, "recent_outputs": 1200,
-            "done_block": 1000, "buffer": 400,
-            "short_term": 400, "tool_history": 800,
-            "goal": 400, "task_contract": 800, "working_state": 300,
-            "constraints": 400,
+            "system": 70, "profile": 0, "memory": 0,
+            "history": 0, "step_tools": 260, "recent_outputs": 0,
+            "done_block": 160, "buffer": 80,
+            "short_term": 80, "tool_history": 100,
+            "goal": 120, "task_contract": 0, "working_state": 0,
+            "constraints": 120,
         },
         "replan": {
-            "system": 500, "profile": 500, "memory": 500,
-            "history": 600, "step_tools": 800, "recent_outputs": 400,
-            "done_block": 1500, "buffer": 200,
-            "short_term": 300, "tool_history": 400,
-            "goal": 400, "task_contract": 900, "working_state": 300,
-            "constraints": 300,
+            "system": 90, "profile": 100, "memory": 120,
+            "history": 180, "step_tools": 180, "recent_outputs": 0,
+            "done_block": 260, "buffer": 80,
+            "short_term": 60, "tool_history": 80,
+            "goal": 180, "task_contract": 120, "working_state": 80,
+            "constraints": 120,
         },
         "synthesize": {
-            "system": 500, "profile": 600, "memory": 600,
-            "history": 1000, "step_tools": 0, "recent_outputs": 0,
-            "done_block": 2500, "buffer": 200,
+            "system": 70, "profile": 0, "memory": 0,
+            "history": 120, "step_tools": 0, "recent_outputs": 0,
+            "done_block": 620, "buffer": 60,
             "short_term": 0, "tool_history": 600,
-            "goal": 400, "task_contract": 900, "working_state": 300,
-            "constraints": 300,
+            "goal": 180, "task_contract": 120, "working_state": 80,
+            "constraints": 90,
         },
+    }
+
+    # Hard prompt caps by phase for small local models.
+    STEP_SOFT_LIMITS = {
+        "plan": 1200,
+        "act": 700,
+        "replan": 900,
+        "synthesize": 900,
     }
 
     def __init__(self, soft_limit: int | None = None, model: str = ""):
@@ -176,6 +184,7 @@ class TokenBudget:
             (trimmed_sections, budget_note, diagnostics)
         """
         allocations = self.STEP_TYPE_ALLOCATIONS.get(step_type, self.STEP_TYPE_ALLOCATIONS["act"])
+        active_limit = min(self.soft_limit, self.STEP_SOFT_LIMITS.get(step_type, self.soft_limit))
 
         # Count tokens for each section
         token_counts = {k: count_tokens(v) for k, v in sections.items()}
@@ -183,13 +192,13 @@ class TokenBudget:
 
         diagnostics = {
             "total_tokens_before": total,
-            "soft_limit": self.soft_limit,
+            "soft_limit": active_limit,
             "step_type": step_type,
             "tokenizer": tokenizer_info()["name"],
             "sections_before": dict(token_counts),
         }
 
-        if total <= self.soft_limit:
+        if total <= active_limit:
             diagnostics["trimmed"] = False
             return dict(sections), "", diagnostics
 
@@ -210,7 +219,7 @@ class TokenBudget:
         # Pass 1: Per-section limits — trim each section that exceeds its allocation
         for key in sorted_keys:
             current_total = sum(count_tokens(v) for v in out.values())
-            if current_total <= self.soft_limit:
+            if current_total <= active_limit:
                 break
 
             if key in self.PROTECTED_SECTIONS:
@@ -227,7 +236,7 @@ class TokenBudget:
         # This guarantees the total will converge to <= soft_limit.
         for _round in range(10):  # safety cap on iterations
             current_total = sum(count_tokens(v) for v in out.values())
-            if current_total <= self.soft_limit:
+            if current_total <= active_limit:
                 break
             for key in sorted_keys:
                 if not out.get(key):
@@ -241,7 +250,7 @@ class TokenBudget:
                 target = max(1, section_tokens // 2)
                 out[key] = self._trim_section(out[key], target, key)
                 # Re-check total after each trim
-                if sum(count_tokens(v) for v in out.values()) <= self.soft_limit:
+                if sum(count_tokens(v) for v in out.values()) <= active_limit:
                     break
 
         diagnostics["trimmed"] = True

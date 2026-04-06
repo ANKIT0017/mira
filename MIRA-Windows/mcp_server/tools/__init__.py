@@ -48,8 +48,15 @@ def register_tool(
                 continue  # don't list **kwargs as a named param
             if param.kind == inspect.Parameter.VAR_POSITIONAL:  # *args
                 continue
+            _ann = param.annotation
+            if _ann == inspect.Parameter.empty:
+                _ann_name = "any"
+            elif hasattr(_ann, "__name__"):
+                _ann_name = _ann.__name__
+            else:
+                _ann_name = str(_ann).replace("typing.", "")
             param_info = {
-                "type": param.annotation.__name__ if param.annotation != inspect.Parameter.empty else "any",
+                "type": _ann_name,
                 "default": param.default if param.default != inspect.Parameter.empty else None,
                 "required": param.default == inspect.Parameter.empty
             }
@@ -186,6 +193,45 @@ def full_tool_schemas(categories: Optional[set[str]] = None) -> str:
                 lines.append(f"    Example: {example}")
             if notes:
                 lines.append(f"    Note: {notes}")
+    return "\n".join(lines)
+
+
+def full_tool_schemas_for_tools(tool_names: list[str]) -> str:
+    """
+    Full schema cards for an explicit tool-name subset.
+    """
+    if not tool_names:
+        return "TOOLS FOR THIS STEP: none"
+    lines = ["TOOLS FOR THIS STEP (use exact names and args):"]
+    seen = set()
+    for name in tool_names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        tool = TOOL_METADATA.get(name)
+        if not tool:
+            continue
+        desc = (tool.get("description") or "").split("\n")[0].strip()[:100]
+        params = tool.get("parameters", {}) or {}
+        notes = tool.get("notes") or ""
+        example = tool.get("example") or ""
+        arg_parts = []
+        for pname, pinfo in params.items():
+            ptype = pinfo.get("type", "any")
+            required = pinfo.get("required", False)
+            default = pinfo.get("default")
+            if required:
+                arg_parts.append(f"{pname}: {ptype} [required]")
+            else:
+                dflt_str = f", default={default!r}" if default is not None else ""
+                arg_parts.append(f"{pname}: {ptype} [optional{dflt_str}]")
+        lines.append(f"  {name}: {desc}")
+        if arg_parts:
+            lines.append("    Args: " + " | ".join(arg_parts))
+        if example:
+            lines.append(f"    Example: {example}")
+        if notes:
+            lines.append(f"    Note: {notes}")
     return "\n".join(lines)
 
 

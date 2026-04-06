@@ -546,6 +546,74 @@ def generate_with_messages(
         return generate(flat, model=model, max_tokens=max_tokens, timeout=timeout, temperature=temperature)
 
 
+def supports_ollama_native_tools(model: str) -> bool:
+    """
+    Return True when the local Ollama model likely supports native tool calling.
+    """
+    m = (model or "").lower().strip()
+    if not m:
+        return False
+    # Provider-prefixed models are routed through cloud adapters, not local Ollama.
+    if any(m.startswith(p) for p in ("groq:", "gemini:", "cerebras:", "sambanova:", "openrouter:")):
+        return False
+    return any(tag in m for tag in ("qwen2.5", "llama3.2", "mistral"))
+
+
+def generate_with_native_tools(
+    messages: list[dict],
+    tools: list[dict],
+    model: str = "qwen2.5:7b-instruct",
+    timeout: int = 240,
+    temperature: float = 0.1,
+) -> dict:
+    """
+    Local Ollama /api/chat call with native tool-calling enabled.
+
+    Returns:
+      {
+        "content": "...assistant text...",
+        "tool_calls": [...],   # optional
+      }
+    """
+    if not isinstance(messages, list) or not messages:
+        return {"error": "messages must be a non-empty list"}
+    if not isinstance(tools, list) or not tools:
+        return {"error": "tools must be a non-empty list"}
+
+    # qwen3.5 supports 32k context; others default to 16k for local stability.
+    _num_ctx = 32768 if "qwen3.5" in model.lower() else 16384
+    try:
+        print(f"[PROVIDER] Ollama /api/chat(native-tools) -> {model} tools={len(tools)}")
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": {
+                "num_ctx": _num_ctx,
+                "num_predict": 1024,
+                "temperature": temperature,
+            },
+        }
+        resp = requests.post(
+            "http://localhost:11434/api/chat",
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data.get("message", {}) if isinstance(data, dict) else {}
+        tool_calls = msg.get("tool_calls", []) if isinstance(msg, dict) else []
+        content = (msg.get("content", "") if isinstance(msg, dict) else "") or ""
+        return {"content": content.strip(), "tool_calls": tool_calls}
+    except requests.exceptions.Timeout:
+        return {"error": "Ollama native tool call timed out"}
+    except requests.exceptions.ConnectionError:
+        return {"error": "Could not connect to Ollama on localhost:11434"}
+    except Exception as e:
+        return {"error": f"Ollama native tool call failed: {e}"}
+
+
 def _flatten_messages(messages: list[dict]) -> str:
     """Flatten structured messages back into a single prompt string."""
     parts = []

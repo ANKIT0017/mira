@@ -7,9 +7,21 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from .model_adapter import generate, generate_with_messages
+from .model_adapter import (
+    generate,
+    generate_with_messages,
+    generate_with_native_tools,
+    supports_ollama_native_tools,
+)
 from .run_controller import get_controller, TERMINAL_STATES
-from mcp_server.tools import execute_tool, list_tools, compact_tool_docs, full_tool_schemas, TOOL_METADATA
+from mcp_server.tools import (
+    execute_tool,
+    list_tools,
+    compact_tool_docs,
+    full_tool_schemas,
+    full_tool_schemas_for_tools,
+    TOOL_METADATA,
+)
 
 # Context engineering modules (v2)
 from .context_compiler import ContextCompiler, ContextSections, StepType
@@ -23,23 +35,27 @@ from .context_metrics import ContextMetricsTracker
 MAX_AUTONOMOUS_STEPS  = 50   # Hard step cap (was 275; tighter = more deterministic)
 MAX_RETRIES_PER_STEP = int(os.getenv("MIRA_MAX_RETRIES_PER_STEP", "4"))
 MAX_PLAN_REVISIONS   = 3    # Replan budget for splitting/revising remaining plan
-MAX_HISTORY_TURNS    = 8    # Cap conversation history to last N turns (context pressure)
+REPLAN_CONSECUTIVE_FAILURES = int(os.getenv("MIRA_REPLAN_CONSECUTIVE_FAILURES", "3"))
+MAX_HISTORY_TURNS    = 4    # Keep history short for small local models
+MAX_PLAN_HISTORY_TURNS = 2  # Planner only sees the last 2 turns
 SANDBOX_DIR = "SANDBOX"
 MEMORY_FILE = "MEMORY.md"
 SOUL_FILE = "SOUL.md"
 USER_FILE = "USER.md"
 MAX_MEMORY_CONTEXT_CHARS = 6000
 MAX_PROFILE_CONTEXT_CHARS = int(os.getenv("MIRA_MAX_PROFILE_CONTEXT_CHARS", "3500"))
+MAX_PLAN_MEMORY_ITEMS = int(os.getenv("MIRA_MAX_PLAN_MEMORY_ITEMS", "5"))
+MAX_PLAN_USER_FACTS = int(os.getenv("MIRA_MAX_PLAN_USER_FACTS", "3"))
 MAX_RECENT_TOOL_OUTPUTS = int(os.getenv("MIRA_MAX_RECENT_TOOL_OUTPUTS", "3"))
 MAX_RECENT_TOOL_OUTPUT_CHARS = int(os.getenv("MIRA_MAX_RECENT_TOOL_OUTPUT_CHARS", "1000"))
-PROMPT_TOKEN_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "8000"))
+PROMPT_TOKEN_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "2000"))
 CHARS_PER_TOKEN_ESTIMATE = 4
 BUFFER_THRESHOLD_CHARS = 2000
 MAX_BUFFER_CONTEXT_ITEMS = int(os.getenv("MIRA_MAX_BUFFER_CONTEXT_ITEMS", "6"))
 FORCE_BUFFER_PREFIXES = ("search.", "firecrawl.")
 EMAIL_REGEX = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 
-# â”€â”€ Synthesizer bypass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  Synthesizer bypass 
 # Set True to skip the LLM synthesis call and emit the raw step results directly.
 # Useful for testing execution quality without the synthesizer layer.
 BYPASS_SYNTHESIZER: bool = False
@@ -57,11 +73,12 @@ CATEGORY_KEYWORDS: dict = {
     # "mail" don't accidentally pull in the Email category for non-email steps.
     "Email": ["send email", "read email", "email inbox", "email draft", "fetch email", "check inbox", "inbox"],
     "Calendar": ["calendar", "event", "schedule", "meeting", "reminder"],
-    # Remove "task" and "complete" â€” too generic; they appear in step descriptions
+    # Remove "task" and "complete"  too generic; they appear in step descriptions
     # like "(User clarification: drop this task)" triggering false category matches.
     "Todo List": ["todo", "todo list", "checklist"],
     "Knowledge Base": ["knowledge", "remember", "notes"],
     "System": ["current time", "current date", "system status", "system"],
+    "Workflows": ["workflow", "template", "reuse", "repeat task", "automation"],
     # Buffer: steps that process, gather, compile, or synthesize data already in buffers
     "Buffer": ["buffer", "from results", "from the results", "gather list", "compile list",
                "extract list", "process results", "summarize results", "list of books",
@@ -90,6 +107,7 @@ _SIDE_EFFECT_PREFIXES = (
     "profile.update",
     "buffer.write",
     "buffer.update",
+    "workflow.save",
     "convert.",
     "pdf.create",
     "pdf.merge",
@@ -101,8 +119,8 @@ def _parse_tool_constraints(text: str) -> tuple:
     Parse runtime allow/deny constraints from user prompt text.
 
     Recognized patterns (case-insensitive):
-      "Use ONLY: filesystem.*, todo.*"   Ã¢â€ â€™ only these prefixes are permitted
-      "Do NOT use: web/email/whatsapp"   Ã¢â€ â€™ these prefixes are hard-blocked
+      "Use ONLY: filesystem.*, todo.*"    only these prefixes are permitted
+      "Do NOT use: web/email/whatsapp"    these prefixes are hard-blocked
 
     Returns (allowed: set[str], denied: set[str]).  Each token is a lowercase
     tool prefix; matching uses  tool_name == tok  or  tool_name.startswith(tok + '.').
@@ -141,17 +159,17 @@ def _humanize_error(error: str, tool_name: str, tool_args: dict) -> str:
     if "5.1.3" in e or "not a valid RFC 5321" in e or "is not a valid" in e.lower():
         to_val = (tool_args or {}).get("to", "")
         return (
-            f"The 'to' value '{to_val}' is NOT a valid email address Ã¢â‚¬â€ it looks like a "
+            f"The 'to' value '{to_val}' is NOT a valid email address  it looks like a "
             "phone number. email.send requires an address like 'name@domain.com'. "
             "If the contact has no email, use whatsapp.send with the phone number instead."
         )
-    # Contact/record ID not found Ã¢â‚¬â€ LLM hallucinated an id instead of reading from a prior result
+    # Contact/record ID not found  LLM hallucinated an id instead of reading from a prior result
     if "contact id" in e.lower() and "not found" in e.lower():
         bad_id = (tool_args or {}).get("id", "")
         return (
             f"Contact ID {bad_id!r} does not exist. You must pass the integer 'id' that was "
             f"returned by a previous contacts.search or contacts.get call. "
-            f"Look in COMPLETED STEPS above Ã¢â‚¬â€ find the 'id' field in those results and pass "
+            f"Look in COMPLETED STEPS above  find the 'id' field in those results and pass "
             f"that exact integer value to {tool_name}. Do NOT invent or guess an id."
         )
     # Generic record-not-found (covers task, event, note IDs)
@@ -171,9 +189,9 @@ def _humanize_error(error: str, tool_name: str, tool_args: dict) -> str:
     if re.search(r"missing required field|is required|cannot be empty|required", e.lower()):
         return (
             f"The call to {tool_name} is missing required arguments. "
-            "Use the exact ACTION JSON format and include all required args shown in the tool error/example."
+            "Use the exact TOOL format and include all required args shown in the tool error/example."
         )
-    # Tool not found Ã¢â‚¬â€ check BEFORE the generic 'not found + id' case
+    # Tool not found  check BEFORE the generic 'not found + id' case
     if "not found" in e.lower() and ("tool" in e.lower() or tool_name in e):
         # Only if the error is specifically about a missing tool, not a missing record
         if "id" not in e.lower():
@@ -188,7 +206,7 @@ def _humanize_error(error: str, tool_name: str, tool_args: dict) -> str:
     return f"Error was: {e[:300]}"
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ Tool Policy Engine Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+#  Tool Policy Engine 
 # Policies are keyed by tool prefix/family and define deterministic success,
 # failure, and escalation behaviour so the execution loop never needs LLM text
 # reasoning to detect empty results, loops, or user-information gaps.
@@ -201,14 +219,14 @@ class ToolPolicy:
     family: str                    # human label
     empty_is_failure: bool = False # 0-item / empty-string result treated as failure
     # fallback_sequence: ordered recovery steps before LLM replan.
-    #   ("tool",       composer)  Ã¢â€ â€™ composer(tool_name, args, error) -> (new_tool, new_args) | None
-    #   ("need_input", composer)  Ã¢â€ â€™ composer(tool_name, args, error) -> question_str
+    #   ("tool",       composer)   composer(tool_name, args, error) -> (new_tool, new_args) | None
+    #   ("need_input", composer)   composer(tool_name, args, error) -> question_str
     fallback_sequence: tuple = ()
     # Last-resort question generator (also used for direct need_input verdict)
     need_input_question: object = None   # callable(tool_name, args, error) -> str | None
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ Fallback composers (pure functions for use in fallback_sequence) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+#  Fallback composers (pure functions for use in fallback_sequence) 
 
 def _fb_list_sandbox(tn, args, err):
     """search-family fallback #1: list SANDBOX root so model sees what exists."""
@@ -284,9 +302,9 @@ def _ni_record(tn, args, err):
     )
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ Policy objects Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+#  Policy objects 
 
-# filesystem.search  Ã¢â‚¬â€ fall back to listing SANDBOX so the model can see what's there
+# filesystem.search   fall back to listing SANDBOX so the model can see what's there
 _POLICY_FILE_SEARCH = ToolPolicy(
     family="file_search",
     empty_is_failure=True,
@@ -297,7 +315,7 @@ _POLICY_FILE_SEARCH = ToolPolicy(
     need_input_question=_ni_search,
 )
 
-# todo.search / knowledge.search  Ã¢â‚¬â€ DB queries; filesystem listing is irrelevant
+# todo.search / knowledge.search   DB queries; filesystem listing is irrelevant
 _POLICY_TODO_SEARCH = ToolPolicy(
     family="todo_search",
     empty_is_failure=True,
@@ -312,7 +330,7 @@ _POLICY_KNOWLEDGE_SEARCH = ToolPolicy(
     need_input_question=_ni_knowledge_search,
 )
 
-# search.duckduckgo / search.news  Ã¢â‚¬â€ web queries; may also be service-down
+# search.duckduckgo / search.news   web queries; may also be service-down
 _POLICY_WEB_SEARCH = ToolPolicy(
     family="web_search",
     empty_is_failure=True,
@@ -427,7 +445,7 @@ def _get_policy(tool_name: str) -> ToolPolicy:
     return _POLICY_DEFAULT
 
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ 5-way tool result classifier Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+#  5-way tool result classifier 
 # Returns one of: "success" | "retryable" | "need_input" | "hard_fail"
 # Driven by ToolPolicy; never relies on LLM text output to determine outcome.
 
@@ -462,7 +480,7 @@ def _classify_tool_result(
             return "hard_fail"   # side-effect may already have occurred
         return "retryable"
 
-    # Ã¢â€â‚¬Ã¢â€â‚¬ Success path: check emptiness according to policy Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    #  Success path: check emptiness according to policy 
     if policy.empty_is_failure:
         _is_empty = (
             tool_res is None
@@ -519,12 +537,13 @@ class Agent:
         self._task_contract: dict = {}
         self._working_state: dict = {"slots": {}, "artifacts": {}}
         self._handoff_payload: str = ""  # latest non-delivery payload for downstream send steps
+        self._pending_workflow_candidate: dict | None = None
         self._ensure_memory_file()
         self._ensure_profile_files()
         self._build_system_prompt()
         self._register_internal_tools()  # expose buffer tools to compact_tool_docs
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Context Engineering v2 Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Context Engineering v2 
         self._context_compiler = ContextCompiler(
             system_prompt=self.system_prompt,
             memory_file=self._memory_file_path(),
@@ -541,6 +560,7 @@ class Agent:
         self._task_contract = {}
         self._working_state = {"slots": {}, "artifacts": {}}
         self._handoff_payload = ""
+        self._pending_workflow_candidate = None
         # Reset context engineering state for new session
         self._context_compiler.reset()
         return {"status": "ok", "message": "History and buffer cleared"}
@@ -601,22 +621,15 @@ class Agent:
             TOOL_METADATA.setdefault(_t["name"], _t)
 
     def _build_system_prompt(self):
-        """Build compact prompt optimized for accurate local tool-calling."""
-        self.system_prompt = f"""{SOUL_FILE}, {USER_FILE}, {MEMORY_FILE}
-
-Core behavior:
-1) Complete tasks end-to-end and skip steps already satisfied by completed results.
-2) Be truthful: only claim success from successful tool outputs.
-3) If information is missing from user, ask NEED_INPUT with one precise question.
-4) Keep memory concise; use memory.write/memory.update for durable facts.
-
-
-Output format (exactly one):
-- ACTION: {{"tool":"...","args":{{...}}}}
-- FINAL ANSWER: <concise completion summary>
-- NEED_INPUT: <specific missing info>
-
-"""
+        """Build tiny fixed system prompt for small local models."""
+        self.system_prompt = (
+            "You are MIRA, a local AI assistant running on the user's PC.\n"
+            "Rules:\n"
+            "1. Use tools to act. Output ONE tool call per turn.\n"
+            "2. If step goal says to read a buffer first (e.g. buffer.slice id=1), call that FIRST next turn.\n"
+            "3. Confirm success only when tool output says so. Never invent results.\n"
+            "4. Only ask the user if information cannot be found with any tool."
+        )
 
     def _make_buffer_observation(self, buf_id: int, data: str, tool_name: str) -> str:
         """Create a compact buffer observation with digest + key refs."""
@@ -741,9 +754,9 @@ Output format (exactly one):
             known_slots["recipient_email"] = maybe_email[0]
 
         rows_spec = ""
-        m_rows = re.search(r'(\d+\s*[-â€“]\s*\d+)\s*rows', raw, re.IGNORECASE)
+        m_rows = re.search(r'(\d+\s*[-]\s*\d+)\s*rows', raw, re.IGNORECASE)
         if m_rows:
-            rows_spec = m_rows.group(1).replace("â€“", "-") + " rows"
+            rows_spec = m_rows.group(1).replace("", "-") + " rows"
 
         provided_data = {}
         if columns:
@@ -1104,7 +1117,7 @@ Output format (exactly one):
 
         memory_view = "\n".join(rendered).strip()
         if len(memory_view) > MAX_MEMORY_CONTEXT_CHARS:
-            memory_view = "Ã¢â‚¬Â¦[truncated to recent section]\n" + memory_view[-MAX_MEMORY_CONTEXT_CHARS:]
+            memory_view = "[truncated to recent section]\n" + memory_view[-MAX_MEMORY_CONTEXT_CHARS:]
 
         return (
             f"PERSISTENT MEMORY ({MEMORY_FILE}, auto-injected each turn):\n"
@@ -1130,6 +1143,448 @@ Output format (exactly one):
         if not blocks:
             return ""
         return "\n\n".join(blocks) + "\n\n"
+
+    def _get_plan_profile_context(self) -> str:
+        """
+        Return only a few key USER facts for planning.
+        """
+        user_text = self._read_profile_file(USER_FILE).strip()
+        if not user_text:
+            return ""
+        lines = [ln.strip() for ln in user_text.splitlines() if ln.strip().startswith("-")]
+        if not lines:
+            return ""
+        top = lines[:MAX_PLAN_USER_FACTS]
+        return "USER FACTS (planner):\n" + "\n".join(top) + "\n\n"
+
+    def _get_relevant_memory_context(self, task: str, max_items: int = MAX_PLAN_MEMORY_ITEMS) -> str:
+        """
+        Inject only task-relevant memory bullets + recent notes.
+        """
+        memory_text = self._read_memory_file().strip()
+        if not memory_text:
+            return ""
+        lines = [ln.strip() for ln in memory_text.splitlines() if ln.strip().startswith("-")]
+        if not lines:
+            return ""
+        task_words = {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", (task or "").lower())}
+        scored = []
+        for ln in lines:
+            ln_words = {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", ln.lower())}
+            overlap = len(task_words & ln_words)
+            scored.append((overlap, ln))
+        top = [ln for _, ln in sorted(scored, key=lambda x: x[0], reverse=True)[:max_items]]
+        recent = lines[-2:]
+        merged = []
+        for ln in top + recent:
+            if ln not in merged:
+                merged.append(ln)
+        picked = merged[:max_items]
+        if not picked:
+            return ""
+        return "RELEVANT MEMORY:\n" + "\n".join(picked) + "\n\n"
+
+    def _build_history_text(
+        self,
+        turns: list[tuple[str, str]],
+        max_turns: int = 2,
+        user_chars: int = 180,
+        assistant_chars: int = 180,
+    ) -> str:
+        """
+        Compact conversation history for small-model prompts.
+        """
+        if not turns:
+            return ""
+        out = []
+        for u, a in turns[-max_turns:]:
+            uu = (u or "").strip()
+            aa = (a or "").strip()
+            if len(uu) > user_chars:
+                uu = uu[:user_chars] + "...[truncated]"
+            if len(aa) > assistant_chars:
+                aa = aa[:assistant_chars] + "...[truncated]"
+            out.append(f"User: {uu}\nMIRA: {aa}")
+        return "\n".join(out) + ("\n" if out else "")
+
+    def _normalize_categories(self, categories: list) -> set:
+        """Normalize raw category strings to canonical CATEGORY_KEYWORDS keys.
+
+        Handles casing variants ("web & search", "Web&Search", "web and search") and
+        maps them to the exact keys used in CATEGORY_KEYWORDS / TOOL_METADATA so that
+        tool-prediction and category-gate logic works reliably.
+        """
+        CANONICAL = {
+            "web & search": "Web & Search",
+            "web&search": "Web & Search",
+            "web and search": "Web & Search",
+            "web search": "Web & Search",
+            "search": "Web & Search",
+            "web scraping": "Web Scraping",
+            "scraping": "Web Scraping",
+            "filesystem": "Filesystem",
+            "file": "Filesystem",
+            "files": "Filesystem",
+            "email": "Email",
+            "calendar": "Calendar",
+            "todo list": "Todo List",
+            "todo": "Todo List",
+            "todos": "Todo List",
+            "whatsapp": "WhatsApp",
+            "contacts": "Contacts",
+            "knowledge base": "Knowledge Base",
+            "knowledge": "Knowledge Base",
+            "buffer": "Buffer",
+            "system": "System",
+            "workflows": "Workflows",
+            "workflow": "Workflows",
+            "memory": "Memory",
+            "documents": "Documents",
+            "pdf": "Documents",
+        }
+        out = set()
+        for cat in (categories or []):
+            s = str(cat).strip()
+            lower = s.lower()
+            if lower in CANONICAL:
+                out.add(CANONICAL[lower])
+            else:
+                # Fall back to title-case as-is (handles exact matches like "Filesystem")
+                out.add(s if s else "System")
+        return out
+
+    def _predict_step_tools(self, step_desc: str, categories: list[str] | None = None) -> list[str]:
+        """
+        Deterministically predict the most likely tool + one backup for this step.
+        """
+        cats = self._normalize_categories(categories or [])
+        step_l = (step_desc or "").lower()
+
+        rules = [
+            ("Web & Search", r"\bnews\b", "search.news"),
+            ("Web & Search", r"\b(search|find|lookup|look up)\b", "search.duckduckgo"),
+            ("Filesystem", r"\b(write|save|create file)\b", "filesystem.write"),
+            ("Filesystem", r"\b(read|open|view)\b", "filesystem.read"),
+            ("Filesystem", r"\b(list|show files|directory)\b", "filesystem.list"),
+            ("Email", r"\bsend\b", "email.send"),
+            ("Email", r"\b(list|read|inbox|fetch)\b", "email.list"),
+            ("Calendar", r"\b(add|create|schedule)\b", "calendar.add_event"),
+            ("Calendar", r"\b(list|show|upcoming)\b", "calendar.list_events"),
+            ("Todo List", r"\b(add|create)\b", "todo.add"),
+            ("Todo List", r"\b(list|show)\b", "todo.list"),
+            ("Contacts", r"\b(find|lookup|search|get)\b", "contacts.search"),
+            ("WhatsApp", r"\b(document|pdf|file)\b", "whatsapp.send_media"),
+            ("WhatsApp", r"\b(send|message|text)\b", "whatsapp.send"),
+            ("Workflows", r"\b(list workflows|show workflows)\b", "workflow.list"),
+            ("Workflows", r"\b(run workflow|execute workflow)\b", "workflow.run"),
+            ("Workflows", r"\b(save workflow|remember workflow)\b", "workflow.save"),
+        ]
+
+        predicted = ""
+        for cat, pattern, tool in rules:
+            if cat in cats and re.search(pattern, step_l):
+                if tool in self.tools:
+                    predicted = tool
+                    break
+
+        if not predicted:
+            for cat in cats:
+                pool = [
+                    name for name, meta in TOOL_METADATA.items()
+                    if str(meta.get("category", "")).strip().lower() == cat.strip().lower()
+                    and name in self.tools
+                ]
+                if pool:
+                    predicted = sorted(pool)[0]
+                    break
+
+        if not predicted:
+            return []
+
+        pred_meta = TOOL_METADATA.get(predicted, {})
+        pred_cat = str(pred_meta.get("category", "")).strip().lower()
+        backups = [
+            name for name, meta in TOOL_METADATA.items()
+            if name != predicted
+            and name in self.tools
+            and str(meta.get("category", "")).strip().lower() == pred_cat
+        ]
+        backup = sorted(backups)[0] if backups else ""
+        return [predicted] + ([backup] if backup else [])
+
+    def _build_native_tool_defs(self, tool_names: list[str]) -> list[dict]:
+        """
+        Convert internal tool metadata to Ollama/OpenAI function-tool schema.
+        """
+        out = []
+        for name in tool_names:
+            meta = TOOL_METADATA.get(name)
+            if not meta:
+                continue
+            props = {}
+            required = []
+            for p_name, p_info in (meta.get("parameters", {}) or {}).items():
+                p_type = str((p_info or {}).get("type", "string")).lower()
+                j_type = "string"
+                if any(x in p_type for x in ("int", "float", "number")):
+                    j_type = "number"
+                elif "bool" in p_type:
+                    j_type = "boolean"
+                elif any(x in p_type for x in ("list", "array")):
+                    j_type = "array"
+                elif any(x in p_type for x in ("dict", "object", "map")):
+                    j_type = "object"
+                props[p_name] = {"type": j_type}
+                if p_info.get("required"):
+                    required.append(p_name)
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": str(meta.get("description", ""))[:300],
+                        "parameters": {
+                            "type": "object",
+                            "properties": props,
+                            "required": required,
+                        },
+                    },
+                }
+            )
+        return out
+
+    def _coerce_kv_value(self, raw: str):
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return s[1:-1]
+        sl = s.lower()
+        if sl in ("true", "false"):
+            return sl == "true"
+        if sl in ("null", "none"):
+            return None
+        if re.fullmatch(r"-?\d+", s):
+            try:
+                return int(s)
+            except Exception:
+                return s
+        if re.fullmatch(r"-?\d+\.\d+", s):
+            try:
+                return float(s)
+            except Exception:
+                return s
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return s
+        return s
+
+    def _extract_tool_kv_call(self, text: str):
+        """
+        Parse simplified ACT protocol:
+          TOOL: tool.name | arg=value | arg2=value
+          or
+          TOOL: tool.name
+          args: arg=value, arg2=value
+        """
+        if not text:
+            return None
+        lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+        if not lines:
+            return None
+        first = lines[0]
+        m = re.match(r"^\s*TOOL\s*:\s*([a-zA-Z0-9._\-]+)\s*(.*)$", first, re.IGNORECASE)
+        if not m:
+            return None
+        tool = m.group(1).strip()
+        tail = m.group(2).strip()
+        arg_blob = tail
+        if len(lines) > 1 and re.match(r"^\s*args\s*:", lines[1], re.IGNORECASE):
+            arg_blob = lines[1].split(":", 1)[-1].strip()
+        args = {}
+        if arg_blob:
+            parts = [p.strip() for p in re.split(r"\s*\|\s*|,\s*", arg_blob) if p.strip()]
+            for part in parts:
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                key = k.strip()
+                if not key:
+                    continue
+                args[key] = self._coerce_kv_value(v)
+        return tool, args, ""
+
+    def _should_skip_synthesis(self, completed: list) -> bool:
+        """
+        Skip synthesis for simple successful tasks.
+        """
+        if not completed:
+            return False
+        if not all(s.get("status") == "done" for s in completed):
+            return False
+        if len(completed) == 1:
+            return True
+        action_roots = ("calendar.", "email.", "todo.", "contacts.", "whatsapp.")
+        return all(str(s.get("tool", "")).startswith(action_roots) for s in completed)
+
+    def _render_simple_completion(self, completed: list) -> str:
+        """
+        Deterministic final message when synthesis is skipped.
+        """
+        if not completed:
+            return "Done."
+        if len(completed) == 1:
+            s = completed[0]
+            return f"Done. {str(s.get('result', '')).strip()[:280]}".strip()
+        lines = ["Done. Completed steps:"]
+        for idx, s in enumerate(completed[:6], start=1):
+            lines.append(f"{idx}. {str(s.get('result', '')).strip()[:140]}")
+        return "\n".join(lines)
+
+    def _maybe_stage_workflow_suggestion(
+        self,
+        task_text: str,
+        completed: list,
+        final_response: str,
+        workflow_was_auto_used: bool = False,
+    ) -> str:
+        """
+        For successful multi-step runs, stage a yes/no workflow-save prompt.
+        """
+        if workflow_was_auto_used:
+            return final_response
+        if self._pending_workflow_candidate:
+            return final_response
+        if not completed or len(completed) < 2:
+            return final_response
+        if not all(str(s.get("status", "")) == "done" for s in completed):
+            return final_response
+
+        steps = []
+        for s in completed:
+            goal = str(s.get("step", "")).strip()
+            if not goal:
+                continue
+            cats = s.get("categories", [])
+            if isinstance(cats, str):
+                cats = [c.strip() for c in re.split(r"[,/|]+", cats) if c.strip()]
+            if not isinstance(cats, list):
+                cats = []
+            steps.append({"goal": goal, "categories": self._normalize_categories(cats)})
+        if len(steps) < 2:
+            return final_response
+
+        self._pending_workflow_candidate = {
+            "task": task_text,
+            "name": self._suggest_workflow_name(task_text),
+            "steps": steps,
+            "trigger_keywords": self._suggest_workflow_triggers(task_text),
+            "variables": [],
+        }
+        n = len(steps)
+        prompt = f"I completed this in {n} steps. Save this as a reusable workflow? (yes/no)"
+        return (final_response.rstrip() + "\n\n" + prompt).strip()
+
+    def _workflow_dir_path(self) -> Path:
+        return (Path(__file__).parent.parent / "SANDBOX" / "workflows").resolve()
+
+    def _load_workflow_library(self) -> list[dict]:
+        wdir = self._workflow_dir_path()
+        wdir.mkdir(parents=True, exist_ok=True)
+        items = []
+        for f in sorted(wdir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data["_path"] = str(f)
+                    items.append(data)
+            except Exception:
+                continue
+        return items
+
+    def _infer_workflow_variables(self, text: str, wf: dict, matched_kw: str) -> dict:
+        vars_out = {}
+        variables = [str(v).strip() for v in (wf.get("variables", []) or []) if str(v).strip()]
+        if not variables:
+            return vars_out
+        t = (text or "").strip()
+        quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', t)
+        qflat = [a or b for a, b in quoted if (a or b)]
+        for i, var in enumerate(variables):
+            if i < len(qflat):
+                vars_out[var] = qflat[i]
+        if variables and variables[0] not in vars_out:
+            rem = t
+            if matched_kw:
+                idx = rem.lower().find(matched_kw.lower())
+                if idx >= 0:
+                    rem = rem[idx + len(matched_kw):].strip(" :,-")
+            if rem:
+                vars_out[variables[0]] = rem
+        return vars_out
+
+    def _expand_workflow_steps(self, wf: dict, variables: dict | None = None) -> list[dict]:
+        vars_map = {str(k): str(v) for k, v in (variables or {}).items()}
+        out = []
+        for st in (wf.get("steps", []) or []):
+            if not isinstance(st, dict):
+                continue
+            goal = str(st.get("goal", ""))
+            for k, v in vars_map.items():
+                goal = goal.replace("{" + k + "}", v)
+            cats = st.get("categories", [])
+            if isinstance(cats, str):
+                cats = [c.strip() for c in re.split(r"[,/|]+", cats) if c.strip()]
+            out.append({"goal": goal, "categories": self._normalize_categories(cats if isinstance(cats, list) else [])})
+        return out
+
+    def _match_workflow_trigger(self, text: str) -> tuple[dict | None, dict]:
+        """
+        Return best matching workflow and inferred variables from user text.
+        """
+        msg = (text or "").lower()
+        best = None
+        best_score = -1
+        best_kw = ""
+        for wf in self._load_workflow_library():
+            kws = [str(k).strip().lower() for k in (wf.get("trigger_keywords", []) or []) if str(k).strip()]
+            for kw in kws:
+                if kw and kw in msg:
+                    score = len(kw)
+                    if score > best_score:
+                        best = wf
+                        best_score = score
+                        best_kw = kw
+        if not best:
+            return None, {}
+        vars_map = self._infer_workflow_variables(text, best, best_kw)
+        return best, vars_map
+
+    def _suggest_workflow_name(self, task_text: str) -> str:
+        raw = (task_text or "").strip().lower()
+        words = re.findall(r"[a-z0-9]+", raw)
+        keep = [w for w in words if w not in {"the", "a", "an", "to", "for", "and", "with", "on", "in"}]
+        if not keep:
+            keep = ["workflow"]
+        name = "_".join(keep[:4])
+        return name[:64] or "workflow"
+
+    def _suggest_workflow_triggers(self, task_text: str) -> list[str]:
+        text = (task_text or "").lower()
+        chunks = [c.strip() for c in re.split(r"[,.]| and | then ", text) if c.strip()]
+        out = []
+        for ch in chunks[:3]:
+            words = [w for w in re.findall(r"[a-z0-9]+", ch) if len(w) > 2]
+            if words:
+                out.append(" ".join(words[:3]))
+        # de-duplicate, keep order
+        dedup = []
+        for x in out:
+            if x not in dedup:
+                dedup.append(x)
+        return dedup[:3]
 
     def _get_recent_tool_outputs_context(self, recent_outputs: list[dict], step_desc: str = "", step_idx: int = 0) -> str:
         """
@@ -1166,7 +1621,7 @@ Output format (exactly one):
         return "\n".join(lines) + "\n\n"
 
     def _estimate_tokens(self, text: str) -> int:
-        """Token counting Ã¢â‚¬â€ delegates to accurate tokenizer (tiktoken or fallback)."""
+        """Token counting  delegates to accurate tokenizer (tiktoken or fallback)."""
         return count_tokens(text)
 
     def _summarize_block(self, text: str, max_chars: int, prefer_tail: bool = False) -> str:
@@ -1263,28 +1718,45 @@ Output format (exactly one):
         return steps
 
     def _should_split_compound_task(self, user_text: str, steps: list) -> bool:
-        """Return True when planner produced a single broad step for a multi-intent task."""
+        """Return True when planner produced a single broad step for a multi-intent task.
+
+        Catches patterns like:
+          - "find X and send to Y via mail"  (no explicit linker, just "and")
+          - "search X then email Y"
+        """
         if len(steps) != 1:
             return False
         t = (user_text or "").lower()
         if not t.strip():
             return False
+        # Explicit linker words always trigger split
         has_linker = bool(re.search(r'\b(and then|then|after that|next|finally|also)\b', t))
+        if has_linker:
+            return True
+        # Count DISTINCT cross-category intents — 2+ means it's a compound task
         intent_count = 0
-        if re.search(r'\b(find|search|research|look up|gather)\b', t):
+        if re.search(r'\b(find|search|research|look up|gather|get)\b', t):
             intent_count += 1
         if re.search(r'\b(pdf|document|doc|report|convert|summari[sz]e|excel|xlsx|spreadsheet|table|formula)\b', t):
             intent_count += 1
-        if re.search(r'\b(send|share|forward|message)\b', t):
+        if re.search(r'\b(send|share|forward|email|mail|message)\b', t):
             intent_count += 1
-        return has_linker or intent_count >= 2
+        if re.search(r'\b(whatsapp|wa|telegram|slack)\b', t):
+            intent_count += 1
+        return intent_count >= 2
 
     def _split_compound_task(self, user_text: str) -> list:
-        """Deterministically split compound user task into smaller executable steps."""
+        """Deterministically split compound user task into atomic, buffer-aware steps.
+
+        Produces concrete step goals instead of vague generic labels.
+        The [BUFFER:?] placeholder is replaced with the real ID by
+        _inject_buffer_refs_into_steps() once the search step completes.
+        """
         text = (user_text or "").strip()
         if not text:
             return []
 
+        # Try linker-based split first ("find X, then send")
         parts = [
             p.strip(" ,.;")
             for p in re.split(r'\b(?:and then|then|after that|next|finally|also)\b', text, flags=re.IGNORECASE)
@@ -1295,27 +1767,186 @@ Output format (exactly one):
             cats = sorted(self._select_categories(part, user_message=text))
             out.append({"goal": part, "categories": cats})
 
-        # Safety net: if split failed to produce multiple parts for a known pattern,
-        # inject canonical 3-step decomposition.
+        # Build atomic steps when linker-split didn't produce multiple parts
         if len(out) <= 1:
             t = text.lower()
-            if re.search(r'\bfind|search|research\b', t):
+            out = []
+
+            # Step A: Search / Research
+            if re.search(r'\b(find|search|research|look up|gather|get)\b', t):
+                # Extract subject: text after the verb, before "and"/delivery verb
+                m = re.search(
+                    r'\b(?:find|search|research|look\s+up|gather|get)\b\s+(.+?)'
+                    r'(?:\s+and\b|\s+then\b|\s+(?:send|email|mail|forward|share|whatsapp)\b|$)',
+                    text, re.IGNORECASE
+                )
+                subject = m.group(1).strip().rstrip(' .,;') if m else text
                 out.append({
-                    "goal": "Research the requested topic and collect practical points.",
-                    "categories": ["Web & Search", "Buffer", "Reasoning", "System"],
-                })
-            if re.search(r'\bpdf|document|report|convert|excel|xlsx|spreadsheet|table|formula\b', t):
-                out.append({
-                    "goal": "Create the requested document/spreadsheet artifact in SANDBOX.",
-                    "categories": ["Documents", "Filesystem", "Buffer", "Reasoning"],
-                })
-            if re.search(r'\bsend|share|forward|message\b', t):
-                out.append({
-                    "goal": "Send the generated PDF/document to the requested recipient (use media sending for files).",
-                    "categories": ["Contacts", "WhatsApp", "Buffer", "Reasoning", "System"],
+                    "goal": f"Search for: {subject}",
+                    "categories": sorted(self._select_categories("search web", user_message=text)),
                 })
 
+            # Step B: Create document artifact if requested
+            if re.search(r'\b(pdf|document|doc|report|convert|summari[sz]e|excel|xlsx|spreadsheet|table|formula)\b', t):
+                out.append({
+                    "goal": "Create the requested document using data from [BUFFER:?] (call buffer.slice id=<id> first to read it).",
+                    "categories": sorted(self._select_categories("create document", user_message=text)),
+                })
+
+            if re.search(r'\b(send|share|forward|email|mail|message|whatsapp)\b', t):
+                # Extract recipient name
+                m_recv = re.search(
+                    r'\b(?:send|share|forward|email|mail|message|whatsapp)\b[\w\s]*?'
+                    r'(?:to|via)?\s+([A-Za-z][a-z]+)',
+                    text, re.IGNORECASE
+                )
+                recipient = m_recv.group(1).strip() if m_recv else None
+                via_mail = bool(re.search(r'\b(mail|email|gmail)\b', t))
+                via_wa   = bool(re.search(r'\b(whatsapp|wa)\b', t))
+
+                # Step C: Look up contact first
+                if recipient:
+                    out.append({
+                        "goal": f"Find {recipient}'s contact details using contacts.search name='{recipient}'.",
+                        "categories": ["Contacts"],
+                    })
+
+                # Step D: Send
+                if via_mail:
+                    recip_hint = f" to {recipient}" if recipient else ""
+                    out.append({
+                        "goal": (
+                            f"Send email{recip_hint}: use buffer.slice id=<id> to read [BUFFER:?], "
+                            "compose a concise body, then email.send."
+                        ),
+                        "categories": ["Email", "Buffer"],
+                    })
+                elif via_wa:
+                    out.append({
+                        "goal": "Send the information via whatsapp.send using recipient's phone number from contacts.",
+                        "categories": ["WhatsApp", "Buffer"],
+                    })
+                else:
+                    out.append({
+                        "goal": "Send the gathered information to the recipient via the appropriate channel.",
+                        "categories": ["Email", "WhatsApp", "Contacts", "Buffer"],
+                    })
+
+        # Fallback: single step
+        if not out:
+            out = [{"goal": text, "categories": sorted(self._select_categories(text, user_message=text))}]
+
         return out
+
+    def _inject_buffer_refs_into_steps(
+        self, steps: list, completed_step: dict, buffer: dict
+    ) -> list:
+        """Replace [BUFFER:?] placeholders with the real buffer ID after a search step.
+
+        Called in the execute loop immediately after a search/scraping step succeeds
+        so downstream email/send steps know exactly which buffer to read.
+        """
+        step_tool = completed_step.get("tool", "")
+        if not step_tool.startswith(("search.", "firecrawl.")):
+            return steps
+        # Find the highest numeric buffer ID that exists
+        latest_id = max(
+            (int(k) for k in buffer.keys() if str(k).isdigit()), default=None
+        )
+        if latest_id is None:
+            return steps
+        buf_ref = f"[BUFFER:{latest_id}]"
+        updated = []
+        for s in steps:
+            goal = str(s.get("goal", ""))
+            # Replace placeholder
+            goal = re.sub(r'\[BUFFER:\?\]', buf_ref, goal)
+            # Also replace generic "id=<id>" hint with real id
+            goal = re.sub(r'id=<id>', f'id={latest_id}', goal)
+            updated.append({**s, "goal": goal})
+        return updated
+
+
+    def _distill_search_result(self, raw_obs: str, step_goal: str, model: str) -> str:
+        """Compress noisy search/scrape JSON into a clean bullet-point fact list.
+
+        Called synchronously (already inside asyncio.to_thread) before storing
+        in the buffer.  Falls back to raw_obs if the LLM call fails or is slow.
+
+        Budget: ~80 tokens prompt, ~200 tokens completion → negligible on small models.
+        """
+        # Skip distillation for very small results — already compact
+        if len(raw_obs) < 500:
+            return raw_obs
+        # Extract just the text snippets from JSON to reduce prompt size
+        try:
+            import json as _json
+            data = _json.loads(raw_obs)
+            # Flatten: pull title + snippet from results list
+            if isinstance(data, dict) and "results" in data:
+                lines = []
+                for r in data["results"][:8]:
+                    title   = str(r.get("title", "")).strip()
+                    snippet = str(r.get("snippet", "")).strip()
+                    url     = str(r.get("url", "")).strip()
+                    if title or snippet:
+                        lines.append(f"- {title}: {snippet[:200]}")
+                raw_text = "\n".join(lines)
+            else:
+                raw_text = raw_obs[:1800]
+        except Exception:
+            raw_text = raw_obs[:1800]
+
+        goal_short = (step_goal or "").strip()[:120]
+        distill_prompt = (
+            f"Goal: {goal_short}\n\n"
+            "Extract ONLY the key facts relevant to the goal from the data below.\n\n"
+            f"Data:\n{raw_text}\n\n"
+            "Key facts:"
+        )
+        try:
+            from agent.model_adapter import generate
+            distilled = generate(distill_prompt, model=model, temperature=0.0)
+            distilled = (distilled or "").strip()
+            if len(distilled) > 50:
+                print(f"[DISTILL] Compressed {len(raw_obs)} chars -> {len(distilled)} chars")
+                return distilled
+        except Exception as _e:
+            print(f"[DISTILL] Skipped (error): {_e}")
+        return raw_obs
+
+    def _prefetch_buffer_content(self, step_desc: str, buffer: dict) -> str:
+        """Pre-read buffer(s) referenced in step_desc and return inline content block.
+
+        This implements the orchestrator-level read pre-fetch:
+        instead of the LLM calling buffer.slice (which it often forgets or cargocults),
+        we read the buffer HERE in Python and inject the content directly into the
+        step context, so the model can use it immediately for composing email bodies etc.
+
+        Returns a compact string to append to the step prompt's working state, or "".
+        Max 600 chars per buffer to stay inside token budget.
+        """
+        if not buffer:
+            return ""
+        MAX_PREFETCH_CHARS = 600
+        # Find all [BUFFER:N] references in the step goal
+        refs = re.findall(r'\[BUFFER:(\d+)\]', step_desc)
+        if not refs:
+            return ""
+        parts = []
+        for buf_id_str in refs:
+            buf_id = int(buf_id_str)
+            raw = buffer.get(buf_id) or buffer.get(str(buf_id))
+            if not raw:
+                continue
+            # Truncate to budget
+            content = str(raw).strip()
+            if len(content) > MAX_PREFETCH_CHARS:
+                content = content[:MAX_PREFETCH_CHARS] + "\n...[truncated, use buffer.slice for full content]"
+            parts.append(f"--- BUFFER:{buf_id} content (pre-read) ---\n{content}\n--- END BUFFER:{buf_id} ---")
+        if not parts:
+            return ""
+        return "\n".join(parts) + "\n\n"
 
     def _select_categories(self, step_desc: str, user_message: str = "", planner_categories: list[str] | None = None) -> set:
         """Select per-step categories from planner hints, then fallback to keyword matching.
@@ -1330,13 +1961,13 @@ Output format (exactly one):
         # expand it with keyword heuristics. This keeps tool scope per-step.
         if selected:
             return selected | _ALWAYS_CATEGORIES
-        # Only match keywords against the step description â€” NOT the user message.
+        # Only match keywords against the step description  NOT the user message.
         # Using user_message caused every step to inherit all task-level categories
         # (e.g. "send via whatsapp as pdf" leaking WhatsApp+Documents into a
         # "retrieve contact" step).
         # Strip any appended user-clarification suffix before keyword matching so
         # text like "(User clarification: drop this task)" doesn't pull in extra
-        # categories (e.g. "task" â†’ Todo List).
+        # categories (e.g. "task"  Todo List).
         _clean_desc = re.sub(r'\s*\(User clarification:[^)]*\)', '', step_desc, flags=re.IGNORECASE).strip()
         combined = _clean_desc.lower()
         for category, keywords in CATEGORY_KEYWORDS.items():
@@ -1355,15 +1986,40 @@ Output format (exactly one):
         return selected | _ALWAYS_CATEGORIES
 
     def _get_step_tools(self, step_desc: str, user_message: str = "", planner_categories: list[str] | None = None) -> str:
-        """Return full tool schemas filtered to categories the planner assigned to this step.
-        The planner already pre-selected which categories each step needs, so we give the
-        executor the complete arg/type/example card for every relevant tool instead of the
-        minimal compact-docs hint â€” eliminating wrong arg names and missing required fields.
-        """
+        """Return predicted tool docs (1 primary + 1 backup) for this step."""
         cats = self._select_categories(step_desc, user_message, planner_categories)
         # Store for execution-time category gate in _safe_execute
         self._current_step_cats = {c.strip().lower() for c in cats}
-        return full_tool_schemas(categories={c for c in cats})
+        predicted = self._predict_step_tools(step_desc, list(cats))
+        if not predicted:
+            # Fallback to one tool per category at most, to keep context small.
+            fallback = []
+            for cat in sorted(cats):
+                cat_tools = [
+                    name for name, meta in TOOL_METADATA.items()
+                    if str(meta.get("category", "")).strip().lower() == cat.strip().lower()
+                    and name in self.tools
+                ]
+                if cat_tools:
+                    fallback.append(sorted(cat_tools)[0])
+                if len(fallback) >= 2:
+                    break
+            predicted = fallback
+        # Buffer hydration guard:
+        # If the step goal explicitly references [BUFFER:N], the model MUST be able
+        # to call buffer.slice to read its contents before the primary tool.
+        # Without this, the model cargo-cults the reference as a literal string.
+        _has_buffer_ref = bool(re.search(rb'\[BUFFER:\d+\]|buffer\.slice|buffer\.extract', step_desc.encode()))
+        if _has_buffer_ref:
+            for _buf_tool in ("buffer.slice", "buffer.extract"):
+                if _buf_tool in self.tools and _buf_tool not in predicted:
+                    predicted.insert(0, _buf_tool)
+        # Contacts guard: if the goal asks to look up a contact, inject contacts.search
+        _has_contact_lookup = bool(re.search(r'contacts\.search|find .{0,30}contact|look up .{0,20}email|look up .{0,20}phone', step_desc, re.IGNORECASE))
+        if _has_contact_lookup and "contacts.search" in self.tools and "contacts.search" not in predicted:
+            predicted.insert(0, "contacts.search")
+        self._current_step_tool_names = set(predicted)
+        return full_tool_schemas_for_tools(predicted)
 
     def _extract_key_data(self, text: str) -> dict:
         """Extract compact artifact references from observations/summaries."""
@@ -1403,7 +2059,7 @@ Output format (exactly one):
             return ""
         lines = ["COMPLETED STEPS:"]
         for idx, item in enumerate(completed):
-            icon = "Ã¢Å“â€œ" if item.get("status") == "done" else "Ã¢Å“â€”"
+            icon = "" if item.get("status") == "done" else ""
             lines.append(f"  [{icon}] Step {idx+1}: {item.get('step','')[:160]}")
             lines.append(f"      Result: {str(item.get('result',''))[:220]}")
             artifacts = item.get("artifacts", {}) if isinstance(item, dict) else {}
@@ -1422,6 +2078,27 @@ Output format (exactly one):
                     f"      Call: {call.get('tool','')} [{call.get('status','')}] -> "
                     f"{str(call.get('summary',''))[:140]}"
                 )
+        return "\n".join(lines) + "\n\n"
+
+    def _format_recent_done_block(self, completed: list, max_steps: int = 2, max_chars: int = 80) -> str:
+        """
+        Tiny completed-step block for ACT prompts on small models.
+        """
+        if not completed:
+            return ""
+        tail = completed[-max_steps:]
+        lines = ["RECENT COMPLETED STEPS:"]
+        for idx, item in enumerate(tail, start=max(1, len(completed) - len(tail) + 1)):
+            status = "ok" if item.get("status") == "done" else "failed"
+            step_txt = str(item.get("step", "")).strip()[:max_chars]
+            res_txt = str(item.get("result", "")).strip()[:max_chars]
+            # Always show buffer references in full — they are short and critical for next step
+            result_full = str(item.get("result", "")).strip()
+            import re as _re
+            buf_refs = _re.findall(r'\[BUFFER:\d+\]', result_full)
+            if buf_refs and not any(b in res_txt for b in buf_refs):
+                res_txt = res_txt + "  " + " ".join(buf_refs)
+            lines.append(f"- [{status}] {idx}. {step_txt} -> {res_txt}")
         return "\n".join(lines) + "\n\n"
 
     async def _route_intent_mode(
@@ -1532,7 +2209,7 @@ Output format (exactly one):
     ) -> list:
         """Revise remaining plan by splitting/adjusting from failed step onward.
 
-        Now routed through ContextCompiler (compile Ã¢â€ â€™ apply_budget Ã¢â€ â€™ prepare_for_generation)
+        Now routed through ContextCompiler (compile  apply_budget  prepare_for_generation)
         so REPLAN gets the same token-accurate budgeting, structured messages,
         temporal context injection, and metrics as PLAN/ACT/SYNTHESIZE.
         """
@@ -1568,7 +2245,7 @@ Output format (exactly one):
             f"OLD REMAINING PLAN:\n{rem_lines}"
         )
 
-        # Use ContextCompiler pipeline (compile Ã¢â€ â€™ budget Ã¢â€ â€™ generate)
+        # Use ContextCompiler pipeline (compile  budget  generate)
         _replan_sections = self._context_compiler.compile(
             step_type=StepType.REPLAN,
             user_message=task,
@@ -1578,8 +2255,8 @@ Output format (exactly one):
             memory_context=memory_context,
             history_text=history_text,
             done_block=done_lines + "\n\n",
-            task_contract=self._get_task_contract_context(),
-            working_state=self._get_working_state_context(),
+            task_contract="",
+            working_state="",
             retry_note=_replan_constraints,
         )
         # Override goal with replan-specific goal (compile() would set "User: {task}")
@@ -1622,15 +2299,15 @@ Output format (exactly one):
         else:
             replan_raw = await asyncio.to_thread(generate, _flat or plan_prompt, model=model, temperature=0.2)
 
-        print(f"\n{'Ã¢â€¢Â'*70}")
+        print(f"\n{''*70}")
         print(f"[STREAM] REPLAN  |  model={model}")
-        print(f"{'Ã¢â€â‚¬'*70}")
-        print("[STREAM][PROMPT Ã¢â€ â€™LLM]")
+        print(f"{''*70}")
+        print("[STREAM][PROMPT LLM]")
         print(plan_prompt)
-        print(f"{'Ã¢â€â‚¬'*70}")
+        print(f"{''*70}")
         print("[STREAM][LLM REPLY]")
         print(replan_raw)
-        print(f"{'Ã¢â€¢Â'*70}")
+        print(f"{''*70}")
 
         revised = self._parse_plan(replan_raw)
         # If the LLM emitted a control output (NEED_INPUT:, CLARIFY:, etc.) instead of
@@ -1653,19 +2330,19 @@ Output format (exactly one):
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            # Plain text Ã¢â‚¬â€ truncate
+            # Plain text  truncate
             return text.replace('\n', ' ')[:150]
 
         if isinstance(data, dict) and data.get('status') == 'error':
             err = str(data.get('error', 'unknown'))
             return f"ERROR: {err[:100]}"
 
-        # whatsapp.status: return ONLY connectivity Ã¢â‚¬â€ never expose the bot's own JID
+        # whatsapp.status: return ONLY connectivity  never expose the bot's own JID
         if tool_name == 'whatsapp.status':
             connected = str(data.get('status', 'unknown'))
             return f"whatsapp: {connected}"
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ filesystem.list / filesystem.search Ã¢â‚¬â€ show top filenames, not just count Ã¢â€â‚¬Ã¢â€â‚¬
+        #  filesystem.list / filesystem.search  show top filenames, not just count 
         if tool_name in ('filesystem.list', 'filesystem.search'):
             if isinstance(data, list):
                 items = data
@@ -1686,7 +2363,7 @@ Output format (exactly one):
                     # Skip the confusing nested SANDBOX/ subdirectory
                     if name.upper() == 'SANDBOX' and is_dir:
                         continue
-                    # Show only filename, never absolute path Ã¢â‚¬â€ prevents SANDBOX/SANDBOX double-prefix
+                    # Show only filename, never absolute path  prevents SANDBOX/SANDBOX double-prefix
                     label = Path(name).name if name else str(it)[:60]
                     if is_dir:
                         label += '/'
@@ -1700,7 +2377,7 @@ Output format (exactly one):
             suffix = f' (+{len(names)-8} more)' if len(names) > 8 else ''
             return f"{len(names)} file(s): {top}{suffix}  [use path: SANDBOX/<filename>]"
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ filesystem.read Ã¢â‚¬â€ show path + size + first heading Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  filesystem.read  show path + size + first heading 
         # search tools: preserve concrete titles/snippets for downstream handoff
         if tool_name in ('search.duckduckgo', 'search.news'):
             results = []
@@ -1741,20 +2418,20 @@ Output format (exactly one):
             heading_text = ' | '.join(headings) if headings else (lines[0][:80] if lines else '')
             return f"file:{path_hint} ({len(content)} chars) {heading_text}".strip()
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ todo.* mutations Ã¢â‚¬â€ surface title so LLM can track which item was added Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  todo.* mutations  surface title so LLM can track which item was added 
         if tool_name in ('todo.add', 'todo.update', 'todo.complete'):
             if isinstance(data, dict):
                 title  = data.get('title', '')
                 tid    = data.get('id', '')
                 status = data.get('message', data.get('status', 'ok'))
                 if title:
-                    return f"todo: id={tid} title={title!r} Ã¢â‚¬â€ {status}"
+                    return f"todo: id={tid} title={title!r}  {status}"
 
         if isinstance(data, dict):
-            # 'jid' is the bot's own WhatsApp identifier Ã¢â‚¬â€ never surface it as a number
+            # 'jid' is the bot's own WhatsApp identifier  never surface it as a number
             skip = {'status', 'hint', 'query', 'category', 'action', 'jid'}
             parts = []
-            # Single contact (contacts.get) Ã¢â‚¬â€ must include id so downstream steps can use it
+            # Single contact (contacts.get)  must include id so downstream steps can use it
             if 'contact' in data and isinstance(data['contact'], dict):
                 c = data['contact']
                 parts.append(
@@ -1762,7 +2439,7 @@ Output format (exactly one):
                     f"phone={c.get('phone','?')} email={c.get('email','?')}"
                 )
                 skip = skip | {'contact'}
-            # Contact list (contacts.search / contacts.list) Ã¢â‚¬â€ include id for each hit
+            # Contact list (contacts.search / contacts.list)  include id for each hit
             elif 'contacts' in data and isinstance(data['contacts'], list):
                 cs = data['contacts']
                 if cs:
@@ -1821,7 +2498,7 @@ Output format (exactly one):
           {"type": "final", "content": "..."}
           {"type": "step_limit", "content": "..."}
         """
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Initialize context engineering for this run Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Initialize context engineering for this run 
         # Clear per-task NEED_INPUT answers; prevents previous session answers bleeding in.
         # /miraclr - hard session reset command
         if text.strip().lower() == "/miraclr":
@@ -1832,8 +2509,37 @@ Output format (exactly one):
             self._task_contract = {}
             self._working_state = {"slots": {}, "artifacts": {}}
             self._handoff_payload = ""
+            self._pending_workflow_candidate = None
             self._context_compiler.reset()
             yield {"type": "final", "content": "Session cleared. Fresh start!"}
+            return
+
+        # Pending workflow save confirmation from previous successful multi-step run.
+        _decision = (text or "").strip().lower()
+        if self._pending_workflow_candidate and _decision in {"yes", "y", "no", "n"}:
+            cand = self._pending_workflow_candidate
+            self._pending_workflow_candidate = None
+            if _decision in {"yes", "y"}:
+                save_args = {
+                    "name": cand.get("name") or self._suggest_workflow_name(cand.get("task", "")),
+                    "steps": cand.get("steps", []),
+                    "trigger_keywords": cand.get("trigger_keywords", []),
+                    "variables": cand.get("variables", []),
+                    "description": "Auto-saved from successful multi-step execution",
+                }
+                saved = await asyncio.to_thread(self._safe_execute, "workflow.save", save_args)
+                if isinstance(saved, dict) and saved.get("status") == "error":
+                    msg = f"I couldn't save the workflow: {saved.get('error', 'unknown error')}"
+                else:
+                    res = saved.get("result", saved) if isinstance(saved, dict) else saved
+                    wf_name = res.get("name", save_args["name"]) if isinstance(res, dict) else save_args["name"]
+                    msg = f"Saved workflow '{wf_name}'."
+                yield {"type": "final", "content": msg}
+                self.history.append((text, msg))
+                return
+            msg = "Okay, I won't save that as a workflow."
+            yield {"type": "final", "content": msg}
+            self.history.append((text, msg))
             return
 
         self._input_answers = {}
@@ -1845,6 +2551,23 @@ Output format (exactly one):
         self._handoff_payload = ""
         self._context_compiler.model = model
         self._context_compiler.reset()  # fresh tool records + short-term memory per run
+
+        #  Workflow auto-trigger 
+        # Check if a saved workflow matches the user message. If so, skip LLM planning
+        # and directly load the workflow steps (saves one full LLM call).
+        _workflow_steps_preloaded: list | None = None
+        _matched_wf, _wf_vars = self._match_workflow_trigger(text)
+        if _matched_wf:
+            _workflow_steps_preloaded = self._expand_workflow_steps(_matched_wf, _wf_vars)
+            if _workflow_steps_preloaded:
+                print(
+                    f"[AGENT] Workflow '{_matched_wf.get('name')}' auto-triggered "
+                    f"({len(_workflow_steps_preloaded)} steps)"
+                )
+                yield {
+                    "type": "thought",
+                    "content": f"Using saved workflow: {_matched_wf.get('display_name', _matched_wf.get('name'))}",
+                }
         self._context_compiler.metrics = ContextMetricsTracker(
             run_id=getattr(run_handle, 'run_id', '') if run_handle else '',
             model=model,
@@ -1855,12 +2578,12 @@ Output format (exactly one):
         # Context management: cap to last N turns and truncate long assistant responses
         # to prevent context overflow on 4B models with long histories.
         recent_history = self.history[-MAX_HISTORY_TURNS:]
-        history_text = ""
-        for u, a in recent_history:
-            # 800-char cap: long enough for multi-step context, short enough for 4B window.
-            # Reasoning: average step reply is ~150 chars; 800 keeps ~5 meaningful turns full.
-            a_trimmed = (a[:800] + "Ã¢â‚¬Â¦[truncated]") if len(a) > 800 else a
-            history_text += f"User: {u}\nMIRA: {a_trimmed}\n"
+        history_text = self._build_history_text(
+            recent_history,
+            max_turns=MAX_PLAN_HISTORY_TURNS,
+            user_chars=180,
+            assistant_chars=180,
+        )
 
         self._exec_model = model  # stored so buffer.search LLM calls can use it
         self._current_task_text = text or ""
@@ -1877,7 +2600,7 @@ Output format (exactly one):
 
         _recent_tool_outputs: list[dict] = []
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Runtime allow/deny constraints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Runtime allow/deny constraints 
         # Parse "Use ONLY: X, Y" / "Do NOT use: A, B" from user prompt and store
         # on self so _safe_execute() can enforce them for every tool call this run.
         self._allowed_tools, self._denied_tools = _parse_tool_constraints(text)
@@ -1886,28 +2609,26 @@ Output format (exactly one):
         if self._denied_tools:
             print(f"[AGENT] Tool deny-list  active: {sorted(self._denied_tools)}")
 
-        # Per-run static context cache
-        # - planner/chat router can use USER+SOUL
-        # - executor/replan/synthesis intentionally excludes USER.md AND SOUL.md
-        #   (SOUL adds ~800 tokens per step with zero action-guiding value)
-        _profile_context_full_cached = self._get_profile_context(include_user=True, include_soul=True)
-        _profile_context_exec_cached = self._get_profile_context(include_user=False, include_soul=False)
-        _memory_context_cached = self._get_memory_context()
+        # Per-run static context cache (small-model prompt diet).
+        _profile_context_plan_cached = self._get_plan_profile_context()
+        _profile_context_exec_cached = ""
+        _memory_context_plan_cached = self._get_relevant_memory_context(text, max_items=MAX_PLAN_MEMORY_ITEMS)
+        _memory_context_exec_cached = ""
         _tool_categories_summary_cached = self._get_tool_categories_summary()
 
         final_response = ""
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 0: Plan Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Phase 0: Plan 
         # Use ContextCompiler for typed section assembly + adaptive budget
         _plan_sections = self._context_compiler.compile(
             step_type=StepType.PLAN,
             user_message=text,
-            profile_context=_profile_context_full_cached,
-            memory_context=_memory_context_cached,
+            profile_context=_profile_context_plan_cached,
+            memory_context=_memory_context_plan_cached,
             history_text=history_text,
             step_tools=_tool_categories_summary_cached,
-            task_contract=self._get_task_contract_context(),
-            working_state=self._get_working_state_context(),
+            task_contract="",
+            working_state="",
         )
         _plan_sections, _plan_budget_note, _plan_diag = self._context_compiler.apply_budget(
             _plan_sections, step_type=StepType.PLAN
@@ -1918,11 +2639,14 @@ Output format (exactly one):
             budget_note=_plan_budget_note,
             output_format=(
                 "PLANNING MODE: DO NOT call any tools yet.\n"
-                "Decide: is this conversational (greeting/question/advice/small-talk)?\n"
-                "  YES -> output exactly: CHAT: <your reply>\n"
-                "  NO  -> output a numbered task plan:\n"
-                "        1. <step> | categories: <Cat1>, <Cat2>\n"
-                "Rules: minimal steps, no redundancy, identify missing info early.\n"
+                "Is this conversational? -> CHAT: <reply>\n"
+                "Otherwise output a numbered plan (one atomic action per step):\n"
+                "  1. <what to do> | categories: <Cat1>, <Cat2>\n"
+                "Rules:\n"
+                "- Split compound tasks: 'find X and email Y' = step1: search, step2: contact lookup, step3: email.\n"
+                "- Each step does exactly ONE thing (one read OR one write).\n"
+                "- If sending, add a contact-lookup step BEFORE the send step.\n"
+                "- Keep the plan to 2-4 steps maximum.\n"
                 "MIRA: Plan:\n"
             ),
         )
@@ -1933,40 +2657,39 @@ Output format (exactly one):
             budget_note=_plan_budget_note,
             output_format=(
                 "PLANNING MODE: DO NOT call any tools yet.\n"
-                "Decide: is this conversational (greeting/question/advice/small-talk)?\n"
-                "  YES -> output exactly: CHAT: <your reply>\n"
-                "  NO  -> output a numbered task plan.\n"
-                "For profile/memory updates use user.update/soul.update/memory.update.\n"
-                "For WhatsApp delivery, resolve phone/JID via contacts tools first.\n"
-                "If info is missing, make gathering it the first step.\n"
-                "1. <step> | categories: <Cat1>, <Cat2>\n"
+                "Is this conversational? -> CHAT: <reply>\n"
+                "Otherwise plan (one atomic action per step):\n"
+                "  1. <what to do> | categories: <Cat1>, <Cat2>\n"
+                "Compound tasks MUST be split: find+email = 3 steps.\n"
                 "MIRA: Plan:\n"
             ),
         )
-        if _plan_msgs is not None:
+        if _workflow_steps_preloaded:
+            plan_raw = "WORKFLOW AUTO-TRIGGER"
+        elif _plan_msgs is not None:
             plan_raw = await asyncio.to_thread(generate_with_messages, _plan_msgs, model=model, thinking=True)
         else:
             plan_raw = await asyncio.to_thread(generate, _plan_flat or plan_prompt, model=model)
-        print(f"\n{'Ã¢â€¢Â'*70}")
-        print(f"[STREAM] Phase 0 Ã¢â‚¬â€ PLAN  |  model={model}")
-        print(f"{'Ã¢â€â‚¬'*70}")
-        print("[STREAM][PROMPT Ã¢â€ â€™LLM]")
+        print(f"\n{''*70}")
+        print(f"[STREAM] Phase 0  PLAN  |  model={model}")
+        print(f"{''*70}")
+        print("[STREAM][PROMPT LLM]")
         print(plan_prompt)
-        print(f"{'Ã¢â€â‚¬'*70}")
+        print(f"{''*70}")
         print("[STREAM][LLM REPLY]")
         print(plan_raw)
-        print(f"{'Ã¢â€¢Â'*70}")
+        print(f"{''*70}")
 
-        steps = self._parse_plan(plan_raw)
+        steps = list(_workflow_steps_preloaded or self._parse_plan(plan_raw))
 
-        # â”€â”€ Planner direct-reply handling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # CHAT: <reply>   â€” conversational; no tools needed
-        # FINAL ANSWER:   â€” task answered without steps (e.g. simple calculation)
+        #  Planner direct-reply handling 
+        # CHAT: <reply>    conversational; no tools needed
+        # FINAL ANSWER:    task answered without steps (e.g. simple calculation)
         # Both bypass the executor entirely.
         _first_non_empty = next((ln.strip() for ln in plan_raw.splitlines() if ln.strip()), "")
         _first_upper = _first_non_empty.upper()
 
-        if _first_upper.startswith("CHAT:") and not steps:
+        if (not _workflow_steps_preloaded) and _first_upper.startswith("CHAT:") and not steps:
             _chat_reply = re.sub(r'^CHAT\s*:', '', _first_non_empty, flags=re.IGNORECASE).strip()
             # If CHAT: was on its own line, take the rest of the output as the reply
             if not _chat_reply:
@@ -1984,7 +2707,7 @@ Output format (exactly one):
         # (no numbered steps). Some models emit both a plan and a hallucinated
         # FINAL ANSWER line; in that case we must execute the plan.
         _pure_final = _first_upper.startswith("FINAL ANSWER:") and not steps
-        if _pure_final and "ACTION:" not in plan_raw:
+        if (not _workflow_steps_preloaded) and _pure_final and "ACTION:" not in plan_raw and "TOOL:" not in plan_raw:
             final_response = plan_raw.split("FINAL ANSWER:")[-1].strip()
             self.history.append((text, final_response))
             yield {"type": "final", "content": final_response}
@@ -2004,14 +2727,15 @@ Output format (exactly one):
         )
         yield {"type": "thought", "content": f"Plan:\n{steps_block}"}
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 1: Execute each step with retry + replan Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Phase 1: Execute each step with retry + replan 
         completed = []   # [{"step": str, "status": "done|failed", "result": str}]
         final_response = ""
         seen_calls: set = set()   # idempotency: skip exact duplicate (tool, args, step)
 
-        # Mutable steps list Ã¢â‚¬â€ continuation steps may be appended mid-run for
+        # Mutable steps list  continuation steps may be appended mid-run for
         # quantified batch steps (e.g. "add 6 todos" expands to 6 sub-steps).
         _plan_revisions = 0
+        _consecutive_failures = 0
         _step_idx = 0
         while _step_idx < len(steps) and _step_idx < MAX_AUTONOMOUS_STEPS:
             i         = _step_idx
@@ -2020,13 +2744,13 @@ Output format (exactly one):
             step_categories = step_item.get("categories", [])
             _step_idx += 1
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Cancel check (OpenClaw-style abort) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Cancel check (OpenClaw-style abort) 
             if run_handle and run_handle.is_cancelled():
-                print(f"[STREAM] Run aborted at step {i+1} Ã¢â‚¬â€ cancel_event set")
+                print(f"[STREAM] Run aborted at step {i+1}  cancel_event set")
                 yield {"type": "aborted", "content": "Run aborted by user.", "step": i + 1}
                 return
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Iteration-limit terminal state Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Iteration-limit terminal state 
             if i >= MAX_AUTONOMOUS_STEPS - 1 and i > 0:
                 msg = f"Reached {MAX_AUTONOMOUS_STEPS}-step limit after {i} completed steps."
                 print(f"[STREAM] {msg}")
@@ -2035,7 +2759,7 @@ Output format (exactly one):
 
             if self.stop_requested:
                 self.stop_requested = False
-                final_response = f"Ã¢ÂÂ¹Ã¯Â¸Â Stopped after {i} steps."
+                final_response = f" Stopped after {i} steps."
                 break
 
             step_result = None
@@ -2053,7 +2777,7 @@ Output format (exactly one):
             _force_plan_revise = False  # bypass fallback and jump to plan revision when strategy is wrong
             _latest_user_input = None   # latest explicit user clarification for replanning
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Quantified step tracking Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Quantified step tracking 
             # Detect numeric goals in step description (e.g. "add 6 todos").
             # Skip detection for continuation steps already annotated "[item N of M]".
             _step_quant_n    = 0   # expected count (0 = no quant goal)
@@ -2077,7 +2801,7 @@ Output format (exactly one):
             for attempt in range(MAX_RETRIES_PER_STEP):
                 done_block = ""
                 if completed:
-                    done_block = self._format_completed_block(completed)
+                    done_block = self._format_recent_done_block(completed, max_steps=2, max_chars=80)
 
                 retry_note = ""
                 if _special_retry_note:
@@ -2086,7 +2810,7 @@ Output format (exactly one):
                 elif attempt > 0 and last_error:
                     hint = _humanize_error(last_error, last_failed_tool or "", last_failed_args or {})
                     retry_note = (
-                        f"Ã¢Å¡Â Ã¯Â¸Â Attempt {attempt} FAILED.\n"
+                        f" Attempt {attempt} FAILED.\n"
                         f"  Tool called: {last_failed_tool}\n"
                         f"  Args used:   {json.dumps(last_failed_args, default=str)[:300]}\n"
                         f"  Fix needed:  {hint}\n"
@@ -2102,7 +2826,7 @@ Output format (exactly one):
                     _lines = [f"  {idx+1}. {entry}" for idx, entry in enumerate(_step_actions)]
                     _progress_block = "STEP PROGRESS:\n" + "\n".join(_lines) + "\n\n"
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Quantified step hint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                #  Quantified step hint 
                 # For continuation steps ("[item N of M]") tell the model exactly
                 # which item it is processing.  For first-pass batch steps, remind
                 # it to output ONE action and let the loop handle the rest.
@@ -2119,7 +2843,7 @@ Output format (exactly one):
                 elif _step_quant_n > 0:
                     _quant_hint = (
                         f"BATCH STEP ({_step_quant_n} items total): "
-                        f"Output ONE ACTION for the first item only Ã¢â‚¬â€ "
+                        f"Output ONE ACTION for the first item only  "
                         f"the loop runs this step again for each remaining item automatically.\n\n"
                     )
 
@@ -2142,7 +2866,7 @@ Output format (exactly one):
                         "Do NOT use whatsapp.send for document delivery.\n\n"
                     )
 
-                # â”€â”€ User-input hint for NEED_INPUT resumed steps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                #  User-input hint for NEED_INPUT resumed steps 
                 _user_input_hint = ""
                 # Show ALL collected answers so later steps can SKIP if goal already satisfied
                 _all_prior = [(k, v) for k, v in sorted(self._input_answers.items()) if isinstance(k, int)]
@@ -2151,31 +2875,31 @@ Output format (exactly one):
                     if _prior_for_step:
                         _hint_lines = [f"  - {v}" for _, v in _all_prior]
                         _user_input_hint = (
-                            "â„¹ï¸ USER PROVIDED INFO (all collected answers):\n"
+                            " USER PROVIDED INFO (all collected answers):\n"
                             + "\n".join(_hint_lines) + "\n"
                             "Use these answers to complete this step.\n"
-                            "If ANY answer satisfies this step goal -> output STEP_DONE or SKIP immediately.\n\n"
+                            "If ANY answer satisfies this step goal -> output DONE immediately.\n\n"
                         )
                     else:
                         _hint_lines = [f"  - Step {k+1}: {v}" for k, v in _all_prior]
                         _user_input_hint = (
-                            "â„¹ï¸ PRIOR USER ANSWERS (from earlier steps):\n"
+                            " PRIOR USER ANSWERS (from earlier steps):\n"
                             + "\n".join(_hint_lines) + "\n"
-                            "If this step goal is already satisfied -> output SKIP.\n\n"
+                            "If this step goal is already satisfied -> output DONE.\n\n"
                         )
 
                 step_temp = 0.1 if attempt == 0 else 0.3
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Compile context using ContextCompiler (typed sections + adaptive budget) Ã¢â€â‚¬Ã¢â€â‚¬
+                #  Compile context using ContextCompiler (typed sections + adaptive budget) 
                 _short_term_ctx = self._context_compiler.short_term.render_context(i)
                 # On retries that already have successful results: add a priority hint so
-                # the model outputs STEP_DONE instead of calling redundant verification tools.
+                # the model outputs DONE instead of calling redundant verification tools.
                 _step_done_hint = ""
                 if attempt > 0 and _step_actions:
                     _step_done_hint = (
                         "\u26a1 PRIORITY CHECK: You already have successful results for this step "
                         "(see STEP PROGRESS above).\n"
-                        "If ANY result satisfies the step goal -> output STEP_DONE right now.\n"
+                        "If ANY result satisfies the step goal -> output DONE right now.\n"
                         "Do NOT call tools to verify, confirm, or check data you already retrieved.\n"
                     )
                 _extra_hints = "\n".join(filter(None, [
@@ -2185,7 +2909,11 @@ Output format (exactly one):
                     _user_input_hint,
                     _step_done_hint
                 ]))
-                _act_history = history_text if (i == 0 or self._step_needs_history(step_desc)) else ""
+                _act_history = ""
+                # Orchestrator read pre-fetch: if the step goal references a buffer,
+                # read it now and inject the content into the working_state so the
+                # model can use it directly without needing to call buffer.slice first.
+                _prefetched = self._prefetch_buffer_content(step_desc, self.buffer)
                 _step_sections = self._context_compiler.compile(
                     step_type=StepType.ACT,
                     user_message=text,
@@ -2193,12 +2921,12 @@ Output format (exactly one):
                     step_idx=i,
                     step_tools=_step_tools,
                     profile_context=_profile_context_exec_cached,
-                    memory_context=_memory_context_cached,
+                    memory_context=_memory_context_exec_cached,
                     buffer_context=buffer_context,
                     history_text=_act_history,
                     done_block=done_block,
-                    task_contract=self._get_task_contract_context(),
-                    working_state=self._get_working_state_context(),
+                    task_contract="",
+                    working_state=_prefetched,
                     retry_note=retry_note,
                     progress_block=_progress_block,
                     extra_hints=_extra_hints,
@@ -2207,35 +2935,32 @@ Output format (exactly one):
                     _step_sections, step_type=StepType.ACT
                 )
 
+                # Build a step-type-aware output format.
+                # If the step goal asks to read a buffer first, make the sequence explicit.
+                _has_buf_in_goal = bool(re.search(r'\[BUFFER:\d+\]', step_desc))
+                if _has_buf_in_goal:
+                    _seq_hint = (
+                        "SEQUENCE for this step:\n"
+                        "  turn 1 -> TOOL: buffer.slice | id=<N>   (reads the buffer)\n"
+                        "  turn 2 -> TOOL: <send/write tool> | ...  (uses the content)\n"
+                        "Do NOT write the buffer reference as a literal string.\n\n"
+                    )
+                else:
+                    _seq_hint = ""
+                _act_output_format = (
+                    f"Current step: {step_desc}\n\n"
+                    f"{_seq_hint}"
+                    "Output exactly ONE of:\n"
+                    "TOOL: tool.name | arg=value | arg2=value2\n"
+                    "DONE: <one-line summary>\n"
+                    "NEED: <one specific question>\n\n"
+                    "MIRA:"
+                )
                 step_prompt = self._context_compiler.render_prompt(
                     _step_sections,
                     step_type=StepType.ACT,
                     budget_note=_budget_note,
-                    output_format=(
-                        f"NOW EXECUTE step {i+1}/{len(steps)}: {step_desc}\n"
-                        f"OUTPUT OPTIONS (pick exactly one):\n"
-                        f"  ACTION: {{\"tool\": \"...\", \"args\": {{...}}}}   Ã¢â€ Â call a tool\n"
-                        f"  STEP_DONE: <brief summary of completion>  Ã¢â€ Â this step is complete\n"
-                        f"  STEP_FAILED: <brief reason>               Ã¢â€ Â this step cannot continue\n"
-                        f"  FINAL ANSWER: <text>                Ã¢â€ Â task done\n"
-                        f"  SKIP: <reason>                      Ã¢â€ Â step condition already satisfied by COMPLETED STEPS above\n"
-                        f"  NEED_INPUT: <question>              Ã¢â€ Â you require specific info from the user that cannot be inferred\n"
-                        f"STOP after your chosen output.\n"
-                        f"MIRA:"
-                    ),
-                )
-                # Use structured messages when provider supports it
-                _act_output_format = (
-                    f"NOW EXECUTE step {i+1}/{len(steps)}: {step_desc}\n"
-                    f"OUTPUT OPTIONS (pick exactly one):\n"
-                    f"  ACTION: {{\"tool\": \"...\", \"args\": {{...}}}}   Ã¢â€ Â call a tool\n"
-                    f"  STEP_DONE: <brief summary of completion>  Ã¢â€ Â this step is complete\n"
-                    f"  STEP_FAILED: <brief reason>               Ã¢â€ Â this step cannot continue\n"
-                    f"  FINAL ANSWER: <text>                Ã¢â€ Â task done\n"
-                    f"  SKIP: <reason>                      Ã¢â€ Â step condition already satisfied by COMPLETED STEPS above\n"
-                    f"  NEED_INPUT: <question>              Ã¢â€ Â you require specific info from the user that cannot be inferred\n"
-                    f"STOP after your chosen output.\n"
-                    f"MIRA:"
+                    output_format=_act_output_format,
                 )
                 _act_flat, _act_msgs = self._context_compiler.prepare_for_generation(
                     _step_sections,
@@ -2243,7 +2968,24 @@ Output format (exactly one):
                     budget_note=_budget_note,
                     output_format=_act_output_format,
                 )
-                if _act_msgs is not None:
+                _native_act = None
+                if (
+                    _act_msgs is not None
+                    and supports_ollama_native_tools(model)
+                    and getattr(self, "_current_step_tool_names", None)
+                ):
+                    _native_defs = self._build_native_tool_defs(sorted(self._current_step_tool_names))
+                    if _native_defs:
+                        _native_act = await asyncio.to_thread(
+                            generate_with_native_tools,
+                            _act_msgs,
+                            _native_defs,
+                            model=model,
+                            temperature=step_temp,
+                        )
+                if _native_act is not None and not _native_act.get("error"):
+                    reply = str(_native_act.get("content", "") or "")
+                elif _act_msgs is not None:
                     reply = await asyncio.to_thread(generate_with_messages, _act_msgs, model=model, temperature=step_temp)
                 else:
                     reply = await asyncio.to_thread(generate, _act_flat or step_prompt, model=model, temperature=step_temp)
@@ -2251,53 +2993,69 @@ Output format (exactly one):
                 print(f"\n{'='*70}")
                 print(f"[STREAM] Step {i+1}/{len(steps)} attempt {attempt+1}  |  {step_desc[:50]}  |  model={model}  temp={step_temp}")
                 print(f"{'-'*70}")
-                print("[STREAM][PROMPT Ã¢â€ â€™LLM]")
+                print("[STREAM][PROMPT LLM]")
                 print(step_prompt)
                 print(f"{'-'*70}")
                 print("[STREAM][LLM REPLY]")
                 print(reply)
                 print(f"{'-'*70}")
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Post-reply context quality verification Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                #  Post-reply context quality verification 
                 _quality_signals = self._context_compiler.verify_context_quality(
                     reply, step_idx=i, step_type="act"
                 )
                 if any(_quality_signals.values()):
                     print(f"[CONTEXT] Quality signals: {_quality_signals}")
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Multi-ACTION guard Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                # A 4B model often outputs N ACTION: blocks when asked to "add 6 items".
+                #  Multi-ACTION guard 
+                # A 4B model often outputs multiple tool blocks when asked to "add 6 items".
                 # Reject the whole reply and force ONE action per invocation.
                 # The quantified-step continuation loop will re-run this step for
                 # each remaining item automatically.
-                _action_count = len(re.findall(r'\bACTION\s*:', reply, re.IGNORECASE))
+                _action_count = len(re.findall(r'\b(?:TOOL|ACTION)\s*:', reply, re.IGNORECASE))
                 if _action_count > 1:
                     _special_retry_note = (
-                        f"Ã¢Å¡Â Ã¯Â¸Â MULTI-ACTION ERROR: You output {_action_count} ACTION: blocks.\n"
-                        "OUTPUT CONTRACT: exactly ONE ACTION per invocation.\n"
-                        f"For steps needing multiple items: output the FIRST item's ACTION only Ã¢â‚¬â€ "
+                        f" MULTI-TOOL ERROR: You output {_action_count} tool blocks.\n"
+                        "OUTPUT CONTRACT: exactly ONE TOOL call per invocation.\n"
+                        f"For steps needing multiple items: output the FIRST item's TOOL only  "
                         "the loop automatically re-runs this step for each remaining item.\n"
-                        "Now output ONE ACTION:\n\n"
+                        "Now output ONE TOOL or DONE:\n\n"
                     )
-                    last_error = f"multi-action ({_action_count} ACTION lines in one reply)"
+                    last_error = f"multi-tool ({_action_count} tool lines in one reply)"
                     last_failed_tool = ""
                     last_failed_args = {}
-                    print(f"[AGENT] Ã¢Å¡Â Ã¯Â¸Â Multi-ACTION rejected step {i+1}: {_action_count} actions")
+                    print(f"[AGENT]  Multi-tool rejected step {i+1}: {_action_count} actions")
                     yield {"type": "thought",
-                           "content": f"Ã¢Å¡Â Ã¯Â¸Â Multi-ACTION rejected ({_action_count} actions) Ã¢â‚¬â€ retrying",
+                           "content": f" Multi-tool output rejected ({_action_count})  retrying",
                            "step": i + 1}
                     continue  # retry loop
 
-                tool_call_data = self._extract_tool_call(reply)
+                tool_call_data = None
+                if isinstance(_native_act, dict) and not _native_act.get("error"):
+                    _tcalls = _native_act.get("tool_calls") or []
+                    if _tcalls:
+                        _tc = _tcalls[0] if isinstance(_tcalls, list) else {}
+                        _fn = _tc.get("function", {}) if isinstance(_tc, dict) else {}
+                        _tn = str((_fn.get("name") or _tc.get("name") or "")).strip()
+                        _ta = _fn.get("arguments", {}) if isinstance(_fn, dict) else _tc.get("arguments", {})
+                        if isinstance(_ta, str):
+                            try:
+                                _ta = json.loads(_ta)
+                            except Exception:
+                                _ta = {}
+                        if _tn:
+                            tool_call_data = (_tn, _ta if isinstance(_ta, dict) else {}, "")
+                if tool_call_data is None:
+                    tool_call_data = self._extract_tool_kv_call(reply) or self._extract_tool_call(reply)
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Mutual-exclusion guard Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                #  Mutual-exclusion guard 
                 # A valid reply should be EITHER a tool call OR a control token.
                 # In practice, small local models often emit ACTION plus trailing
                 # control text; when ACTION is valid, we execute it and ignore the
                 # extra control token instead of forcing a retry/replan loop.
                 _has_control_line = bool(
                     re.search(
-                        r'^\s*[-*]?\s*(STEP_DONE|STEP_FAILED|NEED_INPUT|SKIP|FINAL ANSWER)\s*:',
+                        r'^\s*[-*]?\s*(DONE|NEED|NEED_INPUT|STEP_DONE|STEP_FAILED|SKIP|FINAL ANSWER)\s*:',
                         reply,
                         re.IGNORECASE | re.MULTILINE,
                     )
@@ -2305,34 +3063,37 @@ Output format (exactly one):
                 if tool_call_data is not None and _has_control_line:
                     print(
                         f"[AGENT] Warning: mixed output in step {i+1}; "
-                        "executing ACTION and ignoring control token(s)"
+                        "executing TOOL and ignoring control token(s)"
                     )
                     yield {
                         "type": "thought",
-                        "content": "Mixed output tolerated: executing ACTION and ignoring control token",
+                        "content": "Mixed output tolerated: executing TOOL and ignoring control token",
                         "step": i + 1,
                     }
 
                 if tool_call_data is None:
                     answer = reply.strip()
-                    if answer.upper().startswith("STEP_DONE:"):
-                        step_result = answer[10:].strip()[:220] or (step_result or "step complete")
+                    _answer_u = answer.upper()
+                    if _answer_u.startswith("DONE:") or _answer_u.startswith("STEP_DONE:") or _answer_u.startswith("SKIP:"):
+                        _prefix_len = 5 if _answer_u.startswith("DONE:") else (10 if _answer_u.startswith("STEP_DONE:") else 5)
+                        step_result = answer[_prefix_len:].strip()[:220] or (step_result or "step complete")
                         step_status = "done"
                         break
-                    if answer.upper().startswith("STEP_FAILED:"):
+                    if _answer_u.startswith("STEP_FAILED:"):
                         last_error = answer[12:].strip()[:220] or "step failed"
                         step_status = "failed"
                         break
-                    # Ã¢â€â‚¬Ã¢â€â‚¬ NEED_INPUT: model requests clarification from user Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                    if answer.upper().startswith("NEED_INPUT:"):
-                        question = answer[11:].strip().split("\n")[0][:300]
+                    # NEED/NEED_INPUT: model requests clarification from user
+                    if _answer_u.startswith("NEED:") or _answer_u.startswith("NEED_INPUT:"):
+                        _qlen = 5 if _answer_u.startswith("NEED:") else 11
+                        question = answer[_qlen:].strip().split("\n")[0][:300]
                         _ask_user, _slot_name, _slot_note = self._should_request_need_input(
                             question, last_failed_tool or "", last_failed_args or {}
                         )
                         if not _ask_user:
                             last_error = f"need_input suppressed: {_slot_note[:180]}"
                             _special_retry_note = (
-                                f"NEED_INPUT suppressed: {_slot_note}\n"
+                                f"NEED suppressed: {_slot_note}\n"
                                 "Use existing provided information and continue this step.\n\n"
                             )
                             if attempt == MAX_RETRIES_PER_STEP - 1:
@@ -2384,21 +3145,6 @@ Output format (exactly one):
                             step_result = f"Needs user input (non-interactive mode): {question}"
                             step_status = "failed"
                             break
-                    # Ã¢â€â‚¬Ã¢â€â‚¬ Conditional-step skip Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                    if answer.upper().startswith("SKIP:"):
-                        skip_reason = answer[5:].strip().split("\n")[0][:200]
-                        print(f"[AGENT] Ã¢ÂÂ­ Step {i+1} skipped: {skip_reason}")
-                        yield {"type": "thought",
-                               "content": f"Ã¢ÂÂ­ Step {i+1} skipped: {skip_reason}",
-                               "step": i + 1}
-                        step_result = f"skipped: {skip_reason}"
-                        step_status = "done"
-                        break
-                    if "FINAL ANSWER:" in answer:
-                        final_response = answer.split("FINAL ANSWER:")[-1].strip()
-                        step_result = final_response[:200]
-                        step_status = "done"
-                        break
                     if attempt == MAX_RETRIES_PER_STEP - 1 and step_result:
                         step_status = "done"
                         break
@@ -2417,22 +3163,22 @@ Output format (exactly one):
                     tool_args = ({"command": tool_args} if "shell" in tool_name else {"content": tool_args}) \
                         if isinstance(tool_args, str) else {}
 
-                # Ã¢â€â‚¬Ã¢â€â‚¬ Idempotency guard Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                #  Idempotency guard 
                 # Side-effect tools (send / add / create / write / delete / update):
-                #   key = tool:args_hash   (NO step index Ã¢â‚¬â€ same call anywhere in
+                #   key = tool:args_hash   (NO step index  same call anywhere in
                 #   the run is blocked after first success, regardless of step number)
                 # Read/query tools:
                 #   key = tool:args_hash:step  (allowed to re-read at different steps)
                 _is_side_effect = any(tool_name.startswith(p) for p in _SIDE_EFFECT_PREFIXES)
 
-                # Normalize args for semantic dedup Ã¢â‚¬â€ phone number variants and
+                # Normalize args for semantic dedup  phone number variants and
                 # file path casing should not bypass duplicate detection.
                 _dedup_args = dict(tool_args)
                 if _is_side_effect:
                     for _dk in ("phone", "to", "recipient", "number"):
                         _pv = _dedup_args.get(_dk)
                         if isinstance(_pv, str) and _pv:
-                            # Strip +, leading zeros, spaces, dashes Ã¢â€ â€™ bare digits
+                            # Strip +, leading zeros, spaces, dashes  bare digits
                             _dedup_args[_dk] = re.sub(r'[^0-9]', '', _pv).lstrip('0') or _pv
                     for _dk in ("path", "media_path", "file_path", "file", "filename"):
                         _fv = _dedup_args.get(_dk)
@@ -2445,8 +3191,8 @@ Output format (exactly one):
                 ).hexdigest()[:8]
                 _call_sig = f"{tool_name}:{_args_hash}" if _is_side_effect else f"{tool_name}:{_args_hash}:{i}"
                 if _call_sig in seen_calls:
-                    obs_skip = f"(already executed this run Ã¢â‚¬â€ result already recorded above)"
-                    print(f"[AGENT] Ã¢ÂÂ© Idempotency skip [{_call_sig}]")
+                    obs_skip = f"(already executed this run  result already recorded above)"
+                    print(f"[AGENT]  Idempotency skip [{_call_sig}]")
                     last_error = f"duplicate tool call blocked: {tool_name} with same args"
                     _step_calls.append({
                         "tool": tool_name,
@@ -2456,7 +3202,7 @@ Output format (exactly one):
                     })
                     _special_retry_note = (
                         f"{obs_skip}\n"
-                        "Do not repeat the same call. Either output STEP_DONE if this step is complete, "
+                        "Do not repeat the same call. Either output DONE if this step is complete, "
                         "or choose a different tool/args for this step.\n\n"
                     )
                     if attempt == MAX_RETRIES_PER_STEP - 1:
@@ -2466,7 +3212,7 @@ Output format (exactly one):
                 # Both read tools AND side-effect tools add to seen_calls ONLY after
                 # confirmed success (see success block below). Previously read tools were
                 # added before execution, causing a failed read to be permanently marked
-                # "already executed" Ã¢â‚¬â€ blocking all retries for that step.
+                # "already executed"  blocking all retries for that step.
                 _step_tool = tool_name  # record for completed.append
 
                 yield {"type": "tool_call", "tool": tool_name, "args": tool_args, "step": i + 1}
@@ -2505,7 +3251,7 @@ Output format (exactly one):
                         error_type="missing_arg" if "arg" in last_error.lower() else "",
                         is_retry=attempt > 0,
                     )
-                    print(f"[STREAM][TOOL RESULT Ã¢Å“â€”] {observation}")
+                    print(f"[STREAM][TOOL RESULT ] {observation}")
                     yield {"type": "tool_result", "tool": tool_name, "result": observation,
                            "status": "error", "step": i + 1}
                     _policy_e = _get_policy(tool_name)
@@ -2522,7 +3268,7 @@ Output format (exactly one):
                     tool_res = result.get("result", result) if isinstance(result, dict) else result
                     self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
                     raw_obs = json.dumps(tool_res, indent=2, default=str)
-                    print(f"[STREAM][TOOL RESULT Ã¢Å“â€œ] ({len(raw_obs)} chars):")
+                    print(f"[STREAM][TOOL RESULT ] ({len(raw_obs)} chars):")
                     print(raw_obs[:2000] + ("\n...[truncated]" if len(raw_obs) > 2000 else ""))
                     observation = raw_obs
                     _recent_tool_outputs.append({
@@ -2532,12 +3278,22 @@ Output format (exactly one):
                     })
                     _buf_id_for_record = None
                     if self._should_buffer_result(tool_name, observation):
+                        # Distill noisy search/scrape results before buffering.
+                        # This keeps the buffer compact and removes navigation noise,
+                        # so the pre-fetch injected into downstream steps is signal-only.
+                        _store_data = observation
+                        if tool_name.startswith(("search.", "firecrawl.")):
+                            _store_data = self._distill_search_result(
+                                observation, step_desc, model
+                            )
                         self._buffer_id += 1
                         self.buffer[self._buffer_id] = {
-                            "data": observation, "tool": tool_name, "chars": len(observation)
+                            "data": _store_data, "tool": tool_name, "chars": len(_store_data)
                         }
                         _buf_id_for_record = self._buffer_id
-                        observation = self._make_buffer_observation(self._buffer_id, observation, tool_name)
+                        # Show digest from the distilled (stored) data, not the raw noisy obs
+                        _buf_stored_data = self.buffer[self._buffer_id]["data"]
+                        observation = self._make_buffer_observation(self._buffer_id, _buf_stored_data, tool_name)
                     yield {"type": "tool_result", "tool": tool_name, "result": observation,
                            "status": "ok", "step": i + 1}
                     # Always summarize from raw tool output (not the buffer note),
@@ -2565,9 +3321,9 @@ Output format (exactly one):
                         artifacts=dict(_step_artifacts),
                     )
                     self._context_compiler.metrics.record_tool_call(tool_name, success=True)
-                    print(f"[STREAM][CONTEXTÃ¢â€ â€™NEXT] {step_result}")
+                    print(f"[STREAM][CONTEXTNEXT] {step_result}")
 
-                    # Ã¢â€â‚¬Ã¢â€â‚¬ Mark seen AFTER confirmed success for ALL tool types Ã¢â€â‚¬Ã¢â€â‚¬
+                    #  Mark seen AFTER confirmed success for ALL tool types 
                     # Read tools use step-indexed keys (tool:hash:step) so they can still
                     # re-read at different step indices; side-effects use step-free keys
                     # (tool:hash) to block all duplicates globally across the run.
@@ -2585,7 +3341,7 @@ Output format (exactly one):
                     if _is_side_effect and tool_name in _BATCH_ADDITIVE_TOOLS:
                         _step_quant_done += 1  # count completed items for batch steps
 
-                    # Ã¢â€â‚¬Ã¢â€â‚¬ Policy-driven result validator Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                    #  Policy-driven result validator 
                     # Consults ToolPolicy to detect bad/empty results for
                     # non-side-effect tools without any LLM text reasoning.
                     # For side-effect tools, check for explicit failure indicators in the
@@ -2607,7 +3363,7 @@ Output format (exactly one):
                                 or tool_res.get("message")
                                 or str(tool_res)[:200]
                             ) if isinstance(tool_res, dict) else str(tool_res)[:200]
-                            print(f"[AGENT] Ã¢Å¡Â Ã¯Â¸Â Side-effect tool {tool_name} returned soft-failure: {_se_reason}")
+                            print(f"[AGENT]  Side-effect tool {tool_name} returned soft-failure: {_se_reason}")
                             # Downgrade from ok to failed
                             _step_calls[-1]["status"] = "soft_fail"
                             _step_calls[-1]["summary"] = f"soft-fail: {str(_se_reason)[:160]}"
@@ -2637,7 +3393,7 @@ Output format (exactly one):
                                 )
                             )
                             replan_reason = (
-                                f"{tool_name} found no matching files Ã¢â‚¬â€ check filename or use filesystem.list"
+                                f"{tool_name} found no matching files  check filename or use filesystem.list"
                                 if _empty_matches else
                                 f"tool {tool_name} returned unusable result: {step_result[:120]}"
                             )
@@ -2647,9 +3403,9 @@ Output format (exactly one):
                                     "Current strategy cannot continue. Replan from this step."
                                 )
                                 _force_plan_revise = True
-                            print(f"[AGENT] Ã¢â„¢Â»Ã¯Â¸Â Policy fail step {i+1}: {replan_reason}")
+                            print(f"[AGENT]  Policy fail step {i+1}: {replan_reason}")
                             yield {"type": "thought",
-                                   "content": f"Ã¢â„¢Â»Ã¯Â¸Â **Policy fail step {i+1}:** {replan_reason}",
+                                   "content": f" **Policy fail step {i+1}:** {replan_reason}",
                                    "step": i + 1}
                             last_error = replan_reason
                             last_failed_tool = tool_name
@@ -2670,13 +3426,13 @@ Output format (exactly one):
                         ) if _step_actions else "  - (result recorded above)"
                         _special_retry_note = (
                             f"ALREADY RETRIEVED for this step:\n{_found_summary}\n\n"
-                            "If ANY of the results above satisfy the step goal, output STEP_DONE immediately.\n"
+                            "If ANY of the results above satisfy the step goal, output DONE immediately.\n"
                             "Do NOT call more tools to verify, confirm, or double-check data you already have.\n\n"
                         )
                         continue
                     break
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Policy-driven fallback executor Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Policy-driven fallback executor 
             # Runs BEFORE LLM replan. Iterates policy.fallback_sequence in order:
             #   "tool" entries execute a cheap recovery action (e.g. filesystem.list).
             #   "need_input" entries pause the run and rewind the step.
@@ -2710,7 +3466,7 @@ Output format (exactly one):
                         print(f"[AGENT] Need-input suppressed at step {i+1}: {_slot_note}")
                     if run_handle and hasattr(run_handle, 'input_queue') \
                             and not run_handle.is_cancelled() and not _fb_handled:
-                        print(f"[AGENT] Ã¢Ââ€œ Policy NEED_INPUT step {i+1}: {_auto_q}")
+                        print(f"[AGENT]  Policy NEED_INPUT step {i+1}: {_auto_q}")
                         yield {"type": "need_input", "question": _auto_q, "step": i + 1}
                         try:
                             _ui_ans = await asyncio.wait_for(
@@ -2729,9 +3485,9 @@ Output format (exactly one):
                             _step_idx = i
                             _step_rewound = True
                             _fb_handled = True
-                            print(f"[AGENT] Ã¢â„¢Â» Need input captured; rewinding step {i+1} with clarification")
+                            print(f"[AGENT]  Need input captured; rewinding step {i+1} with clarification")
                         except asyncio.TimeoutError:
-                            print(f"[AGENT] Ã¢ÂÂ± NEED_INPUT timed out step {i+1} Ã¢â‚¬â€ falling to replan")
+                            print(f"[AGENT]  NEED_INPUT timed out step {i+1}  falling to replan")
 
                 # Structured fallback sequence (tool calls followed by optional need_input)
                 if not _fb_handled and not _step_rewound and _policy_fb.fallback_sequence:
@@ -2750,11 +3506,11 @@ Output format (exactly one):
                                 f"{hashlib.md5(json.dumps(_fb_ta, sort_keys=True, default=str).encode()).hexdigest()[:8]}"
                             )
                             if _fb_sig in seen_calls:
-                                print(f"[AGENT] Ã¢ÂÂ© Fallback skip (already done): {_fb_tn}")
+                                print(f"[AGENT]  Fallback skip (already done): {_fb_tn}")
                                 continue
-                            print(f"[AGENT] Ã°Å¸â€Â Policy fallback: {_fb_tn}({json.dumps(_fb_ta)[:80]})")
+                            print(f"[AGENT]  Policy fallback: {_fb_tn}({json.dumps(_fb_ta)[:80]})")
                             yield {"type": "thought",
-                                   "content": f"Ã°Å¸â€Â Policy fallback: {_fb_tn}", "step": i + 1}
+                                   "content": f" Policy fallback: {_fb_tn}", "step": i + 1}
                             yield {"type": "tool_call", "tool": _fb_tn, "args": _fb_ta, "step": i + 1}
                             try:
                                 _fb_res = await asyncio.to_thread(
@@ -2779,9 +3535,14 @@ Output format (exactly one):
                                     "raw": _fb_obs,
                                 })
                                 if self._should_buffer_result(_fb_tn, _fb_obs):
+                                    _fb_store = _fb_obs
+                                    if _fb_tn.startswith(("search.", "firecrawl.")):
+                                        _fb_store = self._distill_search_result(
+                                            _fb_obs, step_desc, model
+                                        )
                                     self._buffer_id += 1
                                     self.buffer[self._buffer_id] = {
-                                        "data": _fb_obs, "tool": _fb_tn, "chars": len(_fb_obs)
+                                        "data": _fb_store, "tool": _fb_tn, "chars": len(_fb_store)
                                     }
                                     _fb_obs = self._make_buffer_observation(
                                         self._buffer_id, _fb_obs, _fb_tn
@@ -2793,7 +3554,7 @@ Output format (exactly one):
                                 _fb_handled = True
                                 yield {"type": "tool_result", "tool": _fb_tn,
                                        "result": _fb_obs, "status": "ok", "step": i + 1}
-                                print(f"[AGENT] Ã¢Å“â€œ Policy fallback succeeded: {step_result[:80]}")
+                                print(f"[AGENT]  Policy fallback succeeded: {step_result[:80]}")
                         elif _fb_type == "need_input":
                             _auto_q = _fb_composer(
                                 last_failed_tool or "", last_failed_args or {}, last_error or ""
@@ -2812,7 +3573,7 @@ Output format (exactly one):
                                 break
                             if run_handle and hasattr(run_handle, 'input_queue') \
                                     and not run_handle.is_cancelled():
-                                print(f"[AGENT] Ã¢Ââ€œ Policy fallback NEED_INPUT step {i+1}: {_auto_q}")
+                                print(f"[AGENT]  Policy fallback NEED_INPUT step {i+1}: {_auto_q}")
                                 yield {"type": "need_input", "question": _auto_q, "step": i + 1}
                                 try:
                                     _ui_ans = await asyncio.wait_for(
@@ -2831,16 +3592,30 @@ Output format (exactly one):
                                     _step_idx = i
                                     _step_rewound = True
                                     _fb_handled = True
-                                    print(f"[AGENT] Ã¢â„¢Â» Need input captured; rewinding step {i+1} with clarification")
+                                    print(f"[AGENT]  Need input captured; rewinding step {i+1} with clarification")
                                 except asyncio.TimeoutError:
-                                    print(f"[AGENT] Ã¢ÂÂ± NEED_INPUT timed out step {i+1}")
+                                    print(f"[AGENT]  NEED_INPUT timed out step {i+1}")
                             break  # stop sequence after need_input attempt
 
+            if not _step_rewound:
+                if step_status == "failed":
+                    _consecutive_failures += 1
+                else:
+                    _consecutive_failures = 0
+
             # -- Replan-as-step-splitting: revise remaining plan from failed step onward --
-            if step_status == "failed" and not _step_rewound and _plan_revisions < MAX_PLAN_REVISIONS:
+            if (
+                step_status == "failed"
+                and not _step_rewound
+                and _plan_revisions < MAX_PLAN_REVISIONS
+                and _consecutive_failures >= REPLAN_CONSECUTIVE_FAILURES
+            ):
                 yield {
                     "type": "thought",
-                    "content": f"Ã¢â„¢Â»Ã¯Â¸Â Replanning from step {i+1}: {step_desc[:90]}",
+                    "content": (
+                        f" Replanning from step {i+1} "
+                        f"after {_consecutive_failures} consecutive failures: {step_desc[:90]}"
+                    ),
                     "step": i + 1,
                 }
                 revised_steps = await self._revise_plan(
@@ -2854,11 +3629,12 @@ Output format (exactly one):
                     model=model,
                     history_text=history_text,
                     profile_context=_profile_context_exec_cached,
-                    memory_context=_memory_context_cached,
+                    memory_context=_memory_context_exec_cached,
                     tool_categories_summary=_tool_categories_summary_cached,
                 )
                 if revised_steps:
                     _plan_revisions += 1
+                    _consecutive_failures = 0
                     self._context_compiler.metrics.record_plan_revision()
                     self._context_compiler.short_term.record_decision(
                         i, f"Replanned from step {i+1}: {step_desc[:80]}",
@@ -2895,34 +3671,17 @@ Output format (exactly one):
                     _step_idx = i
                     yield {
                         "type": "thought",
-                        "content": f"Ã¢â„¢Â»Ã¯Â¸Â Replan parse fallback: retrying step {i+1} with clarification",
+                        "content": f" Replan parse fallback: retrying step {i+1} with clarification",
                         "step": i + 1,
                     }
                     # Close step metrics before retrying with clarification
                     self._context_compiler.metrics.end_step(i, success=False)
                     continue
 
-            # All replans exhausted Ã¢â‚¬â€ force best answer from partial work
-            if step_status == "failed":
-                done_labels = "\n".join(
-                    f"  [{'ok' if s['status']=='done' else 'XX'}] {s['step']} -> {s['result']}"
-                    for s in completed
-                )
-                force_prompt = (
-                    f"{self.system_prompt}\n\n{_profile_context_exec_cached}{_memory_context_cached}{history_text}"
-                    f"User: {text}\n\n"
-                    + (f"DONE:\n{done_labels}\n\n" if done_labels else "")
-                    + f"Step '{step_desc}' failed after plan revision attempts.\n"
-                    "Give the best FINAL ANSWER from what was completed.\n"
-                    "MIRA: FINAL ANSWER:"
-                )
-                force_raw = await asyncio.to_thread(
-                    generate, force_prompt, model=model, temperature=0.5)
-                final_response = force_raw.strip()
-                if "FINAL ANSWER:" in final_response:
-                    final_response = final_response.split("FINAL ANSWER:")[-1].strip()
+            # Do not force a final answer on single-step failures.
+            # Keep executing remaining steps; synthesis will report partial success/failures.
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Quantified step continuation Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Quantified step continuation 
             # If the step had a numeric goal (N items) and only k < N side-effects
             # succeeded, inject (N-k) continuation sub-steps into the step list so
             # the while-loop processes each remaining item one at a time.
@@ -2940,14 +3699,14 @@ Output format (exactly one):
                     _cont_desc = f"{_base_desc} [item {_item_num} of {_step_quant_n}]"
                     steps.insert(i + 1 + _k, {"goal": _cont_desc, "categories": step_categories})
                 print(
-                    f"[AGENT] Ã°Å¸â€œâ€¹ Quantified continuation: {_step_quant_done}/{_step_quant_n} done, "
+                    f"[AGENT]  Quantified continuation: {_step_quant_done}/{_step_quant_n} done, "
                     f"injected {_remaining} continuation step(s)"
                 )
 
             if not _step_rewound:  # don't log rewound steps; they'll re-run and log on success
                 if step_status == "done":
                     self._maybe_update_handoff_payload(_step_tool, step_result or "")
-                completed.append({
+                _completed_entry = {
                     "step": step_desc,
                     "status": step_status,
                     "result": step_result if step_result else (last_error[:100] if last_error else "failed"),
@@ -2955,14 +3714,24 @@ Output format (exactly one):
                     "calls": _step_calls,
                     "artifacts": _step_artifacts,
                     "categories": step_categories,
-                })
+                }
+                completed.append(_completed_entry)
                 # Track step completion in metrics
                 self._context_compiler.metrics.end_step(i, success=(step_status == "done"))
+                # After a search/scraping step succeeds, annotate remaining steps with
+                # the real BUFFER ID so downstream email/send steps know which buffer to read.
+                if step_status == "done" and _step_tool.startswith(("search.", "firecrawl.")):
+                    _remaining_steps = steps[_step_idx:]
+                    if _remaining_steps:
+                        steps[_step_idx:] = self._inject_buffer_refs_into_steps(
+                            _remaining_steps, _completed_entry, self.buffer
+                        )
+
 
             if final_response:
                 break
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 1.5: Postcondition Ã¢â‚¬â€ count verification for quantified tasks Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Phase 1.5: Postcondition  count verification for quantified tasks 
         # When the task asked for N todos/events/contacts and matching side-effect
         # tools were used, verify the actual stored count matches the expectation.
         # Injects a warning into the synthesis prompt if the count is short.
@@ -2982,7 +3751,7 @@ Output format (exactly one):
                     "event":         "calendar.list_events",
                 }
                 _verify_tool = _VERIFY_MAP.get(_entity_type)
-                _entity_root = _entity_type.replace("checklist", "")  # "item" Ã¢â€ â€™ skip
+                _entity_root = _entity_type.replace("checklist", "")  # "item"  skip
                 _had_matching_steps = any(
                     s.get("tool", "").startswith(_entity_root) or
                     s.get("tool", "") == _verify_tool
@@ -2998,17 +3767,17 @@ Output format (exactly one):
                         )
                         if _actual_n < _expected_n:
                             _postcond_warning = (
-                                f"\nÃ¢Å¡Â Ã¯Â¸Â POSTCONDITION FAILURE: task required {_expected_n} "
+                                f"\n POSTCONDITION FAILURE: task required {_expected_n} "
                                 f"{_entity_type}(s), but {_verify_tool} shows only {_actual_n} "
-                                f"total entries. The batch may be incomplete Ã¢â‚¬â€ report this.\n"
+                                f"total entries. The batch may be incomplete  report this.\n"
                             )
-                            print(f"[AGENT] Ã¢ÂÅ’ Postcondition: expected {_expected_n}, got {_actual_n}")
+                            print(f"[AGENT]  Postcondition: expected {_expected_n}, got {_actual_n}")
                         else:
-                            print(f"[AGENT] Ã¢Å“â€¦ Postcondition: {_actual_n} >= {_expected_n} Ã¢Å“â€œ")
+                            print(f"[AGENT]  Postcondition: {_actual_n} >= {_expected_n} ")
                     except Exception as _pce:
                         print(f"[AGENT] Postcondition check error: {_pce}")
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 1.5b: Todo title postcondition Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Phase 1.5b: Todo title postcondition 
         # For any todo.add steps that reported success (with a title in the obs),
         # verify the exact title appears in todo.list. Catches cases where the model
         # used a wrong or truncated title, or the add silently failed.
@@ -3035,7 +3804,7 @@ Output format (exactly one):
                         _postcond_warning = (
                             f"\n\u26a0\ufe0f POSTCONDITION FAILURE: {len(_missing_titles)} todo title(s) "
                             f"reported as added but not found in todo.list: {_missing_titles[:5]}. "
-                            "Report this discrepancy Ã¢â‚¬â€ the items may not have been saved.\n"
+                            "Report this discrepancy  the items may not have been saved.\n"
                         )
                         print(f"[AGENT] \u274c Todo title postcondition: missing {_missing_titles}")
                     else:
@@ -3043,7 +3812,7 @@ Output format (exactly one):
                 except Exception as _tlpe:
                     print(f"[AGENT] Todo title postcondition error: {_tlpe}")
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Phase 1.5c: Media-send postcondition for PDF/document delivery Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Phase 1.5c: Media-send postcondition for PDF/document delivery 
         # If task asks to send a PDF/document/file in WhatsApp context, ensure
         # whatsapp.send_media succeeded with type=document and a valid file path.
         if not _postcond_warning:
@@ -3076,11 +3845,11 @@ Output format (exactly one):
                 )
                 if not _sent_media_ok:
                     _postcond_warning = (
-                        "\nÃ¢Å¡Â Ã¯Â¸Â POSTCONDITION FAILURE: task requested sending a PDF/document/file, "
+                        "\n POSTCONDITION FAILURE: task requested sending a PDF/document/file, "
                         "but no successful whatsapp.send_media call was recorded. "
                         "Do not claim file delivery succeeded.\n"
                     )
-                    print("[AGENT] Ã¢ÂÅ’ Media postcondition: missing successful whatsapp.send_media")
+                    print("[AGENT]  Media postcondition: missing successful whatsapp.send_media")
                 elif not _sent_document_ok:
                     # send_media was called but with wrong type (e.g. type=image)
                     _actual_types = [r.args.get("type", "unknown") for r in _media_records]
@@ -3089,20 +3858,20 @@ Output format (exactly one):
                         for r in _media_records
                     ]
                     _postcond_warning = (
-                        "\nÃ¢Å¡Â Ã¯Â¸Â POSTCONDITION WARNING: whatsapp.send_media succeeded but "
+                        "\n POSTCONDITION WARNING: whatsapp.send_media succeeded but "
                         f"used type={_actual_types} instead of type='document', "
                         f"or the file path does not look like a PDF/document: {_actual_paths}. "
                         "Verify the correct file was sent as a document attachment.\n"
                     )
-                    print(f"[AGENT] Ã¢Å¡Â Ã¯Â¸Â Media postcondition: wrong type/path Ã¢â‚¬â€ "
+                    print(f"[AGENT]  Media postcondition: wrong type/path  "
                           f"types={_actual_types}, paths={_actual_paths}")
                 else:
-                    print("[AGENT] Ã¢Å“â€¦ Media postcondition: whatsapp.send_media with type=document recorded")
+                    print("[AGENT]  Media postcondition: whatsapp.send_media with type=document recorded")
 
         # -- Phase 2: Synthesise --
         if not final_response:
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Hard-block: if any critical side-effect step failed, bypass the LLM
-            # entirely to prevent 4B model from hallucinating success. Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Hard-block: if any critical side-effect step failed, bypass the LLM
+            # entirely to prevent 4B model from hallucinating success. 
             _CRITICAL_VERBS = ("send", "write", "create", "add", "update", "delete",
                                "move", "patch", "post", "upload")
             failed_critical = [
@@ -3120,9 +3889,12 @@ Output format (exactly one):
                     for s in completed if s["status"] == "done"
                 ) or "  (none)"
                 final_response = (
-                    f"Ã¢ÂÅ’ Task incomplete Ã¢â‚¬â€ the following required actions failed:\n{fail_lines}\n\n"
+                    f" Task incomplete  the following required actions failed:\n{fail_lines}\n\n"
                     f"What did succeed:\n{ok_lines}\n\n"
                     f"Please correct the issue and try again."
+                )
+                final_response = self._maybe_stage_workflow_suggestion(
+                    text, completed, final_response, workflow_was_auto_used=bool(_workflow_steps_preloaded)
                 )
                 yield {"type": "final", "content": final_response}
                 self.history.append((text, final_response))
@@ -3130,36 +3902,49 @@ Output format (exactly one):
                 _run_metrics = self._context_compiler.metrics.finalize()
                 print(self._context_compiler.metrics.render_metrics_block())
                 return
-            # â”€â”€ Synthesizer bypass (BYPASS_SYNTHESIZER=True) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            if BYPASS_SYNTHESIZER:
-                _ok  = [s for s in completed if s["status"] == "done"]
-                _bad = [s for s in completed if s["status"] != "done"]
-                _parts = []
-                for s in _ok:
-                    _parts.append(f"âœ… {s['step']}\n   {s['result']}")
-                for s in _bad:
-                    _parts.append(f"âŒ {s['step']} â€” FAILED: {s['result']}")
-                final_response = "\n\n".join(_parts) if _parts else "All steps completed."
-                print("[STREAM] Synthesizer bypassed â€” using raw step results.")
+            if self._should_skip_synthesis(completed) and not _postcond_warning:
+                final_response = self._render_simple_completion(completed)
+                final_response = self._maybe_stage_workflow_suggestion(
+                    text, completed, final_response, workflow_was_auto_used=bool(_workflow_steps_preloaded)
+                )
                 _run_metrics = self._context_compiler.metrics.finalize()
                 print(self._context_compiler.metrics.render_metrics_block())
                 yield {"type": "final", "content": final_response}
                 self.history.append((text, final_response))
                 return
-            # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            #  Synthesizer bypass (BYPASS_SYNTHESIZER=True) 
+            if (not final_response) and BYPASS_SYNTHESIZER:
+                _ok  = [s for s in completed if s["status"] == "done"]
+                _bad = [s for s in completed if s["status"] != "done"]
+                _parts = []
+                for s in _ok:
+                    _parts.append(f" {s['step']}\n   {s['result']}")
+                for s in _bad:
+                    _parts.append(f" {s['step']}  FAILED: {s['result']}")
+                final_response = "\n\n".join(_parts) if _parts else "All steps completed."
+                final_response = self._maybe_stage_workflow_suggestion(
+                    text, completed, final_response, workflow_was_auto_used=bool(_workflow_steps_preloaded)
+                )
+                print("[STREAM] Synthesizer bypassed  using raw step results.")
+                _run_metrics = self._context_compiler.metrics.finalize()
+                print(self._context_compiler.metrics.render_metrics_block())
+                yield {"type": "final", "content": final_response}
+                self.history.append((text, final_response))
+                return
+            # 
 
             # Use deterministic compaction for completed steps trajectory
             _compacted_trajectory = self._context_compiler.compact_trajectory(completed)
             # Also include structured tool call log from ToolRecordStore
             _tool_call_log = self._context_compiler.tool_records.render_compact_summary()
 
-            # Build a step summary that distinguishes Ã¢Å“â€œ success from Ã¢Å“â€” failure
+            # Build a step summary that distinguishes  success from  failure
             done_lines = "\n".join(
                 f"  [{'ok' if s['status']=='done' else 'FAILED'}] "
                 f"Step {j+1}: {s['step']} -> {s['result']}"
                 for j, s in enumerate(completed)
             )
-            # Check if any write/mutation step failed Ã¢â‚¬â€ used to warn the model
+            # Check if any write/mutation step failed  used to warn the model
             write_keywords = ("update", "create", "add", "delete", "send", "write", "set", "move", "patch")
             failed_writes = [
                 s for s in completed
@@ -3168,7 +3953,7 @@ Output format (exactly one):
             failed_writes_note = ""
             if failed_writes:
                 failed_writes_note = (
-                    "Ã¢Å¡Â Ã¯Â¸Â IMPORTANT: The following write/update steps FAILED:\n"
+                    " IMPORTANT: The following write/update steps FAILED:\n"
                     + "\n".join(f"  - {s['step']}: {s['result']}" for s in failed_writes)
                     + "\nDo NOT claim these actions succeeded. Report the failure honestly.\n\n"
                 )
@@ -3177,11 +3962,11 @@ Output format (exactly one):
                 step_type=StepType.SYNTHESIZE,
                 user_message=text,
                 profile_context=_profile_context_exec_cached,
-                memory_context=_memory_context_cached,
+                memory_context=_memory_context_exec_cached,
                 history_text=history_text,
                 done_block=f"Execution results:\n{done_lines}\n\n{_compacted_trajectory}{_tool_call_log}",
-                task_contract=self._get_task_contract_context(),
-                working_state=self._get_working_state_context(),
+                task_contract="",
+                working_state="",
             )
             _synth_sections, _synth_budget_note, _synth_diag = self._context_compiler.apply_budget(
                 _synth_sections, step_type=StepType.SYNTHESIZE
@@ -3221,9 +4006,9 @@ Output format (exactly one):
             else:
                 synth_raw = await asyncio.to_thread(generate, _synth_flat or synth_prompt, model=model, temperature=0.5)
             print(f"\n{'='*70}")
-            print("[STREAM] Phase 2 Ã¢â‚¬â€ SYNTHESIS")
+            print("[STREAM] Phase 2  SYNTHESIS")
             print(f"{'-'*70}")
-            print("[STREAM][PROMPT Ã¢â€ â€™LLM]")
+            print("[STREAM][PROMPT LLM]")
             print(synth_prompt)
             print(f"{'-'*70}")
             print("[STREAM][LLM REPLY]")
@@ -3234,8 +4019,11 @@ Output format (exactly one):
                 final_response = final_response.split("FINAL ANSWER:")[-1].strip()
             if self._extract_tool_call(final_response):
                 final_response = completed[-1]["result"] if completed else "Task completed."
+            final_response = self._maybe_stage_workflow_suggestion(
+                text, completed, final_response, workflow_was_auto_used=bool(_workflow_steps_preloaded)
+            )
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Finalize context quality metrics Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Finalize context quality metrics 
         _run_metrics = self._context_compiler.metrics.finalize()
         print(self._context_compiler.metrics.render_metrics_block())
 
@@ -3245,10 +4033,10 @@ Output format (exactly one):
     def _safe_execute(self, tool_name: str, args: dict):
         """Internal helper to execute a tool with argument aliasing and safety."""
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Runtime allow/deny gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Runtime allow/deny gate 
         # Constraints are set by handle_streaming() from user prompt patterns:
-        #   "Use ONLY: filesystem.*, todo.*"  Ã¢â€ â€™ self._allowed_tools = {"filesystem", "todo"}
-        #   "Do NOT use: web/email"           Ã¢â€ â€™ self._denied_tools  = {"web", "email"}
+        #   "Use ONLY: filesystem.*, todo.*"   self._allowed_tools = {"filesystem", "todo"}
+        #   "Do NOT use: web/email"            self._denied_tools  = {"web", "email"}
         # Buffer/reasoning tools are always permitted regardless of constraints.
         _GATE_BUILTINS = ("buffer.", "memory.", "reasoning.", "think")
         _allowed_tools = getattr(self, '_allowed_tools', set())
@@ -3282,10 +4070,20 @@ Output format (exactly one):
                         )
                     }
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Step-category execution gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        #  Step-category execution gate 
         # Block tools whose registered category is not in the current step's
         # selected categories. Prevents model from hallucinating cross-step
         # tools (e.g. calling whatsapp.send_media during a "retrieve contact" step).
+        _step_tools = getattr(self, "_current_step_tool_names", None)
+        if _step_tools and not any(tool_name.startswith(b) for b in _GATE_BUILTINS):
+            if tool_name not in _step_tools:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Tool '{tool_name}' is outside this step's predicted tools: {sorted(_step_tools)}. "
+                        "Use one of the listed step tools, or output DONE if this step is complete."
+                    ),
+                }
         _step_cats = getattr(self, '_current_step_cats', None)
         if _step_cats and not any(tool_name.startswith(b) for b in _GATE_BUILTINS):
             from mcp_server.tools import get_tool_metadata
@@ -3293,14 +4091,14 @@ Output format (exactly one):
             if _tmeta:
                 _tool_cat = (_tmeta.get("category") or "Other").strip().lower()
                 if _tool_cat not in _step_cats:
-                    print(f"[AGENT] Ã°Å¸Å¡Â« Category gate: {tool_name} (cat={_tool_cat}) "
-                          f"blocked Ã¢â‚¬â€ step allows: {sorted(_step_cats)}")
+                    print(f"[AGENT]  Category gate: {tool_name} (cat={_tool_cat}) "
+                          f"blocked  step allows: {sorted(_step_cats)}")
                     return {
                         "status": "error",
                         "error": (
                             f"Tool '{tool_name}' (category: {_tool_cat}) is not relevant "
                             f"for this step. Allowed categories: {sorted(_step_cats)}. "
-                            "Choose a tool from the listed categories, or output STEP_DONE "
+                            "Choose a tool from the listed categories, or output DONE "
                             "if this step is complete."
                         )
                     }
@@ -3319,7 +4117,7 @@ Output format (exactly one):
                 }
             lines = data.split('\n')
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Fast path: word-level OR keyword matching Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Fast path: word-level OR keyword matching 
             query_words = [w for w in query.lower().split() if len(w) > 3]
             matches, seen_ranges = [], set()
             for i, line in enumerate(lines):
@@ -3331,7 +4129,7 @@ Output format (exactly one):
             if matches:
                 return {"result": f"Found {len(matches)} matches:\n\n" + "\n---\n".join(matches[:15])}
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Slow path: LLM extraction if agent provided a prompt Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Slow path: LLM extraction if agent provided a prompt 
             if extract_prompt:
                 truncated = data[:3500]
                 llm_prompt = (
@@ -3342,7 +4140,7 @@ Output format (exactly one):
                 result_text = generate(llm_prompt, model=model)
                 return {"result": result_text.strip()[:400]}
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ Fallback: small sample + hint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            #  Fallback: small sample + hint 
             sample = '\n'.join(l for l in lines if l.strip())[:600]
             return {
                 "status": "error",
@@ -3756,7 +4554,7 @@ Output format (exactly one):
         if tool_name == "think":
             _base_prompt = args.get("prompt", "")
             _injections = []
-            # 1) buffer=<id>  OR  buffer_id=<id>  Ã¢â‚¬â€ pull from agent buffer
+            # 1) buffer=<id>  OR  buffer_id=<id>   pull from agent buffer
             _raw_buf_id = args.pop("buffer", None) or args.pop("buffer_id", None)
             if _raw_buf_id is not None:
                 try:
@@ -3788,7 +4586,7 @@ Output format (exactly one):
             if "html"    in args and "html_content" not in args: args["html_content"] = args.pop("html")
             if "content" in args and "html_content" not in args: args["html_content"] = args.pop("content")
             if "output"  in args and "output_path" not in args: args["output_path"] = args.pop("output")
-        # whatsapp.status takes zero args Ã¢â‚¬â€ strip any hallucinated args (jid, to, number, ...)
+        # whatsapp.status takes zero args  strip any hallucinated args (jid, to, number, ...)
         if tool_name == "whatsapp.status":
             args = {}
         # whatsapp.send pre-flight: require text payload or auto-fill from handoff payload.
@@ -3920,8 +4718,8 @@ Output format (exactly one):
 
         # --- JIT TOOL DOCS + ARG STRIPPING ---
         # Strip hallucinated kwargs BEFORE calling, using real param names from metadata.
-        # e.g. system.time(format="iso") Ã¢â€ â€™ system.time()  Ã¢â‚¬â€ succeeds first try, no loop.
-        # SKIP stripping when function accepts **kwargs (has_var_keyword=True) Ã¢â‚¬â€ those
+        # e.g. system.time(format="iso")  system.time()   succeeds first try, no loop.
+        # SKIP stripping when function accepts **kwargs (has_var_keyword=True)  those
         # functions are intentionally open-ended and should receive all args.
         try:
             from mcp_server.tools import get_tool_metadata as _gm
@@ -3955,7 +4753,7 @@ Output format (exactly one):
             if _suggested:
                 _msg = (
                     f"Tool '{tool_name}' not found. Use '{_suggested}'.\n"
-                    f"Correct call format: ACTION: {{\"tool\": \"{_suggested}\", \"args\": {{...}}}}"
+                    f"Correct call format: TOOL: {_suggested} | arg=value"
                 )
                 try:
                     from mcp_server.tools import get_tool_metadata as _gm2
@@ -3976,7 +4774,7 @@ Output format (exactly one):
                 "error": (
                     f"Tool '{tool_name}' not found. "
                     f"Use an exact registered tool name. "
-                    f"Call format: ACTION: {{\"tool\": \"<valid_tool>\", \"args\": {{...}}}}"
+                    f"Call format: TOOL: <valid_tool> | arg=value"
                 )
             }
 
@@ -4020,7 +4818,7 @@ Output format (exactly one):
                     example = meta.get("example")
                     fmt_msg = (
                         f"{err}\n"
-                        f"Correct call format: ACTION: {{\"tool\": \"{tool_name}\", \"args\": {json.dumps(required_template, ensure_ascii=False)}}}"
+                        f"Correct call format: TOOL: {tool_name} | args={json.dumps(required_template, ensure_ascii=False)}"
                     )
                     if required_keys:
                         fmt_msg += f"\nRequired args: {', '.join(required_keys)}"
@@ -4036,7 +4834,7 @@ Output format (exactly one):
         Extract a tool call JSON from the LLM's output.
         Returns (tool_name, tool_args, pre_text) or None if no valid tool call.
         
-        Uses brace-matching instead of brute-force O(nÃ‚Â²) scan.
+        Uses brace-matching instead of brute-force O(n) scan.
         Handles: markdown code fences, nested braces, string escapes.
         """
         import re
@@ -4108,4 +4906,10 @@ Output format (exactly one):
             return tool_name, args, pre_text
         
         return None
+
+
+
+
+
+
 

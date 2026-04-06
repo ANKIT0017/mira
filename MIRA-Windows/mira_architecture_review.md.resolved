@@ -1,0 +1,506 @@
+# MIRA Revised Plan — Small Model Local-First Agent
+
+> Constraint: Qwen3:4B / Llama3.2:3B / Phi-3.5-mini running on-device.
+> Budget: ~3-4GB RAM. Context: 4K-8K tokens. Attention collapses past ~2K tokens.
+> Goal: consistent personal assistant that builds and executes workflows.
+
+---
+
+## The Core Constraint — Why Multi-Call IS Correct
+
+A 4B model running on 4GB RAM has:
+- **4K-8K context window** (depending on model)
+- **Effective attention: ~1.5K-2K tokens** before quality degrades
+- **Instruction following: unreliable** with more than ~3 competing rules
+- **Tool-call format: flaky** if JSON is buried deep in a long prompt
+
+Claude uses one big loop because it runs 200B parameters with 128K context. You
+cannot do that with a 4B model on a laptop. The multi-call design is the right
+answer. **What is broken is what each call contains and what it asks for.**
+
+---
+
+## Problem 1: ACT Prompts Are Too Big → Fix Each Call's Diet
+
+### Current ACT prompt size (estimated):
+```
+system_prompt         ~300 tokens
+tool schemas          ~800-2000 tokens (entire category)
+profile context       ~400 tokens (injected even in ACT)
+memory context        ~200 tokens
+short_term_memory     ~150 tokens
+buffer context        ~200 tokens
+tool_history          ~300 tokens
+history               ~400 tokens
+done_block            grows ~150 tokens per completed step
+task_contract         ~100 tokens
+working_state         ~100 tokens
+constraints/retry     ~200 tokens
+output_format         ~100 tokens
+────────────────────────────────
+TOTAL:                3,000–5,000+ tokens BEFORE the model generates anything
+```
+
+A 4B model with 8K context and a 4K prompt has 4K left for output. But with
+attention degradation, it's effectively reading only the last ~1.5K tokens clearly.
+
+### What Each Call Should Actually Contain
+
+**PLAN call** (one-shot decision: conversational or task?):
+```
+Budget: ≤ 1,200 tokens total
+
+system_prompt (identity + rules)        ≤ 150 tokens
+USER.md (name, timezone, 3 key facts)   ≤ 100 tokens
+MEMORY.md (last 10 items only)          ≤ 200 tokens
+conversation history (last 2 turns)     ≤ 300 tokens
+user message                            ≤ variable
+tool categories (names only, no schemas)≤ 150 tokens
+output format                           ≤ 50 tokens
+────────────────────────────────────────────────────
+PLAN budget: ≤ 1,200 tokens
+```
+
+**ACT call** (execute one specific step):
+```
+Budget: ≤ 1,000 tokens total
+
+system_identity (3 lines)               ≤ 60 tokens
+ONLY the schema for the 1 most-likely tool ≤ 200 tokens
+done_block (last 2 steps only, 80 chars each) ≤ 150 tokens
+current step description                ≤ 80 tokens
+retry note (if retrying)                ≤ 100 tokens
+output format (2 options max)           ≤ 50 tokens
+────────────────────────────────────────────────────
+ACT budget: ≤ 700 tokens
+```
+
+**SYNTHESIS call** (write the final reply):
+```
+Budget: ≤ 1,500 tokens total
+
+system_identity                         ≤ 60 tokens
+done_block (ALL steps, compacted)       ≤ 600 tokens
+user message (original goal)            ≤ 200 tokens
+output format                           ≤ 30 tokens
+────────────────────────────────────────────────────
+SYNTH budget: ≤ 900 tokens
+```
+
+**Key changes from current:**
+- SOUL.md removed from ACT and SYNTH (pure noise for tool execution)
+- Memory removed from ACT (the model forgot it by step 5 anyway — inject as facts in done_block instead)
+- Full history removed from ACT (last 2 steps in done_block is enough)
+- Tool schema → only 1 schema (the predicted tool), not the whole category
+- Remove task_contract and working_state from ACT — too much overhead per step
+
+---
+
+## Problem 2: Output Format Has 6 Options → The Model Gets Confused
+
+Current ACT output options:
+```
+ACTION / STEP_DONE / STEP_FAILED / FINAL ANSWER / SKIP / NEED_INPUT
+```
+
+A 4B model consistently picks wrong ones. It outputs STEP_DONE when it should
+call a tool. It outputs FINAL ANSWER mid-plan. It mixes up SKIP and STEP_DONE.
+
+### Fix: Reduce to 3 Options
+
+```
+TOOL: toolname
+args: arg1=value1, arg2=value2
+
+DONE: brief summary of what was accomplished
+
+NEED: one specific question for the user
+```
+
+- **TOOL**: execute a tool. Simple key-value args, not JSON.
+- **DONE**: this step is complete (either tool ran or step was already satisfied).
+- **NEED**: block for user input.
+
+No STEP_FAILED (if tool errors, the executor handles retry with code, not model decision).
+No SKIP (merge into DONE: "already done from step X").
+No FINAL ANSWER in ACT (synthesis is always a separate step).
+
+For models that support native Ollama tool-calling (`llama3.2`, `qwen2.5`, `mistral`):
+use the structured API — the model returns a tool_call object. Text parsing only
+for models that don't support it.
+
+---
+
+## Problem 3: REPLAN Is a Symptom, Not a Feature — Replace It
+
+REPLAN happens when:
+a) Tool fails 4 times → exhausted retries
+b) The plan turns out to be wrong partway through
+
+### For (a) — Tool Failure Recovery: Use Code, Not LLM
+
+```python
+# After tool failure, try in this order (no LLM call):
+1. Tool-specific fallback (from ToolPolicy) — already exists, keep it
+2. If no fallback: mark step SKIPPED, continue the plan
+3. If step was required: inject "Tool X failed: <error>" into done_block
+4. Let SYNTHESIS handle reporting what failed
+
+# Only call REPLAN if:
+# - 2+ consecutive plan steps all fail
+# - AND user has provided a NEED_INPUT answer that changes the plan
+```
+
+### For (b) — Wrong Plan: Stateless Step Injection
+
+Instead of a full REPLAN call, inject correction steps at the current position:
+
+```python
+# Instead of:
+# REPLAN: re-think the whole remaining plan (800-token + LLM call)
+
+# Do:
+# If step N fails and has no fallback:
+#   Insert "alternative for step N" as a new step N+1
+#   This alternative is deterministic (from ToolPolicy fallback_sequence)
+#   No LLM call needed
+```
+
+**The only time you need an LLM REPLAN is when the task itself needs re-scoping.**
+This should be triggered by code logic (e.g., 3 consecutive failures), not on every
+single step failure.
+
+---
+
+## Problem 4: One Tool Schema Per ACT Call
+
+Currently, ACT gets all schemas for an entire category. Example:
+
+```
+"Web & Search" category → 3 tool schemas → ~600 tokens of tool docs
+"Filesystem" category → 5 tool schemas → ~800 tokens
+```
+
+The model only needs ONE tool for ONE step. You already know which tool it will
+likely use from the planner categories. Predict it and give only that schema.
+
+### Prediction Logic (deterministic, no LLM):
+
+```python
+STEP_TOOL_PREDICTION = {
+    # (category, keywords_in_step) → likely_tool
+    ("Web & Search", "search"):  "search.duckduckgo",
+    ("Web & Search", "news"):    "search.news",
+    ("Filesystem", "write"):     "filesystem.write",
+    ("Filesystem", "read"):      "filesystem.read",
+    ("Email", "send"):           "email.send",
+    ("Email", "read"):           "email.list",
+    ("Calendar", "add"):         "calendar.add_event",
+    ("Calendar", "list"):        "calendar.list",
+    # etc.
+}
+```
+
+Give the predicted tool's full schema + ONE backup tool schema from the same category.
+Total tool context: ~250 tokens instead of ~800-2000 tokens.
+
+If the model calls a different tool (edge case), it fails, retry gives it the
+correct schema. Cost: one extra LLM call. Benefit: every other call is 500-1500 tokens
+lighter.
+
+---
+
+## Problem 5: Eliminate SYNTHESIS for Simple Tasks
+
+Current: SYNTHESIS always runs as a full LLM call.
+
+### Rules for skipping SYNTHESIS:
+
+```python
+def should_skip_synthesis(completed: list, task_type: str) -> bool:
+    # Skip synthesis if:
+    all_succeeded = all(s["status"] == "done" for s in completed)
+    is_action_task = task_type in ("calendar.add", "email.send", "todo.add", ...)
+    one_step = len(completed) == 1
+    
+    if all_succeeded and (is_action_task or one_step):
+        # Generate response from template, no LLM call needed:
+        # "Done. I added the event 'Meeting' on April 10 at 2pm."
+        return True
+    return False
+```
+
+For a simple "add this to my calendar" task: 1 step, succeeded → no SYNTHESIS call.
+Just template-format the result. This eliminates a full LLM call for ~40% of tasks.
+
+---
+
+## Problem 6: SOUL.md Is Wasted Tokens in Execution
+
+SOUL.md ("You are not a chatbot. You are becoming someone.") costs ~250 tokens.
+It is injected into PLAN calls and was previously in ACT calls too.
+
+The model **cannot read philosophical instructions about its identity and simultaneously
+make precise tool calls.** These are competing attention targets.
+
+### Fix: Role Separation
+
+```
+SOUL.md content → Only in CHAT responses (conversational turn)
+USER.md content → Only in PLAN call (first 3 key facts, not the whole file)
+MEMORY.md       → Relevant items injected as facts in done_block, not separately
+```
+
+In ACT: zero SOUL, zero USER, zero MEMORY. Just: who am I, what tool, what step, what happened.
+
+---
+
+## Problem 7: The System Prompt Must Be Tiny and Fixed
+
+Current system prompt is built dynamically and references file *names* not contents.
+
+### Target system prompt (≤ 120 tokens):
+
+```
+You are MIRA, a local AI assistant.
+Complete tasks using tools. Be direct and honest.
+One tool call per response.
+If a tool fails, try a different approach.
+Ask the user only when truly blocked.
+```
+
+That's it. Everything else (tool schemas, memory, history) is injected per-call
+as needed context. The system prompt should be stable and tiny.
+
+---
+
+## Problem 8: Memory System — Keep the File, Fix the Injection
+
+MEMORY.md as a file is fine for a local-first app. No database needed.
+The problem is injecting the **whole file** into every prompt.
+
+### Fix: Keyword-Matched Injection
+
+```python
+def get_relevant_memory(task: str, memory_file: str, max_items: int = 5) -> str:
+    """Return only memory items relevant to the current task."""
+    lines = [l for l in memory_file.splitlines() if l.strip().startswith("-")]
+    task_words = set(task.lower().split())
+    
+    scored = []
+    for line in lines:
+        line_words = set(line.lower().split())
+        overlap = len(task_words & line_words)
+        scored.append((overlap, line))
+    
+    # Top 5 most relevant + always include last 2 (most recent)
+    top = [l for _, l in sorted(scored, reverse=True)[:max_items]]
+    recent = lines[-2:]
+    result = list(dict.fromkeys(top + recent))  # deduplicate, keep order
+    return "\n".join(result[:max_items])
+```
+
+No vector DB. No embeddings. Just keyword overlap. Good enough for MEMORY.md
+at this scale, zero extra dependencies.
+
+---
+
+## Feature Gap: Workflow Persistence (THE MISSING PIECE)
+
+The primary goal — "build workflows and execute them for longer tasks" — is not
+implemented at all. This is the most important missing feature.
+
+### Implementation: 3 New Tools
+
+**`workflow.save`** — save the current plan as a reusable workflow:
+```python
+# Writes to SANDBOX/workflows/<name>.json
+{
+  "name": "research_company",
+  "trigger_keywords": ["research", "look up", "find info about"],
+  "steps": [
+    {"goal": "Search for {target} on DuckDuckGo", "categories": ["Web & Search"]},
+    {"goal": "Scrape top result for {target}", "categories": ["Web Scraping"]},
+    {"goal": "Summarize findings about {target}", "categories": ["Buffer"]}
+  ],
+  "variables": ["target"]
+}
+```
+
+**`workflow.list`** — show available workflows:
+```
+Available workflows:
+1. research_company — triggered by: "research", "look up"
+2. send_weekly_report — triggered by: "send report", "weekly update"
+```
+
+**`workflow.run`** — run a workflow with variables:
+```python
+workflow.run(name="research_company", variables={"target": "Notion"})
+# → loads the JSON, substitutes variables in step goals, adds to current plan
+```
+
+### Auto-Trigger on Plan
+
+```python
+# In handle_streaming(), before running PLAN:
+matched_workflow = check_workflow_trigger(user_message, "SANDBOX/workflows/")
+if matched_workflow:
+    steps = load_workflow_steps(matched_workflow, user_message)
+    skip_plan_call = True
+    # Total LLM calls for triggered workflow: 0 (PLAN) + N (ACT steps) + 1 (SYNTH)
+```
+
+### The Agent Teaches Itself Over Time
+
+After completing a multi-step task, the agent asks:
+```
+"I completed this in 4 steps. Save this as a reusable workflow for next time? (yes/no)"
+```
+
+If yes → `workflow.save` is called automatically. Over weeks, MIRA builds a personal
+workflow library for the user's specific patterns.
+
+---
+
+## What Stays, What Changes, What Gets Added
+
+### Keep (Working Correctly)
+| Component | Reason |
+|-----------|--------|
+| Multi-call architecture | Correct for small models |
+| ToolPolicy registry | Good failure routing without LLM |
+| run_controller (abort/pause/resume) | Solid, keep as-is |
+| task_store.py | Task persistence, needs more use |
+| NEED_INPUT pause/resume | Critical, working |
+| Idempotency (seen_calls set) | Prevents duplicate side effects |
+| SSE streaming to UI | Good UX |
+| SANDBOX file isolation | Clean pattern |
+| model_adapter fallback chain | Fine for free-tier local use |
+
+### Change (Fix These)
+| Component | Change |
+|-----------|--------|
+| ACT prompt | Cut from ~4000 to ~700 tokens. Remove SOUL/USER/full memory/full history |
+| PLAN prompt | Cut from ~2000 to ~1200 tokens |
+| Output format | 6 options → 3 options (TOOL / DONE / NEED) |
+| Tool schema injection | Whole category → predicted 1 tool + 1 backup |
+| REPLAN trigger | Only on 3+ consecutive failures, not 1 |
+| SYNTHESIS | Skip for single-step + all-succeeded tasks |
+| system_prompt | Dynamic bloat → 5 fixed lines |
+| Memory injection | Whole file → 5 keyword-matched items |
+
+### Add (Missing Features)
+| Feature | Priority |
+|---------|----------|
+| workflow.save / workflow.run / workflow.list tools | 🔴 High — core goal |
+| Auto-trigger from workflow library | 🔴 High |
+| Workflow suggestion after successful multi-step task | 🟡 Medium |
+| Native Ollama tool-calling for supported models | 🟡 Medium |
+| SOUL.md injection only in CHAT mode, not execution | 🟢 Low effort |
+
+---
+
+## Prompt Changes: Before → After
+
+### System Prompt
+```
+Before (current):
+"SOUL.md, USER.md, MEMORY.md
+
+Core behavior:
+1) Complete tasks end-to-end and skip steps already satisfied...
+2) Be truthful: only claim success from successful tool outputs.
+3) If information is missing from user, ask NEED_INPUT with one precise question.
+4) Keep memory concise; use memory.write/memory.update for durable facts.
+
+Output format (exactly one):
+- ACTION: {"tool":"...","args":{...}}
+- FINAL ANSWER: <concise completion summary>
+- NEED_INPUT: <specific missing info>"
+
+────────────────────────────
+After:
+"You are MIRA, a local AI assistant for [NAME].
+Complete tasks using the available tools. One tool call per turn.
+Only claim success when the tool output confirms it.
+Ask the user only when you cannot proceed without their input."
+```
+
+### ACT Output Format
+```
+Before:
+"NOW EXECUTE step 3/7: <step>
+OUTPUT OPTIONS (pick exactly one):
+  ACTION: {"tool": "...", "args": {...}}
+  STEP_DONE: <brief summary>
+  STEP_FAILED: <brief reason>
+  FINAL ANSWER: <text>
+  SKIP: <reason>
+  NEED_INPUT: <question>
+STOP after your chosen output.
+MIRA:"
+
+────────────────────────────
+After:
+"Step: <step description>
+
+Available tool:
+<single tool schema here>
+
+Reply with one of:
+TOOL: toolname | arg=value | arg=value
+DONE: what was accomplished
+NEED: question for user
+
+MIRA:"
+```
+
+---
+
+## Implementation Priority Order
+
+### Phase 1 — Prompt Diet (1-2 days, high impact)
+1. Cut ACT prompt to ≤ 700 tokens: remove SOUL, full USER, full MEMORY, full history
+2. Inject only predicted tool schema (1 tool) not whole category
+3. Reduce output format to 3 options
+4. Cut system prompt to 5 lines
+
+Expected result: **2-3x improvement in ACT call reliability** on 4B models.
+
+### Phase 2 — Eliminate Wasted LLM Calls (1 day)
+1. Skip SYNTHESIS for simple single-step succeeded tasks (template instead)
+2. Make REPLAN only trigger on 3+ consecutive failures (not every single failure)
+3. Remove SOUL from ACT and SYNTH contexts
+
+Expected result: **30-40% fewer LLM calls** per task.
+
+### Phase 3 — Workflow Persistence (2-3 days, core feature)
+1. Implement `workflow.save` tool (writes JSON to SANDBOX/workflows/)
+2. Implement `workflow.list` tool
+3. Implement `workflow.run` tool
+4. Add auto-trigger check at start of handle_streaming()
+5. Add post-task "save as workflow?" prompt for multi-step successes
+
+Expected result: **Mira learns the user's patterns over time.**
+
+### Phase 4 — Native Tool-Calling for Supported Models (2 days)
+1. Detect if current Ollama model supports tools (qwen2.5, llama3.2, mistral)
+2. If yes: send `tools=[...]` schemas, read back structured tool_calls
+3. If no: use the simplified TOOL: / DONE: / NEED: text format
+4. Remove ~500 lines of text-parsing code for the native path
+
+Expected result: **Near-zero tool format errors** on supported models.
+
+---
+
+## What This Achieves
+
+| Metric | Before | After |
+|--------|--------|-------|
+| ACT prompt tokens | ~3-5K | ~500-700 |
+| Output options for model | 6 | 3 |
+| LLM calls for simple task | 3 (plan+act+synth) | 2 (plan+act, no synth) |
+| Tool format error rate | High (text parsing) | Low (native tools or simplified format) |
+| Workflow reuse | None | Full library |
+| Consistency across retries | Variable | High (smaller, more focused prompts) |

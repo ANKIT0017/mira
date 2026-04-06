@@ -69,3 +69,18 @@ Thumbs.db
 desktop.ini
 
 localhost
+
+# ── Local model files (large binaries — download separately) ──────────────
+# GGUF models (llama.cpp format)
+*.gguf
+*.ggml
+# Raw model weights
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+# llama.cpp compiled server binaries
+llama-server.exe
+llama-cli.exe
+llama.cpp/
+llama_cpp_server/

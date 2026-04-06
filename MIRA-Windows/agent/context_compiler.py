@@ -145,7 +145,7 @@ class ContextCompiler:
         step_idx: int = 0,
         step_tools: str = "",
         profile_context: str = "",
-        memory_context: str = "",
+        memory_context: str | None = None,
         buffer_context: str = "",
         history_text: str = "",
         done_block: str = "",
@@ -174,12 +174,15 @@ class ContextCompiler:
         sections.profile = profile_context
 
         # Memory (long-term persistent facts)
-        if self.long_term and step_type != StepType.SYNTHESIZE:
+        # If caller provided memory_context explicitly (including ""), use it as-is.
+        if memory_context is not None:
+            sections.memory = memory_context
+        elif self.long_term and step_type in (StepType.PLAN, StepType.REPLAN):
             sections.memory = self.long_term.render_context(
                 query=f"{user_message} {step_desc}"
             )
         else:
-            sections.memory = memory_context
+            sections.memory = ""
 
         # Short-term memory (per-run volatile state)
         if step_type in (StepType.ACT, StepType.REPLAN):
