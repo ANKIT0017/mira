@@ -4,7 +4,7 @@ setlocal
 
 REM ─────────────────────────────────────────────────────────────────────────
 REM  MIRA local inference engine — llama.cpp server
-REM  Model  : gemma-4-E2B-it-Q4_K_M.gguf  (~3.1 GB)
+REM  Model  : gemma-4-E2B-it-Q5_K_M.gguf  (~3.8 GB)
 REM  Engine : llama.cpp  (OpenAI-compatible REST on localhost:8080)
 REM
 REM  Key flags:
@@ -51,7 +51,7 @@ if not exist "%LLAMA_BIN%" (
 )
 
 REM ── Locate model file ─────────────────────────────────────────────────────
-set "MODEL=%~dp0gemma-4-E2B-it-Q4_K_M.gguf"
+set "MODEL=%~dp0gemma-4-E2B-it-Q5_K_M.gguf"
 if not exist "%MODEL%" (
     echo.
     echo  [ERROR] Model file not found:
@@ -62,7 +62,7 @@ if not exist "%MODEL%" (
     echo  or
     echo    https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF
     echo.
-    echo  File: gemma-4-E2B-it-Q4_K_M.gguf  (~3.1 GB)
+    echo  File: gemma-4-E2B-it-Q5_K_M.gguf  (~3.8 GB)
     echo.
     pause
     exit /b 1

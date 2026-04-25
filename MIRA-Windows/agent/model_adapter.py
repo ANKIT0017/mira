@@ -2,6 +2,7 @@ import subprocess
 import os
 import json
 import time
+import threading
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -41,6 +42,338 @@ def _mark_rate_limited(provider: str):
 
 
 # ============================================================
+# LLM USAGE + COST TRACKING
+# Tracks per-call token usage and run totals.
+# ============================================================
+
+_LLM_USAGE_LOG_ENABLED = os.getenv("MIRA_LOG_LLM_USAGE", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+_LLM_INPUT_COST_PER_MTOK = float(os.getenv("MIRA_LLM_INPUT_COST_PER_MTOK", "0") or 0)
+_LLM_OUTPUT_COST_PER_MTOK = float(os.getenv("MIRA_LLM_OUTPUT_COST_PER_MTOK", "0") or 0)
+
+_llm_usage_lock = threading.Lock()
+_llm_usage_totals = {
+    "calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "estimated_calls": 0,
+    "cost_usd": 0.0,
+}
+_llm_usage_by_provider = {}
+
+
+def reset_llm_usage_totals() -> None:
+    """Reset per-run LLM usage totals."""
+    with _llm_usage_lock:
+        _llm_usage_totals["calls"] = 0
+        _llm_usage_totals["prompt_tokens"] = 0
+        _llm_usage_totals["completion_tokens"] = 0
+        _llm_usage_totals["total_tokens"] = 0
+        _llm_usage_totals["estimated_calls"] = 0
+        _llm_usage_totals["cost_usd"] = 0.0
+        _llm_usage_by_provider.clear()
+
+
+def get_llm_usage_totals() -> dict:
+    """Return a snapshot of current run-level LLM usage totals."""
+    with _llm_usage_lock:
+        return {
+            "calls": int(_llm_usage_totals["calls"]),
+            "prompt_tokens": int(_llm_usage_totals["prompt_tokens"]),
+            "completion_tokens": int(_llm_usage_totals["completion_tokens"]),
+            "total_tokens": int(_llm_usage_totals["total_tokens"]),
+            "estimated_calls": int(_llm_usage_totals["estimated_calls"]),
+            "cost_usd": float(_llm_usage_totals["cost_usd"]),
+            "by_provider": {k: dict(v) for k, v in _llm_usage_by_provider.items()},
+        }
+
+
+def render_llm_usage_summary() -> str:
+    """Render a compact terminal-friendly summary of LLM token usage."""
+    snap = get_llm_usage_totals()
+    if snap["calls"] <= 0:
+        return "[LLM USAGE] No successful LLM calls recorded in this run."
+
+    lines = [
+        (
+            "[LLM USAGE SUMMARY] "
+            f"calls={snap['calls']} "
+            f"prompt_tokens={snap['prompt_tokens']} "
+            f"completion_tokens={snap['completion_tokens']} "
+            f"total_tokens={snap['total_tokens']}"
+        )
+    ]
+
+    if snap["estimated_calls"] > 0:
+        lines.append(
+            f"[LLM USAGE SUMMARY] estimated_calls={snap['estimated_calls']} "
+            "(provider usage metadata missing for those calls)"
+        )
+
+    for provider, stats in sorted(snap["by_provider"].items()):
+        lines.append(
+            (
+                f"[LLM USAGE SUMMARY] provider={provider} "
+                f"calls={int(stats.get('calls', 0))} "
+                f"total_tokens={int(stats.get('total_tokens', 0))}"
+            )
+        )
+
+    if _LLM_INPUT_COST_PER_MTOK > 0 or _LLM_OUTPUT_COST_PER_MTOK > 0:
+        lines.append(f"[LLM USAGE SUMMARY] estimated_cost_usd=${snap['cost_usd']:.6f}")
+
+    return "\n".join(lines)
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    if not text:
+        return 0
+    # Conservative fallback estimate when provider does not return usage metadata.
+    return max(1, len(str(text)) // 4)
+
+
+def _estimate_tokens_from_messages(messages: list[dict] | None) -> int:
+    if not messages:
+        return 0
+    parts = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            parts.append(str(msg))
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            chunk = []
+            for item in content:
+                if isinstance(item, dict):
+                    chunk.append(str(item.get("text", "")))
+                else:
+                    chunk.append(str(item))
+            parts.append(" ".join(chunk))
+        else:
+            parts.append(str(content))
+    return _estimate_tokens_from_text("\n".join(parts))
+
+
+def _estimate_tokens_from_gemini_content(content_dict: dict | None) -> int:
+    if not isinstance(content_dict, dict):
+        return 0
+    parts = []
+    si = content_dict.get("systemInstruction", {})
+    if isinstance(si, dict):
+        for p in si.get("parts", []) or []:
+            if isinstance(p, dict):
+                parts.append(str(p.get("text", "")))
+    for item in content_dict.get("contents", []) or []:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        for p in item.get("parts", []) or []:
+            if isinstance(p, dict):
+                parts.append(str(p.get("text", "")))
+            else:
+                parts.append(str(p))
+    return _estimate_tokens_from_text("\n".join(parts))
+
+
+def _extract_usage_openai_payload(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _safe_int(
+        usage.get("prompt_tokens", usage.get("input_tokens", usage.get("promptTokenCount", 0)))
+    )
+    completion_tokens = _safe_int(
+        usage.get("completion_tokens", usage.get("output_tokens", usage.get("candidatesTokenCount", 0)))
+    )
+    total_tokens = _safe_int(usage.get("total_tokens", usage.get("totalTokenCount", 0)))
+
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+        return None
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _extract_usage_gemini_payload(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usageMetadata")
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _safe_int(usage.get("promptTokenCount", 0))
+    completion_tokens = _safe_int(
+        usage.get("candidatesTokenCount", usage.get("outputTokenCount", 0))
+    )
+    total_tokens = _safe_int(usage.get("totalTokenCount", 0))
+
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+        return None
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _record_llm_usage(
+    provider: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    estimated: bool = False,
+) -> None:
+    prompt_tokens = max(0, _safe_int(prompt_tokens))
+    completion_tokens = max(0, _safe_int(completion_tokens))
+    total_tokens = max(0, _safe_int(total_tokens))
+
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if total_tokens <= 0 and prompt_tokens <= 0 and completion_tokens <= 0:
+        return
+
+    if completion_tokens <= 0 and total_tokens > prompt_tokens:
+        completion_tokens = max(0, total_tokens - prompt_tokens)
+
+    cost_usd = (
+        (prompt_tokens / 1_000_000.0) * _LLM_INPUT_COST_PER_MTOK
+        + (completion_tokens / 1_000_000.0) * _LLM_OUTPUT_COST_PER_MTOK
+    )
+
+    with _llm_usage_lock:
+        _llm_usage_totals["calls"] += 1
+        _llm_usage_totals["prompt_tokens"] += prompt_tokens
+        _llm_usage_totals["completion_tokens"] += completion_tokens
+        _llm_usage_totals["total_tokens"] += total_tokens
+        _llm_usage_totals["cost_usd"] += cost_usd
+        if estimated:
+            _llm_usage_totals["estimated_calls"] += 1
+
+        pstats = _llm_usage_by_provider.setdefault(
+            provider,
+            {
+                "calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        pstats["calls"] += 1
+        pstats["prompt_tokens"] += prompt_tokens
+        pstats["completion_tokens"] += completion_tokens
+        pstats["total_tokens"] += total_tokens
+        pstats["cost_usd"] += cost_usd
+
+        call_index = int(_llm_usage_totals["calls"])
+
+    if _LLM_USAGE_LOG_ENABLED:
+        est_note = " (estimated)" if estimated else ""
+        cost_note = (
+            f" cost_usd=${cost_usd:.6f}"
+            if (_LLM_INPUT_COST_PER_MTOK > 0 or _LLM_OUTPUT_COST_PER_MTOK > 0)
+            else ""
+        )
+        print(
+            "[LLM USAGE]"
+            f" call={call_index}"
+            f" provider={provider}"
+            f" model={model}"
+            f" prompt_tokens={prompt_tokens}"
+            f" completion_tokens={completion_tokens}"
+            f" total_tokens={total_tokens}"
+            f"{est_note}{cost_note}"
+        )
+
+
+def _record_openai_response_usage(
+    provider: str,
+    model: str,
+    payload: dict,
+    prompt_text: str = "",
+    messages: list[dict] | None = None,
+    completion_text: str = "",
+) -> None:
+    usage = _extract_usage_openai_payload(payload)
+    if usage:
+        _record_llm_usage(
+            provider=provider,
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            estimated=False,
+        )
+        return
+
+    prompt_tokens_est = _estimate_tokens_from_messages(messages) if messages else _estimate_tokens_from_text(prompt_text)
+    completion_tokens_est = _estimate_tokens_from_text(completion_text)
+    _record_llm_usage(
+        provider=provider,
+        model=model,
+        prompt_tokens=prompt_tokens_est,
+        completion_tokens=completion_tokens_est,
+        total_tokens=prompt_tokens_est + completion_tokens_est,
+        estimated=True,
+    )
+
+
+def _record_gemini_response_usage(
+    provider: str,
+    model: str,
+    payload: dict,
+    prompt_text: str = "",
+    content_dict: dict | None = None,
+    completion_text: str = "",
+) -> None:
+    usage = _extract_usage_gemini_payload(payload)
+    if usage:
+        _record_llm_usage(
+            provider=provider,
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            estimated=False,
+        )
+        return
+
+    prompt_tokens_est = _estimate_tokens_from_text(prompt_text)
+    if prompt_tokens_est <= 0 and content_dict is not None:
+        prompt_tokens_est = _estimate_tokens_from_gemini_content(content_dict)
+    completion_tokens_est = _estimate_tokens_from_text(completion_text)
+    _record_llm_usage(
+        provider=provider,
+        model=model,
+        prompt_tokens=prompt_tokens_est,
+        completion_tokens=completion_tokens_est,
+        total_tokens=prompt_tokens_est + completion_tokens_est,
+        estimated=True,
+    )
+
+
+# ============================================================
 # PROVIDER FUNCTIONS
 # Each returns: string on success, dict with error/rate_limited on failure
 # ============================================================
@@ -74,8 +407,17 @@ def generate_groq(prompt: str, model: str = "llama-3.3-70b-versatile", max_token
             return {"error": "Rate limited", "rate_limited": True}
         elif response.status_code != 200:
             return {"error": f"API Error {response.status_code}", "rate_limited": False}
-        
-        return response.json()["choices"][0]["message"]["content"]
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        _record_openai_response_usage(
+            provider="groq",
+            model=model,
+            payload=data,
+            prompt_text=prompt,
+            completion_text=content,
+        )
+        return content
         
     except Exception as e:
         return {"error": str(e), "rate_limited": False}
@@ -112,7 +454,23 @@ def generate_gemini(prompt: str, model: str = "gemini-2.5-flash", max_tokens: in
         if "candidates" in data and data["candidates"]:
             parts = data["candidates"][0].get("content", {}).get("parts", [])
             if parts and "text" in parts[0]:
-                return parts[0]["text"]
+                content = parts[0]["text"]
+                _record_gemini_response_usage(
+                    provider="gemini",
+                    model=model,
+                    payload=data,
+                    prompt_text=prompt,
+                    completion_text=content,
+                )
+                return content
+
+        _record_gemini_response_usage(
+            provider="gemini",
+            model=model,
+            payload=data,
+            prompt_text=prompt,
+            completion_text="",
+        )
         
         return {"error": "Unexpected response format", "rate_limited": False}
         
@@ -146,8 +504,17 @@ def generate_cerebras(prompt: str, model: str = "llama-3.3-70b", max_tokens: int
             return {"error": "Rate limited", "rate_limited": True}
         elif response.status_code != 200:
             return {"error": f"API Error {response.status_code}", "rate_limited": False}
-        
-        return response.json()["choices"][0]["message"]["content"]
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        _record_openai_response_usage(
+            provider="cerebras",
+            model=model,
+            payload=data,
+            prompt_text=prompt,
+            completion_text=content,
+        )
+        return content
         
     except Exception as e:
         return {"error": str(e), "rate_limited": False}
@@ -179,8 +546,17 @@ def generate_sambanova(prompt: str, model: str = "Meta-Llama-3.3-70B-Instruct", 
             return {"error": "Rate limited", "rate_limited": True}
         elif response.status_code != 200:
             return {"error": f"API Error {response.status_code}", "rate_limited": False}
-        
-        return response.json()["choices"][0]["message"]["content"]
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        _record_openai_response_usage(
+            provider="sambanova",
+            model=model,
+            payload=data,
+            prompt_text=prompt,
+            completion_text=content,
+        )
+        return content
         
     except Exception as e:
         return {"error": str(e), "rate_limited": False}
@@ -217,8 +593,17 @@ def generate_openrouter(prompt: str, model: str = "meta-llama/llama-3.3-70b-inst
             return {"error": "Rate limited", "rate_limited": True}
         elif response.status_code != 200:
             return {"error": f"API Error {response.status_code}", "rate_limited": False}
-        
-        return response.json()["choices"][0]["message"]["content"]
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        _record_openai_response_usage(
+            provider="openrouter",
+            model=model,
+            payload=data,
+            prompt_text=prompt,
+            completion_text=content,
+        )
+        return content
         
     except Exception as e:
         return {"error": str(e), "rate_limited": False}
@@ -341,9 +726,26 @@ def _generate_llamacpp_chat(
         if tools:
             content = (msg.get("content") or "").strip()
             tool_calls = msg.get("tool_calls") or []
+            completion_for_estimate = content
+            if not completion_for_estimate and tool_calls:
+                completion_for_estimate = json.dumps(tool_calls)[:2000]
+            _record_openai_response_usage(
+                provider="llamacpp",
+                model=LLAMA_MODEL_NAME,
+                payload=data,
+                messages=messages,
+                completion_text=completion_for_estimate,
+            )
             return {"content": content, "tool_calls": tool_calls}
 
         result = (msg.get("content") or "").strip()
+        _record_openai_response_usage(
+            provider="llamacpp",
+            model=LLAMA_MODEL_NAME,
+            payload=data,
+            messages=messages,
+            completion_text=result,
+        )
         # Strip residual <think>...</think> blocks (some models emit them)
         result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
         return result
@@ -421,12 +823,18 @@ def generate(prompt: str, model: str = "local", max_tokens: int = 92024, timeout
     # ── Local llama.cpp server (OpenAI-compatible API) ────────────────────
     # Context size, KV cache quant, RoPE scaling, and GPU layers are all
     # configured at server startup via start_llama_server.bat — not here.
-    return _generate_llamacpp_chat(
+    result = _generate_llamacpp_chat(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         timeout=timeout,
         temperature=temperature,
     )
+    # Auto-fallback: if local server is down, route through cloud chain
+    if isinstance(result, str) and "Could not connect to llama.cpp" in result:
+        print("[ROTATION] llama.cpp unreachable — auto-falling back to cloud chain")
+        cloud = _try_fallback_chain(prompt, max_tokens, temperature=temperature)
+        return cloud if cloud else result
+    return result
 
 
 def generate_streaming(prompt: str, model: str = "local", max_tokens: int = 512):
@@ -467,6 +875,14 @@ def generate_streaming(prompt: str, model: str = "local", max_tokens: int = 512)
                     yield delta
             except Exception:
                 continue
+    except requests.exceptions.ConnectionError:
+        # llama.cpp server not running — fall back to one cloud call
+        print("[ROTATION] llama.cpp stream unreachable — falling back to cloud")
+        flat_resp = _try_fallback_chain(prompt, max_tokens)
+        if flat_resp:
+            yield flat_resp
+        else:
+            yield "[Error: llama.cpp server is not running. Start it with start_llama_server.bat]"
     except Exception as e:
         yield f"[Stream error: {e}]"
 
@@ -545,12 +961,18 @@ def generate_with_messages(
         # Last-resort: flatten to single-user prompt and retry
         print(f"[PROVIDER] llama.cpp /chat failed ({e}), retrying as flat prompt")
         flat = _flatten_messages(messages) if isinstance(messages, list) and messages else ""
-        return _generate_llamacpp_chat(
+        result = _generate_llamacpp_chat(
             [{"role": "user", "content": flat}],
             max_tokens=max_tokens,
             timeout=timeout,
             temperature=temperature,
         )
+        # Auto-fallback to cloud if local server unavailable
+        if isinstance(result, str) and "Could not connect to llama.cpp" in result:
+            print("[ROTATION] llama.cpp unreachable in generate_with_messages — falling back to cloud")
+            cloud = _try_fallback_chain(flat, max_tokens, temperature=temperature)
+            return cloud if cloud else result
+        return result
 
 
 def supports_local_native_tools(model: str) -> bool:
@@ -686,7 +1108,23 @@ def _generate_with_gemini_content(
         if "candidates" in data and data["candidates"]:
             parts = data["candidates"][0].get("content", {}).get("parts", [])
             if parts and "text" in parts[0]:
-                return parts[0]["text"]
+                content = parts[0]["text"]
+                _record_gemini_response_usage(
+                    provider="gemini",
+                    model=model,
+                    payload=data,
+                    content_dict=content_dict,
+                    completion_text=content,
+                )
+                return content
+
+        _record_gemini_response_usage(
+            provider="gemini",
+            model=model,
+            payload=data,
+            content_dict=content_dict,
+            completion_text="",
+        )
 
         return "[Gemini: unexpected response format]"
 
@@ -762,7 +1200,16 @@ def _generate_with_openai_messages(
         elif response.status_code != 200:
             return f"[{provider_name} API Error {response.status_code}]"
 
-        return response.json()["choices"][0]["message"]["content"]
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        _record_openai_response_usage(
+            provider=provider_name,
+            model=model,
+            payload=data,
+            messages=messages,
+            completion_text=content,
+        )
+        return content
 
     except Exception as e:
         # Fall back to flat prompt on any error

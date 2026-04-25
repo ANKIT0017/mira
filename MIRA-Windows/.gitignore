@@ -82,5 +82,6 @@ localhost
 # llama.cpp compiled server binaries
 llama-server.exe
 llama-cli.exe
+*.dll
 llama.cpp/
 llama_cpp_server/

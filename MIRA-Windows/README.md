@@ -95,7 +95,6 @@ ollama pull qwen3:4b-instruct
 Recommended stronger models for reliability:
 
 ```powershell
-ollama pull qwen3.5:4b
 ollama pull mistral:7b
 ```
 

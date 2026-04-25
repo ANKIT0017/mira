@@ -1970,18 +1970,18 @@
     <div class="model-switcher">
       <span class="model-icon">⚡</span>
       <select id="modelSelect" onchange="switchModel()">
-        <option value="qwen2.5:3b">Fast Qwen2.5 3b</option>
-        <option value="qwen3:4b-instruct">qwen3:4b-instruct 🧠</option>
-        <option value="gemma4:e2b">Gemma4:E2B 🧠 (32k)</option>
-        <option value="groq:llama-3.3-70b-versatile">Cloud (Llama 70B)</option>
-        <option value="groq:qwen/qwen3-32b">Cloud (Qwen3 32B)</option>
-        <option value="gemini:gemini-2.5-flash-lite">Gemini (2.5 Flash-Lite) 🚀</option>
-        <option value="gemini:gemini-2.5-flash">Gemini (2.5 Flash)</option>
-        <option value="gemini:gemma-3-12b-it">Gemma 3 (12B)</option>
-        <option value="gemini:gemma-3-27b-it">Gemma 3 (27B)</option>
-        <option value="cerebras:llama-3.3-70b">Cerebras (Llama 70B) ⚡</option>
-        <option value="sambanova:Meta-Llama-3.3-70B-Instruct">SambaNova (Llama 70B)</option>
-        <option value="openrouter:meta-llama/llama-3.3-70b-instruct:free">OpenRouter (Free Llama 70B)</option>
+        <optgroup label="── Local (llama.cpp) ─────────">
+          <option value="local">⚡ Gemma 4 E2B — Local (llama.cpp)</option>
+        </optgroup>
+        <optgroup label="── Cloud Fallback ────────────">
+          <option value="groq:llama-3.3-70b-versatile">☁ Groq — Llama 3.3 70B</option>
+          <option value="groq:qwen/qwen3-32b">☁ Groq — Qwen3 32B</option>
+          <option value="gemini:gemini-2.5-flash-lite">🚀 Gemini 2.5 Flash-Lite</option>
+          <option value="gemini:gemini-2.5-flash">🧠 Gemini 2.5 Flash</option>
+          <option value="cerebras:llama-3.3-70b">⚡ Cerebras — Llama 70B</option>
+          <option value="sambanova:Meta-Llama-3.3-70B-Instruct">☁ SambaNova — Llama 70B</option>
+          <option value="openrouter:meta-llama/llama-3.3-70b-instruct:free">☁ OpenRouter — Free Llama 70B</option>
+        </optgroup>
       </select>
     </div>
     <button class="theme-toggle" onclick="toggleTheme()">◑</button>
@@ -2277,7 +2277,7 @@
     }
 
     // Model selection state
-    let currentModel = localStorage.getItem('aiModel') || 'qwen2.5:3b';
+    let currentModel = localStorage.getItem('aiModel') || 'local';
 
     function switchModel() {
       const select = document.getElementById('modelSelect');
@@ -2286,12 +2286,14 @@
 
       // Update icon based on model
       const icon = document.querySelector('.model-icon');
-      if (currentModel === 'qwen2.5:3b') {
-        icon.textContent = '⚡'; // Fast local
-      } else if (currentModel.startsWith('groq:')) {
+      if (currentModel === 'local') {
+        icon.textContent = '⚡'; // Local llama.cpp
+      } else if (currentModel.startsWith('groq:') || currentModel.startsWith('cerebras:')) {
         icon.textContent = '⚡☁️'; // Cloud ultra-fast
+      } else if (currentModel.startsWith('gemini:')) {
+        icon.textContent = '🚀'; // Gemini
       } else {
-        icon.textContent = '🧠'; // Thinking local
+        icon.textContent = '🧠'; // Other cloud
       }
 
       document.getElementById('status').textContent = `Switched to ${select.options[select.selectedIndex].text} mode`;

@@ -1,0 +1,132 @@
+# MIRA — llama.cpp Migration Walkthrough
+
+## What We Did
+
+### 1. Inference Engine: Ollama → llama.cpp
+
+**`agent/model_adapter.py`** — Full rewrite of the local inference path:
+- Replaced all Ollama REST calls (`localhost:11434`) with a `_generate_llamacpp_chat()` helper that hits the llama.cpp OpenAI-compatible API (`localhost:8080/v1/chat/completions`)
+- Updated `generate()`, `generate_with_messages()`, and `generate_streaming()` (now SSE via llama.cpp)
+- **Auto cloud fallback**: if the llama.cpp server is unreachable, MIRA automatically falls back to `_try_fallback_chain()` → Groq → Gemini → Cerebras → SambaNova → OpenRouter. No crash, no raw error shown to user.
+- Fixed duplicate `import subprocess / import os` lines left from cascading edits
+
+**`agent/provider_state.py`**
+- `detect_provider()` now returns `'llamacpp'` instead of `'ollama'`
+
+**`agent/token_budget.py`**
+- Context window for `llamacpp` set to **16 384 tokens** (matches `--ctx-size 16384`)
+
+---
+
+### 2. Server Launchers
+
+**`start_llama_server.bat`** (new)
+```
+--model gemma-4-E2B-it-Q5_K_M.gguf
+--ctx-size 16384
+--n-gpu-layers 999        ← all layers to GPU
+--cache-type-k q4_0       ← KV cache compression
+--cache-type-v q4_0
+--rope-scale 2            ← effective context × 2 = 32768
+-t 8 --temp 0.7 --repeat-penalty 1.1
+--host 127.0.0.1 --port 8080
+```
+
+**`run.bat`** — updated to start llama.cpp server as step 1, then MCP bridge, then Flask UI
+
+**`run_with_ngrok.bat`** — updated to add llama.cpp as step 1/7, with graceful skip if binary/model is missing
+
+---
+
+### 3. UI Model Selector
+
+**`ui/templates/chat.html`**
+- Removed stale Ollama model options (`qwen2.5:3b`, `qwen3:4b-instruct`, `gemma4:e2b`)
+- Added grouped dropdown:
+  - **Local (llama.cpp)**: `⚡ Gemma 4 E2B — Local (llama.cpp)` (value=`local`)
+  - **Cloud Fallback**: Groq, Gemini, Cerebras, SambaNova, OpenRouter
+- Default changed: `'qwen2.5:3b'` → `'local'` (persisted in localStorage)
+- Icon logic updated to match new model IDs
+
+---
+
+### 4. Configuration
+
+**`.env`** (you added manually, lines 53-55):
+```env
+LLAMA_SERVER_URL=http://127.0.0.1:8080
+LLAMA_MODEL_NAME=gemma-4-E2B-it
+MIRA_DEFAULT_CONTEXT_WINDOW=16384
+```
+
+**`config/mira.yaml`**:
+```yaml
+model:
+  type: llamacpp
+  name: gemma-4-E2B-it
+  server_url: http://127.0.0.1:8080
+  ctx_size: 16384
+```
+
+**`.gitignore`** (root + MIRA-Windows): added exclusions for `*.gguf`, `*.safetensors`, `llama-server.exe`, CUDA DLLs
+
+---
+
+### 5. Setup Scripts (new)
+
+**`setup_llama.ps1`** — Auto-downloads the correct llama.cpp release from GitHub:
+- Detects GPU (NVIDIA → CUDA build, AMD/Intel → Vulkan, fallback → AVX2 CPU)
+- Asset selection fixed to pick `llama-b****-bin-win-cuda-*.zip` (not the cudart helper zip)
+- Extracts `llama-server.exe` + companion DLLs to `MIRA-Windows/`
+
+**`setup_cudart.ps1`** — Downloads `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll` needed for actual GPU offloading (these are in a separate cudart zip from GitHub)
+
+---
+
+### 6. Documentation
+
+**`RECOMMENDED_MODELS.md`** — Full rewrite documenting:
+- Active model: Gemma 4 E2B Q5_K_M (upgraded from Q4_K_M)
+- Quantization comparison table
+- Alternative models (Llama 3.2, Phi-3.5, Mistral 7B)
+- Step-by-step setup instructions
+- All server flags explained
+- Cloud fallback provider chain
+
+---
+
+### 7. Model Upgrade: Q4_K_M → Q5_K_M
+
+Updated all filename references across:
+- `start_llama_server.bat`
+- `run_with_ngrok.bat`
+- `run.bat`
+- `RECOMMENDED_MODELS.md`
+
+---
+
+## Verified Working
+
+| Check | Result |
+|-------|--------|
+| `llama-server.exe` installed | ✅ b8672 CUDA build |
+| CUDA DLLs present | ✅ `cudart64_12.dll`, `cublas64_12.dll` |
+| GPU offloading | ✅ 36/36 layers → RTX 2050, 1407 MiB VRAM |
+| `/health` endpoint | ✅ `{"status": "ok"}` |
+| Inference test | ✅ `CONTENT: [Hello!]`, `finish_reason: stop` |
+| Cloud fallback | ✅ Auto-routes to Groq/Gemini when server down |
+| model_adapter.py syntax | ✅ AST parse clean |
+| token_budget.py syntax | ✅ AST parse clean |
+
+---
+
+## How to Start MIRA
+
+```
+1. run.bat              ← starts everything (llama server + MCP + Flask UI)
+   — or —
+2. start_llama_server.bat   ← inference engine only
+   run.bat                  ← rest of stack
+```
+
+> **Note**: The Q4_K_M model is still in the folder — it's not deleted. You can switch back by editing the `--model` path in `start_llama_server.bat`.

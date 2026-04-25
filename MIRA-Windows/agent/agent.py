@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 import asyncio
 import hashlib
@@ -11,6 +11,9 @@ from .model_adapter import (
     generate,
     generate_with_messages,
     generate_with_native_tools,
+    get_llm_usage_totals,
+    render_llm_usage_summary,
+    reset_llm_usage_totals,
     supports_ollama_native_tools,
 )
 from .run_controller import get_controller, TERMINAL_STATES
@@ -52,7 +55,7 @@ PROMPT_TOKEN_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "2000"))
 CHARS_PER_TOKEN_ESTIMATE = 4
 BUFFER_THRESHOLD_CHARS = 2000
 MAX_BUFFER_CONTEXT_ITEMS = int(os.getenv("MIRA_MAX_BUFFER_CONTEXT_ITEMS", "6"))
-FORCE_BUFFER_PREFIXES = ("search.", "firecrawl.")
+FORCE_BUFFER_PREFIXES = ("search.", "firecrawl.", "think")
 EMAIL_REGEX = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 
 #  Synthesizer bypass 
@@ -569,6 +572,16 @@ class Agent:
         """Signal the agent to stop current execution."""
         self.stop_requested = True
         return {"status": "ok", "message": "Stop signal sent"}
+
+    def _print_llm_usage_summary(self) -> None:
+        """Print end-of-run LLM usage totals when at least one call was made."""
+        try:
+            snap = get_llm_usage_totals()
+            if int(snap.get("calls", 0)) <= 0:
+                return
+            print(render_llm_usage_summary())
+        except Exception as _usage_err:
+            print(f"[LLM USAGE] Summary unavailable: {_usage_err}")
     
     def _register_internal_tools(self) -> None:
         """Register agent-internal tools (buffer, memory) into TOOL_METADATA so they
@@ -707,6 +720,26 @@ class Agent:
             return digits
         return ""
 
+    def _extract_recipient_hint(self, text: str) -> str:
+        """Extract a likely recipient name hint (e.g., "to ankit") from user text."""
+        if not text:
+            return ""
+        raw = str(text)
+        m = re.search(r'\b(?:to|for)\s+([A-Za-z][A-Za-z0-9_.\-]{1,40})\b', raw)
+        if not m:
+            return ""
+        cand = m.group(1).strip()
+        low = cand.lower()
+        if low in {
+            "me", "myself", "you", "them", "it", "all", "the", "this", "that",
+            "email", "mail", "message", "whatsapp", "send", "share", "forward",
+            "code", "file", "pdf", "document",
+        }:
+            return ""
+        if re.search(EMAIL_REGEX, cand) or re.search(r'\d', cand):
+            return ""
+        return cand
+
     def _build_task_contract(self, text: str) -> dict:
         """Extract an immutable, compact task contract from the user prompt."""
         raw = (text or "").strip()
@@ -752,6 +785,9 @@ class Agent:
         maybe_email = self._extract_emails(raw)
         if maybe_email:
             known_slots["recipient_email"] = maybe_email[0]
+        recipient_hint = self._extract_recipient_hint(raw)
+        if recipient_hint:
+            known_slots["recipient_name_hint"] = recipient_hint
 
         rows_spec = ""
         m_rows = re.search(r'(\d+\s*[-]\s*\d+)\s*rows', raw, re.IGNORECASE)
@@ -786,6 +822,10 @@ class Agent:
         required_slots = list(contract.get("required_slots", []))
         known_slots = dict(contract.get("known_slots", {}))
         slots = {slot: known_slots.get(slot) for slot in required_slots}
+        # Preserve non-required hints (e.g., recipient_name_hint) for downstream steps.
+        for k, v in known_slots.items():
+            if k not in slots:
+                slots[k] = v
         deliverables = set(contract.get("deliverables", []))
         artifacts = {}
         if "excel_file" in deliverables:
@@ -850,6 +890,35 @@ class Agent:
         slots = self._working_state.setdefault("slots", {})
         artifacts = self._working_state.setdefault("artifacts", {})
 
+        if tool_name == "think":
+            txt = ""
+            if isinstance(tool_res, dict):
+                txt = str(
+                    tool_res.get("result")
+                    or tool_res.get("content")
+                    or tool_res.get("text")
+                    or ""
+                )
+            else:
+                txt = str(tool_res or "")
+            txt = txt.strip()
+            if txt:
+                slots["message_body"] = txt[:12000]
+
+        if tool_name in ("filesystem.write", "filesystem.append"):
+            raw_path = str(
+                tool_args.get("path")
+                or tool_args.get("file_path")
+                or tool_args.get("filename")
+                or ""
+            ).strip()
+            if raw_path:
+                norm = raw_path.replace("\\", "/")
+                if not norm.lower().startswith("sandbox/"):
+                    norm = f"SANDBOX/{Path(norm).name}"
+                artifacts["last_file_path"] = norm
+                slots["file_path"] = norm
+
         if tool_name == "excel.create":
             artifacts.setdefault("excel_created", False)
             artifacts["excel_created"] = True
@@ -874,6 +943,11 @@ class Agent:
             to_val = str(tool_args.get("to", "")).strip()
             if to_val:
                 slots["recipient_phone_or_jid"] = self._extract_phone_like(to_val) or to_val
+
+        if tool_name == "email.create_draft" and isinstance(tool_res, dict):
+            _draft_id = tool_res.get("draft_id") or tool_res.get("id") or tool_res.get("message_id")
+            if _draft_id:
+                slots["draft_id"] = str(_draft_id)
 
         if not tool_name.startswith("contacts."):
             return
@@ -979,7 +1053,7 @@ class Agent:
             tool = str(item.get("tool", "") or "")
             if tool.startswith("whatsapp.") or tool.startswith("email."):
                 continue
-            result = str(item.get("result", "") or "").strip()
+            result = str(item.get("raw_payload") or item.get("result", "") or "").strip()
             if not result or result.lower() in ("ok", "no result", "none", "null"):
                 continue
             artifacts = item.get("artifacts", {}) if isinstance(item, dict) else {}
@@ -1000,22 +1074,22 @@ class Agent:
         lines.append("For whatsapp.send, include non-empty text in message/body/text/content.")
         return "\n".join(lines) + "\n"
 
-    def _maybe_update_handoff_payload(self, step_tool: str, step_result: str) -> None:
+    def _maybe_update_handoff_payload(self, step_tool: str, step_result: str, raw_payload: str = "") -> None:
         """Keep latest useful non-delivery text as fallback payload for send steps."""
         t = (step_tool or "").lower()
-        if not step_result:
+        if not step_result and not raw_payload:
             return
         if t.startswith((
             "whatsapp.", "email.", "contacts.", "calendar.", "system.", "memory.",
             "user.", "soul.", "profile."
         )):
             return
-        text = str(step_result).strip()
+        text = str(raw_payload or step_result).strip()
         if len(text) < 12:
             return
         if text.lower() in ("ok", "no result", "none", "null"):
             return
-        self._handoff_payload = text[:1800]
+        self._handoff_payload = text[:8000]
 
     def _persist_user_email(self, email: str) -> None:
         """Persist preferred user email to USER.md and MEMORY.md."""
@@ -1697,25 +1771,362 @@ class Agent:
                 out.append(available[key])
         return out
 
+    def _sanitize_plan_goal(self, goal: str, max_words: int = 18, max_chars: int = 140) -> str:
+        """Keep planner step goals short and atomic for small-model reliability."""
+        g = re.sub(r"\s+", " ", str(goal or "")).strip()
+        if not g:
+            return ""
+        g = re.split(r"[\r\n]", g, maxsplit=1)[0].strip()
+        if ":" in g and len(g) > max_chars:
+            head, tail = g.split(":", 1)
+            if len(tail.split()) > 12:
+                g = head.strip()
+        words = g.split()
+        if len(words) > max_words:
+            g = " ".join(words[:max_words])
+        if len(g) > max_chars:
+            g = g[:max_chars].rsplit(" ", 1)[0].strip()
+        return g
+
+    def _parse_plan_slots(self, raw: str) -> list[str]:
+        """Parse OUTPUT/INPUT slot tokens into compact snake_case names."""
+        if not raw:
+            return []
+        parts = [
+            p.strip().lower()
+            for p in re.split(r"[,/|+]+|\band\b", str(raw), flags=re.IGNORECASE)
+            if p and p.strip()
+        ]
+        out = []
+        for p in parts:
+            if p in {"none", "n/a", "na", "-"}:
+                continue
+            slot = re.sub(r"[^a-z0-9_]+", "_", p).strip("_")[:40]
+            if slot and slot not in out:
+                out.append(slot)
+        return out
+
+    def _estimate_min_plan_steps(self, user_text: str) -> int:
+        """Heuristic minimum step pressure for planner output."""
+        t = (user_text or "").lower()
+        if not t.strip():
+            return 1
+
+        has_lookup = bool(re.search(r"\b(find|search|lookup|look up|research|get)\b", t))
+        has_generation = bool(
+            re.search(r"\b(write|draft|compose|generate|prepare|summari[sz]e|code|convert|report|document|pdf)\b", t)
+        )
+        has_delivery = bool(re.search(r"\b(send|share|forward|email|message|whatsapp|mail)\b", t))
+        has_side_effect = bool(
+            re.search(r"\b(create|write|add|update|delete|save|send|share|forward|upload|post)\b", t)
+        )
+        has_contact_target = bool(re.search(r"\b(contact|recipient|phone|email address|to\s+[a-z])\b", t))
+
+        est = 0
+        if has_lookup:
+            est += 1
+        if has_generation:
+            est += 1
+        if has_delivery or has_side_effect:
+            est += 1
+        if has_delivery and has_contact_target:
+            est += 1
+        if has_side_effect:
+            est += 1  # verify step
+
+        return max(1, min(est, 8))
+
     def _parse_plan(self, text: str) -> list:
-        """Extract numbered steps and optional categories from planning output."""
+        """Extract numbered steps, optional ACTION/slots, and normalized categories."""
         steps = []
         for line in text.strip().splitlines():
             line = line.strip()
-            m = re.match(
-                r'^(?:step\s*)?(\d+)[.):\-\s]+(.+?)(?:\s*\|\s*categories?\s*:\s*(.+))?$',
-                line,
-                re.IGNORECASE,
-            )
+            m = re.match(r'^(?:step\s*)?(\d+)[.):\-\s]+(.+)$', line, re.IGNORECASE)
             if not m:
                 continue
-            goal = m.group(2).strip()
+
+            body = m.group(2).strip()
+            if not body:
+                continue
+
+            parts = [p.strip() for p in body.split("|") if p and p.strip()]
+            kv = {}
+            free_parts = []
+            for part in parts:
+                mk = re.match(
+                    r'^(action|goal|purpose|output|outputs|input|inputs|categories?)\s*:\s*(.+)$',
+                    part,
+                    re.IGNORECASE,
+                )
+                if mk:
+                    kv[mk.group(1).lower()] = mk.group(2).strip()
+                else:
+                    free_parts.append(part)
+
+            action = (kv.get("action") or "").strip()
+            goal = (kv.get("goal") or kv.get("purpose") or (free_parts[0] if free_parts else "")).strip()
+            goal = self._sanitize_plan_goal(goal)
+            if not goal and action:
+                if action.lower() in {"verify", "check", "confirm"}:
+                    goal = "Verify completion criteria and report gaps"
+                else:
+                    goal = self._sanitize_plan_goal(action.replace(".", " "))
             if not goal or len(goal) <= 3:
                 continue
-            raw_cats = m.group(3) or ""
+
+            raw_cats = kv.get("categories") or kv.get("category") or ""
             cats = [c.strip() for c in re.split(r'[,/|]+', raw_cats) if c.strip()]
-            steps.append({"goal": goal, "categories": self._normalize_categories(cats)})
+
+            if action in self.tools:
+                action_cat = str((TOOL_METADATA.get(action, {}) or {}).get("category", "")).strip()
+                if action_cat:
+                    cats.append(action_cat)
+
+            norm_cats = self._normalize_categories(cats)
+            if not norm_cats:
+                inferred = self._select_categories(goal, planner_categories=[])
+                norm_cats = self._normalize_categories(list(inferred))
+
+            step = {"goal": goal, "categories": norm_cats}
+            if action:
+                step["action"] = action
+
+            outputs = self._parse_plan_slots(kv.get("output") or kv.get("outputs") or "")
+            inputs = self._parse_plan_slots(kv.get("input") or kv.get("inputs") or "")
+            if outputs:
+                step["outputs"] = outputs
+            if inputs:
+                step["inputs"] = inputs
+
+            if action.lower() in {"think", "draft", "summarize", "summarise", "synthesize", "plan"}:
+                step["allow_toolless_done"] = True
+            if action.lower() in {"verify", "check", "confirm"}:
+                step["is_verify"] = True
+                step["allow_toolless_done"] = True
+
+            steps.append(step)
         return steps
+
+    def _ensure_send_content_prereqs(self, steps: list) -> list:
+        """Ensure delivery steps have explicit content + recipient prerequisites."""
+        if not steps:
+            return steps
+
+        out = [dict(s) for s in steps]
+        i = 0
+        while i < len(out):
+            cur = out[i]
+            goal_l = str(cur.get("goal", "")).lower()
+            action_l = str(cur.get("action", "")).lower()
+            is_send_step = bool(
+                action_l in {"email.send", "email.create_draft", "whatsapp.send", "whatsapp.send_media"}
+                or re.search(r"\b(send|share|forward|email|mail|message|whatsapp)\b", goal_l)
+            )
+            if not is_send_step:
+                i += 1
+                continue
+
+            prior = out[:i]
+            has_content_step = any(
+                bool(p.get("outputs"))
+                and not re.search(r"\b(contact|recipient|email|phone)\b", str(p.get("goal", "")).lower())
+                for p in prior
+            ) or any(
+                re.search(
+                    r"\b(write|draft|compose|generate|prepare|summari[sz]e|create|build|code|convert)\b",
+                    str(p.get("goal", "")).lower(),
+                )
+                for p in prior
+            )
+            if not has_content_step:
+                prep_step = {
+                    "goal": "Prepare message content for delivery",
+                    "categories": self._normalize_categories(["Documents"]),
+                    "action": "think",
+                    "outputs": ["message_body"],
+                    "allow_toolless_done": True,
+                }
+                out.insert(i, prep_step)
+                send_inputs = list(cur.get("inputs", []))
+                if "message_body" not in send_inputs:
+                    send_inputs.append("message_body")
+                cur["inputs"] = send_inputs
+                i += 2
+                continue
+
+            # File/code delivery must persist generated content before sending.
+            _task_l = str(getattr(self, "_current_task_text", "") or "").lower()
+            _task_implies_code_file = any(k in _task_l for k in ("c++", " cpp", ".cpp", "source code", "implementation", "algorithm"))
+            needs_file_delivery = bool(
+                re.search(r"\b(attach|attachment|file|document|pdf|docx?|code|cpp|source|implementation)\b", goal_l)
+                or _task_implies_code_file
+            )
+            has_persist_step = any(
+                str(p.get("action", "")).lower() in {
+                    "filesystem.write", "buffer.pipe", "pdf.create", "word.create"
+                }
+                or "file_path" in (p.get("outputs") or [])
+                for p in prior
+            )
+            if needs_file_delivery and not has_persist_step:
+                source_slot = "message_body"
+                for p in reversed(prior):
+                    outs = list(p.get("outputs") or [])
+                    if not outs:
+                        continue
+                    cand = str(outs[0]).strip().lower()
+                    if not cand or "recipient" in cand or "contact" in cand:
+                        continue
+                    source_slot = str(outs[0]).strip()
+                    break
+                persist_step = {
+                    "goal": "Persist generated content to SANDBOX file",
+                    "categories": self._normalize_categories(["Filesystem"]),
+                    "action": "filesystem.write",
+                    "inputs": [source_slot],
+                    "outputs": ["file_path"],
+                }
+                out.insert(i, persist_step)
+                send_inputs = list(cur.get("inputs", []))
+                if "file_path" not in send_inputs:
+                    send_inputs.append("file_path")
+                cur["inputs"] = send_inputs
+                i += 2
+                continue
+
+            has_contact_step = any(
+                str(p.get("action", "")).startswith("contacts.")
+                or re.search(r"\b(contact|lookup|find recipient|recipient details)\b", str(p.get("goal", "")).lower())
+                for p in prior
+            )
+            has_explicit_target = bool(
+                re.search(EMAIL_REGEX, goal_l)
+                or re.search(r"\b\d{10,15}\b", goal_l)
+            )
+            if not has_contact_step and not has_explicit_target:
+                lookup_step = {
+                    "goal": "Lookup recipient contact details",
+                    "categories": self._normalize_categories(["Contacts"]),
+                    "action": "contacts.search",
+                    "outputs": ["recipient_contact"],
+                }
+                out.insert(i, lookup_step)
+                send_inputs = list(cur.get("inputs", []))
+                if "recipient_contact" not in send_inputs:
+                    send_inputs.append("recipient_contact")
+                cur["inputs"] = send_inputs
+                i += 2
+                continue
+
+            i += 1
+
+        return out
+
+    def _normalize_email_draft_send_flow(self, steps: list) -> list:
+        """Avoid orphan drafts when the same plan already contains a real send step."""
+        if not steps:
+            return steps
+        first_send_idx = next(
+            (idx for idx, s in enumerate(steps) if str(s.get("action", "")).lower() == "email.send"),
+            None,
+        )
+        if first_send_idx is None:
+            return steps
+
+        out = []
+        for idx, s in enumerate(steps):
+            act = str(s.get("action", "")).lower()
+            if act == "email.create_draft" and idx < first_send_idx:
+                continue
+            out.append(dict(s))
+        return out
+
+    def _dedupe_contact_lookup_steps(self, steps: list) -> list:
+        """Drop repeated recipient contact lookups when a prior lookup already exists."""
+        if not steps:
+            return steps
+        out = []
+        resolved_lookup = False
+        for s in steps:
+            act = str(s.get("action", "")).lower()
+            goal_l = str(s.get("goal", "")).lower()
+            is_contact_lookup = bool(
+                act.startswith("contacts.")
+                or re.search(r"\b(lookup|find|search|get)\b.{0,32}\b(contact|recipient|email|phone)\b", goal_l)
+            )
+            if is_contact_lookup and resolved_lookup:
+                continue
+            out.append(dict(s))
+            if is_contact_lookup:
+                resolved_lookup = True
+        return out
+
+    def _ensure_verification_step(self, steps: list) -> list:
+        """Append a final verify/check step for mutation-heavy plans when missing."""
+        if not steps:
+            return steps
+
+        has_verify = any(
+            bool(s.get("is_verify"))
+            or re.search(r"\b(verify|confirm|check|validate)\b", str(s.get("goal", "")).lower())
+            for s in steps
+        )
+        if has_verify:
+            return steps
+
+        has_side_effect = False
+        for s in steps:
+            action_l = str(s.get("action", "")).lower()
+            goal_l = str(s.get("goal", "")).lower()
+            if action_l and any(action_l.startswith(p) for p in _SIDE_EFFECT_PREFIXES):
+                has_side_effect = True
+                break
+            if re.search(r"\b(send|write|create|add|update|delete|save|upload|post)\b", goal_l):
+                has_side_effect = True
+                break
+        if not has_side_effect:
+            return steps
+
+        cats = {str(c).strip().lower() for s in steps for c in (s.get("categories") or [])}
+        verify_tool = ""
+        verify_goal = "Verify required action completed successfully"
+        verify_cats = []
+
+        if "todo list" in cats and "todo.list" in self.tools:
+            verify_tool = "todo.list"
+            verify_goal = "Verify todo entries exist"
+            verify_cats = ["Todo List"]
+        elif "calendar" in cats and "calendar.list_events" in self.tools:
+            verify_tool = "calendar.list_events"
+            verify_goal = "Verify scheduled events exist"
+            verify_cats = ["Calendar"]
+        elif ("filesystem" in cats or "documents" in cats or "conversion" in cats) and "filesystem.list" in self.tools:
+            verify_tool = "filesystem.list"
+            verify_goal = "Verify output file exists in SANDBOX"
+            verify_cats = ["Filesystem"]
+        elif "contacts" in cats and "contacts.search" in self.tools:
+            verify_tool = "contacts.search"
+            verify_goal = "Verify contact retrieval result"
+            verify_cats = ["Contacts"]
+        elif "email" in cats and "email.list" in self.tools:
+            verify_tool = "email.list"
+            verify_goal = "Verify email action in inbox/sent list"
+            verify_cats = ["Email"]
+        elif "whatsapp" in cats and "whatsapp.status" in self.tools:
+            verify_tool = "whatsapp.status"
+            verify_goal = "Verify WhatsApp service status before reporting success"
+            verify_cats = ["WhatsApp"]
+
+        verify_step = {
+            "goal": verify_goal,
+            "categories": self._normalize_categories(verify_cats),
+            "is_verify": True,
+        }
+        if verify_tool:
+            verify_step["action"] = verify_tool
+        else:
+            verify_step["allow_toolless_done"] = True
+        return steps + [verify_step]
 
     def _should_split_compound_task(self, user_text: str, steps: list) -> bool:
         """Return True when planner produced a single broad step for a multi-intent task.
@@ -1841,20 +2252,26 @@ class Agent:
     def _inject_buffer_refs_into_steps(
         self, steps: list, completed_step: dict, buffer: dict
     ) -> list:
-        """Replace [BUFFER:?] placeholders with the real buffer ID after a search step.
+        """Inject concrete [BUFFER:N] refs into downstream consumer steps.
 
-        Called in the execute loop immediately after a search/scraping step succeeds
-        so downstream email/send steps know exactly which buffer to read.
+        This is used after any content-producing step (search/scrape/think/etc.) that
+        buffered output, so write/send steps can consume the exact payload deterministically.
         """
-        step_tool = completed_step.get("tool", "")
-        if not step_tool.startswith(("search.", "firecrawl.")):
+        artifacts = completed_step.get("artifacts", {}) if isinstance(completed_step, dict) else {}
+        candidate_ids = [
+            int(str(x))
+            for x in (artifacts.get("buffers") or [])
+            if str(x).isdigit()
+        ]
+        if not candidate_ids:
+            # Fallback: use latest buffer ID in memory when artifacts are sparse.
+            latest = max((int(k) for k in buffer.keys() if str(k).isdigit()), default=None)
+            if latest is not None:
+                candidate_ids = [latest]
+        if not candidate_ids:
             return steps
-        # Find the highest numeric buffer ID that exists
-        latest_id = max(
-            (int(k) for k in buffer.keys() if str(k).isdigit()), default=None
-        )
-        if latest_id is None:
-            return steps
+
+        latest_id = max(candidate_ids)
         buf_ref = f"[BUFFER:{latest_id}]"
         updated = []
         for s in steps:
@@ -1863,6 +2280,14 @@ class Agent:
             goal = re.sub(r'\[BUFFER:\?\]', buf_ref, goal)
             # Also replace generic "id=<id>" hint with real id
             goal = re.sub(r'id=<id>', f'id={latest_id}', goal)
+            # If step consumes generated content but has no explicit buffer ref, append one.
+            _consumer = bool(re.search(
+                r"\b(send|share|forward|email|whatsapp|compose|draft|write|save|attach|convert|create file|filesystem\.write)\b",
+                goal,
+                re.IGNORECASE,
+            ))
+            if _consumer and "[BUFFER:" not in goal:
+                goal = f"{goal} {buf_ref}".strip()
             updated.append({**s, "goal": goal})
         return updated
 
@@ -1924,11 +2349,14 @@ class Agent:
         step context, so the model can use it immediately for composing email bodies etc.
 
         Returns a compact string to append to the step prompt's working state, or "".
-        Max 600 chars per buffer to stay inside token budget.
+        Max chars per buffer is adaptive: small for generic steps, larger for
+        send/write composition steps where payload fidelity matters.
         """
         if not buffer:
             return ""
         MAX_PREFETCH_CHARS = 600
+        if re.search(r'\b(send|share|forward|email|whatsapp|draft|compose|write|filesystem\.write|attach|attachment)\b', step_desc, re.IGNORECASE):
+            MAX_PREFETCH_CHARS = 4000
         # Find all [BUFFER:N] references in the step goal
         refs = re.findall(r'\[BUFFER:(\d+)\]', step_desc)
         if not refs:
@@ -1985,13 +2413,48 @@ class Agent:
                         break
         return selected | _ALWAYS_CATEGORIES
 
-    def _get_step_tools(self, step_desc: str, user_message: str = "", planner_categories: list[str] | None = None) -> str:
+    def _get_step_tools(
+        self,
+        step_desc: str,
+        user_message: str = "",
+        planner_categories: list[str] | None = None,
+        planned_action: str = "",
+    ) -> str:
         """Return predicted tool docs (1 primary + 1 backup) for this step."""
         cats = self._select_categories(step_desc, user_message, planner_categories)
+        _is_verify_action = (planned_action or "").strip().lower() in {"verify", "check", "confirm"}
         # Store for execution-time category gate in _safe_execute
         self._current_step_cats = {c.strip().lower() for c in cats}
         predicted = self._predict_step_tools(step_desc, list(cats))
+
+        planned_action = (planned_action or "").strip()
+        if planned_action in self.tools:
+            predicted = [planned_action] + [p for p in predicted if p != planned_action]
+        elif _is_verify_action:
+            verify_bias = [
+                p for p in predicted
+                if (p.endswith(".list") or p.endswith(".status") or p.endswith(".read"))
+                and not p.startswith("system.clipboard")
+            ]
+            if verify_bias:
+                predicted = verify_bias + [p for p in predicted if p not in verify_bias]
+            else:
+                predicted = [
+                    p for p in predicted
+                    if (p.endswith(".list") or p.endswith(".status") or p.endswith(".read"))
+                    and not p.startswith("system.clipboard")
+                ]
+
         if not predicted:
+            if _is_verify_action:
+                predicted = [
+                    t for t in (
+                        "todo.list", "calendar.list_events", "filesystem.list", "email.list", "whatsapp.status"
+                    )
+                    if t in self.tools
+                ][:2]
+                self._current_step_tool_names = set(predicted)
+                return full_tool_schemas_for_tools(predicted)
             # Fallback to one tool per category at most, to keep context small.
             fallback = []
             for cat in sorted(cats):
@@ -2498,6 +2961,9 @@ class Agent:
           {"type": "final", "content": "..."}
           {"type": "step_limit", "content": "..."}
         """
+        # Reset run-scoped LLM token/cost tracker for this user request.
+        reset_llm_usage_totals()
+
         #  Initialize context engineering for this run 
         # Clear per-task NEED_INPUT answers; prevents previous session answers bleeding in.
         # /miraclr - hard session reset command
@@ -2512,6 +2978,7 @@ class Agent:
             self._pending_workflow_candidate = None
             self._context_compiler.reset()
             yield {"type": "final", "content": "Session cleared. Fresh start!"}
+            self._print_llm_usage_summary()
             return
 
         # Pending workflow save confirmation from previous successful multi-step run.
@@ -2536,10 +3003,12 @@ class Agent:
                     msg = f"Saved workflow '{wf_name}'."
                 yield {"type": "final", "content": msg}
                 self.history.append((text, msg))
+                self._print_llm_usage_summary()
                 return
             msg = "Okay, I won't save that as a workflow."
             yield {"type": "final", "content": msg}
             self.history.append((text, msg))
+            self._print_llm_usage_summary()
             return
 
         self._input_answers = {}
@@ -2633,36 +3102,34 @@ class Agent:
         _plan_sections, _plan_budget_note, _plan_diag = self._context_compiler.apply_budget(
             _plan_sections, step_type=StepType.PLAN
         )
+        _min_plan_steps = self._estimate_min_plan_steps(text)
+        _plan_output_format = (
+            "PLANNING MODE: DO NOT call any tools yet.\n"
+            "Is this conversational? -> CHAT: <reply>\n"
+            "Otherwise output a numbered plan using this EXACT one-line schema per step:\n"
+            "  1. ACTION: <tool.name|think|verify> | GOAL: <5-14 words> | OUTPUT: <slot_name|none> | INPUTS: <slot_a,slot_b|none> | categories: <Cat1>, <Cat2>\n"
+            "Rules:\n"
+            "- Each step must map to exactly ONE action.\n"
+            "- GOAL must be short and atomic; never include payload text, email body, or code blocks.\n"
+            f"- Produce at least {_min_plan_steps} steps for this task unless CHAT applies.\n"
+            "- For any send/share/email/whatsapp step: add a content-preparation step BEFORE sending.\n"
+            "- If sending to a person, add a contact-lookup step BEFORE the send step.\n"
+            "- Do NOT combine read and write in the same step.\n"
+            "- Add a final VERIFY step that checks completion with a read/list/status tool.\n"
+            "MIRA: Plan:\n"
+        )
         plan_prompt = self._context_compiler.render_prompt(
             _plan_sections,
             step_type=StepType.PLAN,
             budget_note=_plan_budget_note,
-            output_format=(
-                "PLANNING MODE: DO NOT call any tools yet.\n"
-                "Is this conversational? -> CHAT: <reply>\n"
-                "Otherwise output a numbered plan (one atomic action per step):\n"
-                "  1. <what to do> | categories: <Cat1>, <Cat2>\n"
-                "Rules:\n"
-                "- Split compound tasks: 'find X and email Y' = step1: search, step2: contact lookup, step3: email.\n"
-                "- Each step does exactly ONE thing (one read OR one write).\n"
-                "- If sending, add a contact-lookup step BEFORE the send step.\n"
-                "- Keep the plan to 2-4 steps maximum.\n"
-                "MIRA: Plan:\n"
-            ),
+            output_format=_plan_output_format,
         )
         # Use structured messages when provider supports it
         _plan_flat, _plan_msgs = self._context_compiler.prepare_for_generation(
             _plan_sections,
             step_type=StepType.PLAN,
             budget_note=_plan_budget_note,
-            output_format=(
-                "PLANNING MODE: DO NOT call any tools yet.\n"
-                "Is this conversational? -> CHAT: <reply>\n"
-                "Otherwise plan (one atomic action per step):\n"
-                "  1. <what to do> | categories: <Cat1>, <Cat2>\n"
-                "Compound tasks MUST be split: find+email = 3 steps.\n"
-                "MIRA: Plan:\n"
-            ),
+            output_format=_plan_output_format,
         )
         if _workflow_steps_preloaded:
             plan_raw = "WORKFLOW AUTO-TRIGGER"
@@ -2701,6 +3168,7 @@ class Agent:
             print(self._context_compiler.metrics.render_metrics_block())
             self.history.append((text, final_response))
             yield {"type": "final", "content": final_response}
+            self._print_llm_usage_summary()
             return
 
         # Accept direct planner answer ONLY when the response is pure FINAL ANSWER
@@ -2711,6 +3179,7 @@ class Agent:
             final_response = plan_raw.split("FINAL ANSWER:")[-1].strip()
             self.history.append((text, final_response))
             yield {"type": "final", "content": final_response}
+            self._print_llm_usage_summary()
             return
 
         if not steps:
@@ -2720,8 +3189,15 @@ class Agent:
             if len(_split_steps) >= 2:
                 print(f"[AGENT] Plan auto-split: 1 -> {len(_split_steps)} steps")
                 steps = _split_steps
+        if not _workflow_steps_preloaded:
+            steps = self._ensure_send_content_prereqs(steps)
+            steps = self._normalize_email_draft_send_flow(steps)
+            steps = self._ensure_verification_step(steps)
         steps_block = "\n".join(
-            f"{i+1}. {s['goal']}"
+            f"{i+1}. "
+            + (f"ACTION: {s.get('action')} | " if s.get("action") else "")
+            + f"{s['goal']}"
+            + (f" | outputs: {', '.join(s.get('outputs', []))}" if s.get("outputs") else "")
             + (f" | categories: {', '.join(s.get('categories', []))}" if s.get("categories") else "")
             for i, s in enumerate(steps)
         )
@@ -2742,12 +3218,16 @@ class Agent:
             step_item = steps[i]
             step_desc = step_item.get("goal", "")
             step_categories = step_item.get("categories", [])
+            step_action = str(step_item.get("action", "")).strip()
+            step_inputs = list(step_item.get("inputs", []) or [])
+            step_outputs = list(step_item.get("outputs", []) or [])
             _step_idx += 1
 
             #  Cancel check (OpenClaw-style abort) 
             if run_handle and run_handle.is_cancelled():
                 print(f"[STREAM] Run aborted at step {i+1}  cancel_event set")
                 yield {"type": "aborted", "content": "Run aborted by user.", "step": i + 1}
+                self._print_llm_usage_summary()
                 return
 
             #  Iteration-limit terminal state 
@@ -2755,6 +3235,7 @@ class Agent:
                 msg = f"Reached {MAX_AUTONOMOUS_STEPS}-step limit after {i} completed steps."
                 print(f"[STREAM] {msg}")
                 yield {"type": "iteration_limit", "content": msg, "steps_completed": i}
+                self._print_llm_usage_summary()
                 return
 
             if self.stop_requested:
@@ -2773,9 +3254,18 @@ class Agent:
             _step_actions = []       # compact progress entries for this step
             _step_calls = []         # structured call records for this step
             _step_artifacts = {"buffers": [], "files": [], "phones": []}
-            _step_tools = self._get_step_tools(step_desc, text, step_categories)
+            _step_tools = self._get_step_tools(
+                step_desc,
+                text,
+                step_categories,
+                planned_action=step_action,
+            )
             _force_plan_revise = False  # bypass fallback and jump to plan revision when strategy is wrong
             _latest_user_input = None   # latest explicit user clarification for replanning
+            _step_success_calls = 0     # valid successful tool executions in this step
+            _step_had_error = False     # any tool/runtime error happened in this step
+            _step_allows_toolless_done = bool(step_item.get("allow_toolless_done")) or bool(step_item.get("is_verify"))
+            _step_raw_payload = ""      # full payload for downstream handoff (not compressed digest)
 
             #  Quantified step tracking 
             # Detect numeric goals in step description (e.g. "add 6 todos").
@@ -2797,6 +3287,38 @@ class Agent:
 
             # Start step tracking BEFORE the retry loop (once per logical step)
             self._context_compiler.metrics.start_step(i, "act")
+
+            # Duplicate contact-lookup short-circuit: if recipient is already resolved,
+            # skip repeated lookup/get steps instead of re-querying the same contact.
+            _slots_now = (self._working_state or {}).get("slots", {})
+            _recipient_known = bool(_slots_now.get("recipient_email") or _slots_now.get("recipient_phone_or_jid"))
+            _prior_contact_ok = any(
+                str(c.get("tool", "")).startswith("contacts.") and c.get("status") == "done"
+                for c in completed
+            )
+            if step_action.startswith("contacts.") and _recipient_known and _prior_contact_ok:
+                step_status = "done"
+                step_result = "Recipient already resolved from earlier contact lookup; skipping duplicate step."
+                _step_tool = step_action or "contacts.search"
+                _step_actions.append("duplicate_lookup_skipped")
+                _completed_entry = {
+                    "step": step_desc,
+                    "status": step_status,
+                    "result": step_result,
+                    "tool": _step_tool,
+                    "calls": _step_calls,
+                    "artifacts": _step_artifacts,
+                    "categories": step_categories,
+                    "raw_payload": "",
+                }
+                completed.append(_completed_entry)
+                self._context_compiler.metrics.end_step(i, success=True)
+                yield {
+                    "type": "thought",
+                    "content": "Contact already resolved earlier; skipping redundant contact lookup step.",
+                    "step": i + 1,
+                }
+                continue
 
             for attempt in range(MAX_RETRIES_PER_STEP):
                 done_block = ""
@@ -2902,7 +3424,18 @@ class Agent:
                         "If ANY result satisfies the step goal -> output DONE right now.\n"
                         "Do NOT call tools to verify, confirm, or check data you already retrieved.\n"
                     )
+                _slot_hint = ""
+                if step_inputs or step_outputs:
+                    _in_slots = ", ".join(step_inputs) if step_inputs else "none"
+                    _out_slots = ", ".join(step_outputs) if step_outputs else "none"
+                    _slot_hint = (
+                        "SLOT CONTRACT:\n"
+                        f"- INPUTS: {_in_slots}\n"
+                        f"- OUTPUTS: {_out_slots}\n"
+                        "Use these names consistently in your DONE summary.\n\n"
+                    )
                 _extra_hints = "\n".join(filter(None, [
+                    _slot_hint,
                     _quant_hint,
                     _media_hint,
                     self._build_handoff_hint(completed, step_desc),
@@ -2947,13 +3480,39 @@ class Agent:
                     )
                 else:
                     _seq_hint = ""
+                _action_hint = (
+                    f"PLANNED ACTION: {step_action}\n"
+                    "Prefer this action unless a tool error requires fallback.\n\n"
+                    if step_action else ""
+                )
+                _orig_req = re.sub(r'\s+', ' ', (text or '').strip())[:320]
+                _orig_req_line = f"ORIGINAL REQUEST: {_orig_req}\n\n" if _orig_req else ""
+                _slot_contract_line = ""
+                if step_inputs or step_outputs:
+                    _in_slots = ", ".join(step_inputs) if step_inputs else "none"
+                    _out_slots = ", ".join(step_outputs) if step_outputs else "none"
+                    _slot_contract_line = (
+                        "STEP SLOTS:\n"
+                        f"- INPUTS: {_in_slots}\n"
+                        f"- OUTPUTS: {_out_slots}\n\n"
+                    )
+                _priority_tail = ""
+                if attempt > 0 and _step_actions:
+                    _priority_tail = (
+                        "PRIORITY CHECK (FINAL RULE): If STEP PROGRESS already satisfies this step, "
+                        "output DONE immediately. Do NOT call another tool.\n\n"
+                    )
                 _act_output_format = (
                     f"Current step: {step_desc}\n\n"
+                    f"{_orig_req_line}"
+                    f"{_action_hint}"
+                    f"{_slot_contract_line}"
                     f"{_seq_hint}"
                     "Output exactly ONE of:\n"
                     "TOOL: tool.name | arg=value | arg2=value2\n"
                     "DONE: <one-line summary>\n"
                     "NEED: <one specific question>\n\n"
+                    f"{_priority_tail}"
                     "MIRA:"
                 )
                 step_prompt = self._context_compiler.render_prompt(
@@ -3076,7 +3635,21 @@ class Agent:
                     _answer_u = answer.upper()
                     if _answer_u.startswith("DONE:") or _answer_u.startswith("STEP_DONE:") or _answer_u.startswith("SKIP:"):
                         _prefix_len = 5 if _answer_u.startswith("DONE:") else (10 if _answer_u.startswith("STEP_DONE:") else 5)
-                        step_result = answer[_prefix_len:].strip()[:220] or (step_result or "step complete")
+                        _done_summary = answer[_prefix_len:].strip()[:220] or (step_result or "step complete")
+                        _has_evidence = _step_success_calls > 0 or (_step_allows_toolless_done and not _step_had_error)
+                        if not _has_evidence:
+                            last_error = "DONE rejected: no successful tool execution for this step"
+                            _special_retry_note = (
+                                "DONE rejected: this step has no successful tool result yet.\n"
+                                "Execute one valid tool call first, then output DONE.\n\n"
+                            )
+                            if attempt == MAX_RETRIES_PER_STEP - 1:
+                                step_result = "Marked DONE without evidence; no successful tool call."
+                                step_status = "failed"
+                                break
+                            continue
+                        step_result = _done_summary
+                        _step_raw_payload = _done_summary
                         step_status = "done"
                         break
                     if _answer_u.startswith("STEP_FAILED:"):
@@ -3225,6 +3798,7 @@ class Agent:
                     result = {"status": "error", "error": f"Internal crash: {str(e)}"}
 
                 if isinstance(result, dict) and result.get("status") == "error":
+                    _step_had_error = True
                     last_error = result.get("error", "unknown error")
                     last_failed_tool = tool_name
                     last_failed_args = tool_args
@@ -3268,6 +3842,7 @@ class Agent:
                     tool_res = result.get("result", result) if isinstance(result, dict) else result
                     self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
                     raw_obs = json.dumps(tool_res, indent=2, default=str)
+                    _step_raw_payload = raw_obs[:12000]
                     print(f"[STREAM][TOOL RESULT ] ({len(raw_obs)} chars):")
                     print(raw_obs[:2000] + ("\n...[truncated]" if len(raw_obs) > 2000 else ""))
                     observation = raw_obs
@@ -3302,6 +3877,7 @@ class Agent:
                     if _buf_id_for_record is not None:
                         step_result = f"{step_result} [BUFFER:{_buf_id_for_record}]"
                     step_status = "done"
+                    _step_success_calls += 1
                     _step_calls.append({
                         "tool": tool_name,
                         "status": "ok",
@@ -3370,6 +3946,8 @@ class Agent:
                             last_error = f"Tool returned failure status: {str(_se_reason)[:200]}"
                             last_failed_tool = tool_name
                             last_failed_args = tool_args
+                            _step_had_error = True
+                            _step_success_calls = 0
                             step_status = "failed"
                             step_result = None
                             continue  # retry loop
@@ -3410,6 +3988,8 @@ class Agent:
                             last_error = replan_reason
                             last_failed_tool = tool_name
                             last_failed_args = tool_args
+                            _step_had_error = True
+                            _step_success_calls = 0
                             step_status = "failed"
                             step_result = None
                             continue  # retry loop
@@ -3550,6 +4130,7 @@ class Agent:
                                 seen_calls.add(_fb_sig)
                                 step_result = self._compress_obs(_fb_obs, _fb_tn)
                                 step_status = "done"
+                                _step_success_calls += 1
                                 _step_tool  = _fb_tn
                                 _fb_handled = True
                                 yield {"type": "tool_result", "tool": _fb_tn,
@@ -3705,7 +4286,11 @@ class Agent:
 
             if not _step_rewound:  # don't log rewound steps; they'll re-run and log on success
                 if step_status == "done":
-                    self._maybe_update_handoff_payload(_step_tool, step_result or "")
+                    self._maybe_update_handoff_payload(
+                        _step_tool,
+                        step_result or "",
+                        raw_payload=_step_raw_payload,
+                    )
                 _completed_entry = {
                     "step": step_desc,
                     "status": step_status,
@@ -3714,13 +4299,14 @@ class Agent:
                     "calls": _step_calls,
                     "artifacts": _step_artifacts,
                     "categories": step_categories,
+                    "raw_payload": _step_raw_payload,
                 }
                 completed.append(_completed_entry)
                 # Track step completion in metrics
                 self._context_compiler.metrics.end_step(i, success=(step_status == "done"))
-                # After a search/scraping step succeeds, annotate remaining steps with
-                # the real BUFFER ID so downstream email/send steps know which buffer to read.
-                if step_status == "done" and _step_tool.startswith(("search.", "firecrawl.")):
+                # After any buffered content-producing step, annotate remaining steps with
+                # a concrete buffer ID so downstream send/write steps can consume payload.
+                if step_status == "done" and _step_artifacts.get("buffers"):
                     _remaining_steps = steps[_step_idx:]
                     if _remaining_steps:
                         steps[_step_idx:] = self._inject_buffer_refs_into_steps(
@@ -3901,6 +4487,7 @@ class Agent:
                 # Finalize metrics
                 _run_metrics = self._context_compiler.metrics.finalize()
                 print(self._context_compiler.metrics.render_metrics_block())
+                self._print_llm_usage_summary()
                 return
             if self._should_skip_synthesis(completed) and not _postcond_warning:
                 final_response = self._render_simple_completion(completed)
@@ -3911,6 +4498,7 @@ class Agent:
                 print(self._context_compiler.metrics.render_metrics_block())
                 yield {"type": "final", "content": final_response}
                 self.history.append((text, final_response))
+                self._print_llm_usage_summary()
                 return
             #  Synthesizer bypass (BYPASS_SYNTHESIZER=True) 
             if (not final_response) and BYPASS_SYNTHESIZER:
@@ -3930,6 +4518,7 @@ class Agent:
                 print(self._context_compiler.metrics.render_metrics_block())
                 yield {"type": "final", "content": final_response}
                 self.history.append((text, final_response))
+                self._print_llm_usage_summary()
                 return
             # 
 
@@ -4026,6 +4615,7 @@ class Agent:
         #  Finalize context quality metrics 
         _run_metrics = self._context_compiler.metrics.finalize()
         print(self._context_compiler.metrics.render_metrics_block())
+        self._print_llm_usage_summary()
 
         yield {"type": "final", "content": final_response}
         self.history.append((text, final_response))
@@ -4549,6 +5139,9 @@ class Agent:
             return {"result": f"Lines {start}-{end} of buffer {buf_id} ({len(lines)} total lines):\n{sliced}"}
         
         # --- REGULAR TOOL EXECUTION ---
+        _slots = (self._working_state or {}).get("slots", {})
+        _artifacts = (self._working_state or {}).get("artifacts", {})
+
         # think: inject buffer content and/or inline context into the prompt
         # before dispatching to the reasoning connector (which has no buffer access).
         if tool_name == "think":
@@ -4586,6 +5179,17 @@ class Agent:
             if "html"    in args and "html_content" not in args: args["html_content"] = args.pop("html")
             if "content" in args and "html_content" not in args: args["html_content"] = args.pop("content")
             if "output"  in args and "output_path" not in args: args["output_path"] = args.pop("output")
+
+        # contacts.search pre-flight: recover missing query from task/slot hints.
+        if tool_name == "contacts.search":
+            _q = str(args.get("query") or args.get("name") or args.get("text") or "").strip()
+            if not _q:
+                _hint = str(_slots.get("recipient_name_hint") or self._extract_recipient_hint(getattr(self, "_current_task_text", "")) or "").strip()
+                if _hint:
+                    args.setdefault("query", _hint)
+                    args.setdefault("name", _hint)
+                    print(f"[AGENT] contacts.search auto-filled query from recipient hint: {_hint}")
+
         # whatsapp.status takes zero args  strip any hallucinated args (jid, to, number, ...)
         if tool_name == "whatsapp.status":
             args = {}
@@ -4616,6 +5220,44 @@ class Agent:
                             "Use prior step results to compose the message text before sending."
                         ),
                     }
+
+        # filesystem.write/append pre-flight: hydrate content/path from slots when missing.
+        if tool_name in ("filesystem.write", "filesystem.append"):
+            if "content" in args and "data" not in args:
+                args["data"] = args.get("content")
+            if "text" in args and "data" not in args:
+                args["data"] = args.get("text")
+            _data = args.get("data")
+            if _data is None or (isinstance(_data, str) and not _data.strip()):
+                _candidate = ""
+                for _k in ("message_body", "cpp_code", "code_text", "content"):
+                    _v = _slots.get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        _candidate = _v.strip()
+                        break
+                if not _candidate:
+                    _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
+                    if _fallback and _fallback.lower() not in ("ok", "no result", "none", "null"):
+                        _candidate = _fallback
+                if _candidate:
+                    args["data"] = _candidate[:60000]
+                    print("[AGENT] filesystem.write auto-filled data from slots/handoff payload")
+
+            _path = str(args.get("path") or args.get("file_path") or args.get("filename") or "").strip()
+            if not _path:
+                _path = str(_artifacts.get("last_file_path") or "").strip()
+            if not _path:
+                _task_l = str(getattr(self, "_current_task_text", "") or "").lower()
+                if any(k in _task_l for k in ("c++", " cpp", ".cpp", "bellman", "algorithm", "source code")):
+                    _path = "SANDBOX/generated.cpp"
+                elif "markdown" in _task_l:
+                    _path = "SANDBOX/generated.md"
+                elif "json" in _task_l:
+                    _path = "SANDBOX/generated.json"
+                else:
+                    _path = "SANDBOX/generated_output.txt"
+            args.setdefault("path", _path)
+
         # whatsapp.send_media pre-flight: verify file exists in SANDBOX.
         # Accept both SANDBOX-relative paths and absolute paths that point inside SANDBOX.
         if tool_name == "whatsapp.send_media":
@@ -4677,6 +5319,55 @@ class Agent:
             if "email" in args and "to" not in args:
                 args["to"] = args.pop("email")
                 _to_raw = str(args.get("to") or "").strip()
+
+            if "message" in args and "body" not in args:
+                args["body"] = args.get("message")
+            if "text" in args and "body" not in args:
+                args["body"] = args.get("text")
+            if "content" in args and "body" not in args:
+                args["body"] = args.get("content")
+
+            _body = args.get("body")
+            if _body is None:
+                _body = ""
+            if not isinstance(_body, str):
+                _body = json.dumps(_body, default=str)
+            _body = _body.strip()
+            if not _body:
+                _slot_body = ""
+                for _k in ("message_body", "cpp_code", "code_text", "content"):
+                    _v = _slots.get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        _slot_body = _v.strip()
+                        break
+                if not _slot_body:
+                    _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
+                    if _fallback and _fallback.lower() not in ("ok", "no result", "none", "null"):
+                        _slot_body = _fallback
+                if _slot_body:
+                    args["body"] = _slot_body[:12000]
+                    print(f"[AGENT] {tool_name} auto-filled body from slots/handoff payload")
+
+            if "body" in args:
+                args.setdefault("message", args["body"])
+                args.setdefault("content", args["body"])
+                args.setdefault("text", args["body"])
+
+            if tool_name == "email.send":
+                _task_l = str(getattr(self, "_current_task_text", "") or "").lower()
+                _wants_file_send = bool(re.search(r"\b(attach|attachment|file|pdf|document|code|cpp|source)\b", _task_l))
+                _atts = args.get("attachments")
+                if _atts is None:
+                    _atts = []
+                if isinstance(_atts, str):
+                    _atts = [_atts]
+                if _wants_file_send and not _atts:
+                    _file_path = str(_slots.get("file_path") or _artifacts.get("last_file_path") or "").strip()
+                    if _file_path:
+                        args["attachments"] = [_file_path]
+                        args.setdefault("attachment_paths", [_file_path])
+                        args.setdefault("files", [_file_path])
+                        print(f"[AGENT] email.send auto-attached generated file: {_file_path}")
 
             _to_l = _to_raw.lower()
             _is_valid_to = bool(re.fullmatch(EMAIL_REGEX, _to_l))

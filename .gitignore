@@ -29,6 +29,7 @@ AION-Windows/.env
 AION-Windows/venv/
 AION-Windows/mcp_server/db.sqlite
 AION-Windows/whatsapp_bridge/auth_whatsapp/
+MIRA-Windows/*.dll
 
 # ── Large model files (never commit — download separately) ────────────────
 *.gguf
@@ -38,3 +39,4 @@ AION-Windows/whatsapp_bridge/auth_whatsapp/
 *.ckpt
 llama-server.exe
 llama-cli.exe
+*.dll
