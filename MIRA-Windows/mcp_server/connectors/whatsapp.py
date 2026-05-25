@@ -18,9 +18,10 @@ def _normalize_number(to: str) -> str:
       2. If exactly 10 digits starting with 6-9 → Indian mobile → prepend '91'
       3. Everything else is returned as-is (group JIDs like 120363…@g.us are untouched)
     """
+    to = str(to or "").strip()
     if "@" in to:          # group JID or full JID — leave alone
         return to
-    cleaned = to.strip().lstrip("+").replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
+    cleaned = to.lstrip("+").replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
     if len(cleaned) == 10 and cleaned[0] in "6789":
         return "91" + cleaned
     return cleaned
@@ -69,9 +70,12 @@ def send_message(to: str, message: str = None, body: str = None, text: str = Non
     Returns:
         Status dict
     """
+    to = str(to or "").strip()
     message = message or body or text or content
     if not to or not message:
         return {"status": "error", "error": "Both 'to' and 'message' are required"}
+    if not isinstance(message, str):
+        message = str(message)
     to = _normalize_number(to)
     return _bridge("POST", "/send", json={"to": to, "message": message})
 
@@ -96,6 +100,11 @@ def send_media(to: str, url: str, type: str = "", caption: str = "") -> dict:
     Returns:
         Status dict
     """
+    to = str(to or "").strip()
+    url = str(url or "").strip()
+    if not to or not url:
+        return {"status": "error", "error": "Both 'to' and 'url' are required"}
+
     # Auto-detect media type from file extension when not provided or empty,
     # so PDFs and office docs are never misclassified as images.
     if not type:

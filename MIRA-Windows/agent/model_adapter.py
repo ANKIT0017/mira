@@ -746,8 +746,12 @@ def _generate_llamacpp_chat(
             messages=messages,
             completion_text=result,
         )
-        # Strip residual <think>...</think> blocks (some models emit them)
-        result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+        # Strip residual <think>...</think> blocks only when a visible answer remains.
+        # Some local models put the entire useful response inside a think block; if we
+        # remove it unconditionally, downstream tools see an empty success payload.
+        _without_think = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+        if _without_think:
+            result = _without_think
         return result
 
     except requests.exceptions.Timeout:

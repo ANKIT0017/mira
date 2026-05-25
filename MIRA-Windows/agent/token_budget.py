@@ -128,12 +128,12 @@ class TokenBudget:
             "constraints": 80,
         },
         "act": {
-            "system": 70, "profile": 0, "memory": 0,
-            "history": 0, "step_tools": 260, "recent_outputs": 0,
-            "done_block": 160, "buffer": 80,
-            "short_term": 80, "tool_history": 100,
-            "goal": 120, "task_contract": 0, "working_state": 0,
-            "constraints": 120,
+            "system": 90, "profile": 0, "memory": 0,
+            "history": 0, "step_tools": 320, "recent_outputs": 0,
+            "done_block": 160, "buffer": 500,
+            "short_term": 80, "tool_history": 120,
+            "goal": 160, "task_contract": 0, "working_state": 500,
+            "constraints": 200,
         },
         "replan": {
             "system": 90, "profile": 100, "memory": 120,
@@ -156,7 +156,7 @@ class TokenBudget:
     # Hard prompt caps by phase for small local models.
     STEP_SOFT_LIMITS = {
         "plan": 1200,
-        "act": 700,
+        "act": 1800,
         "replan": 900,
         "synthesize": 900,
     }

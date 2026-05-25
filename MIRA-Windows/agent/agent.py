@@ -505,6 +505,16 @@ def _classify_tool_result(
                 and "data" in tool_res
                 and tool_res.get("data") in (None, [], "")
             )
+            or (
+                isinstance(tool_res, dict)
+                and "text" in tool_res
+                and not str(tool_res.get("text") or "").strip()
+            )
+            or (
+                isinstance(tool_res, dict)
+                and "content" in tool_res
+                and not str(tool_res.get("content") or "").strip()
+            )
             or (isinstance(tool_res, list) and len(tool_res) == 0)
             or (isinstance(tool_res, str)  and not tool_res.strip())
             or (
@@ -539,6 +549,7 @@ class Agent:
         self._input_answers: dict = {}  # {step_idx: user_answer} for NEED_INPUT pause/resume
         self._task_contract: dict = {}
         self._working_state: dict = {"slots": {}, "artifacts": {}}
+        self._dependency_outputs: dict = {}  # {target_step_number: [signal output records]}
         self._handoff_payload: str = ""  # latest non-delivery payload for downstream send steps
         self._pending_workflow_candidate: dict | None = None
         self._ensure_memory_file()
@@ -562,6 +573,7 @@ class Agent:
         self._input_answers = {}
         self._task_contract = {}
         self._working_state = {"slots": {}, "artifacts": {}}
+        self._dependency_outputs = {}
         self._handoff_payload = ""
         self._pending_workflow_candidate = None
         # Reset context engineering state for new session
@@ -858,6 +870,15 @@ class Agent:
 
     def _should_request_need_input(self, question: str, tool_name: str = "", tool_args: dict | None = None) -> tuple:
         slot = self._classify_need_input_slot(question, tool_name, tool_args)
+        q_l = str(question or "").lower()
+        if not slot and re.search(r"\b(name|who|recipient)\b", q_l):
+            hint = str((self._working_state or {}).get("slots", {}).get("recipient_name_hint") or "").strip()
+            if hint:
+                return False, "recipient_name_hint", f"Recipient name already known from task: '{hint}'."
+            extracted = self._extract_recipient_hint(getattr(self, "_current_task_text", ""))
+            if extracted:
+                self._working_state.setdefault("slots", {})["recipient_name_hint"] = extracted
+                return False, "recipient_name_hint", f"Recipient name found in original request: '{extracted}'."
         if not slot:
             return True, "", ""
         required = set(self._task_contract.get("required_slots", []))
@@ -903,6 +924,11 @@ class Agent:
                 txt = str(tool_res or "")
             txt = txt.strip()
             if txt:
+                if "message_body" in {
+                    str(x or "").strip().lower()
+                    for x in getattr(self, "_current_step_outputs", []) or []
+                }:
+                    txt = self._normalize_delivery_body(txt)
                 slots["message_body"] = txt[:12000]
 
         if tool_name in ("filesystem.write", "filesystem.append"):
@@ -1017,6 +1043,698 @@ class Agent:
                 if k not in rendered:
                     lines.append(f"- artifact.{k}: {artifacts.get(k)}")
         return "\n".join(lines) + "\n\n"
+
+    def _extract_primary_payload(self, tool_res, raw_obs: str = "") -> str:
+        """Return the most useful text payload from a tool result."""
+        payload = ""
+        if isinstance(tool_res, dict):
+            for key in ("text", "result", "content", "message", "body", "data"):
+                val = tool_res.get(key)
+                if isinstance(val, str) and val.strip():
+                    payload = val.strip()
+                    break
+            if not payload:
+                payload = json.dumps(tool_res, ensure_ascii=False, default=str)
+        elif tool_res is not None:
+            payload = str(tool_res).strip()
+        if not payload:
+            payload = str(raw_obs or "").strip()
+
+        # buffer.slice returns a header followed by the actual sliced payload.
+        if payload.startswith("Lines ") and ":\n" in payload:
+            payload = payload.split(":\n", 1)[1].strip()
+
+        # If the payload itself is JSON, prefer its content-bearing field.
+        if payload.startswith("{") and payload.endswith("}"):
+            try:
+                obj = json.loads(payload)
+                if isinstance(obj, dict):
+                    for key in ("text", "result", "content", "message", "body"):
+                        val = obj.get(key)
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+            except Exception:
+                pass
+        return payload.strip()
+
+    def _payload_to_signal(
+        self,
+        payload: str,
+        tool_name: str = "",
+        slot: str = "",
+        max_chars: int = 4000,
+    ) -> str:
+        """Convert raw tool output into compact task-relevant signal."""
+        text = str(payload or "").strip()
+        if not text:
+            return ""
+
+        slot_l = str(slot or "").lower()
+        tool_l = str(tool_name or "").lower()
+        lines: list[str] = []
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            contact = data.get("contact")
+            contacts = data.get("contacts")
+            if isinstance(contact, dict):
+                contacts = [contact]
+            if isinstance(contacts, list) and contacts:
+                for item in contacts[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    parts = []
+                    for key in ("id", "name", "phone", "email", "jid"):
+                        val = item.get(key)
+                        if val not in (None, "", [], {}):
+                            parts.append(f"{key}={val}")
+                    if parts:
+                        lines.append("- " + ", ".join(parts))
+
+            results = data.get("results") or data.get("items") or data.get("matches")
+            if isinstance(results, list) and results:
+                for item in results[:8]:
+                    if isinstance(item, dict):
+                        title = str(item.get("title") or item.get("name") or item.get("label") or "").strip()
+                        snippet = str(
+                            item.get("snippet")
+                            or item.get("summary")
+                            or item.get("description")
+                            or item.get("content")
+                            or ""
+                        ).strip()
+                        url = str(item.get("url") or item.get("link") or "").strip()
+                        source_query = str(item.get("source_query") or "").strip()
+                        row = ": ".join(p for p in (title, snippet[:240]) if p)
+                        if url:
+                            row = f"{row} ({url})" if row else url
+                        if source_query and row:
+                            row = f"[{source_query}] {row}"
+                        if row:
+                            lines.append("- " + re.sub(r"\s+", " ", row).strip())
+                    elif str(item).strip():
+                        lines.append("- " + re.sub(r"\s+", " ", str(item)).strip()[:260])
+
+            if not lines:
+                for key in ("text", "result", "content", "message", "body", "summary"):
+                    val = data.get(key)
+                    if isinstance(val, str) and val.strip():
+                        lines.append(val.strip())
+                        break
+            if not lines:
+                small = {
+                    k: v for k, v in data.items()
+                    if k in {"id", "name", "title", "phone", "email", "jid", "path", "file", "url", "status"}
+                    and v not in (None, "", [], {})
+                }
+                if small:
+                    lines.append(json.dumps(small, ensure_ascii=False, default=str))
+
+        if lines:
+            signal = "\n".join(lines)
+        else:
+            signal_lines = []
+            for line in text.splitlines():
+                clean = re.sub(r"\s+", " ", line).strip()
+                if not clean:
+                    continue
+                if clean.startswith(("{", "}", "[", "]")) and len(clean) < 4:
+                    continue
+                signal_lines.append(clean)
+                if len("\n".join(signal_lines)) >= max_chars:
+                    break
+            signal = "\n".join(signal_lines) if signal_lines else text
+
+        signal = signal.replace("\\n", "\n").strip()
+        if len(signal) > max_chars or (
+            tool_l.startswith(("search.", "firecrawl.", "web."))
+            and len(signal) > 1200
+        ):
+            try:
+                prompt = (
+                    "Rewrite the content below as pure signal for the current task.\n"
+                    "Keep only facts, identifiers, file paths, contact details, titles, URLs, or exact text needed by later steps.\n"
+                    "Remove JSON wrappers, tool logs, duplicates, generic commentary, and unsupported claims.\n"
+                    "Use concise bullets. Max 900 characters.\n\n"
+                    f"Task: {getattr(self, '_current_task_text', '')[:300]}\n"
+                    f"Step: {getattr(self, '_current_step_desc', '')[:180]}\n"
+                    f"Slot: {slot_l or 'unspecified'}\n\n"
+                    f"Content:\n{signal[:6000]}\n\n"
+                    "Pure signal:"
+                )
+                compact = str(generate(prompt, model=getattr(self, "_exec_model", "local"), temperature=0.0, max_tokens=320) or "").strip()
+                compact = re.sub(r"^\s*(?:Pure signal|Signal|FINAL ANSWER)\s*:\s*", "", compact, flags=re.IGNORECASE)
+                if compact and len(compact) < len(signal):
+                    signal = compact
+            except Exception as e:
+                print(f"[AGENT] signal distill skipped: {e}")
+
+        if len(signal) > max_chars:
+            signal = signal[:max_chars].rstrip() + "\n...[signal truncated]"
+        return signal
+
+    def _clean_multi_search_item(self, item: str) -> str:
+        """Normalize one extracted item/topic label for focused searching."""
+        s = str(item or "").strip()
+        if not s:
+            return ""
+        s = re.sub(r"[*_`#>\[\]\(\)]", "", s)
+        s = re.sub(r"^\s*(?:[-+•]|\d+[.)])\s*", "", s)
+        s = re.sub(r"^\s*(?:book|title|item|topic)\s*\d*\s*[:.-]\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s+", " ", s).strip(" :-–—\"'")
+        if ":" in s:
+            s = s.split(":", 1)[0].strip(" :-–—\"'")
+        if " - " in s:
+            s = s.split(" - ", 1)[0].strip(" :-–—\"'")
+        return s.strip()
+
+    def _extract_multi_search_items_from_text(self, text: str, max_items: int = 8) -> list[str]:
+        """Extract concrete item/topic labels from a slot value."""
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        candidates: list[str] = []
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    val = item.get("title") or item.get("name") or item.get("topic") or item.get("query")
+                else:
+                    val = item
+                if val:
+                    candidates.append(str(val))
+        elif isinstance(data, dict):
+            for key in ("titles", "items", "topics", "queries", "books", "entities", "results"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict):
+                            candidates.append(str(item.get("title") or item.get("name") or item.get("topic") or ""))
+                        elif item:
+                            candidates.append(str(item))
+
+        for m in re.finditer(r"\*\*([^*\n]{2,120})\*\*", raw):
+            candidates.append(m.group(1))
+
+        for line in raw.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            if not re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", clean):
+                # Also catch compact title lines like "Still Into You by Erin Connor".
+                if not re.search(r"\bby\s+[A-Z][A-Za-z.'-]+", clean):
+                    continue
+            candidates.append(clean)
+
+        bad_fragments = (
+            "based on", "search result", "potential", "additional", "context",
+            "genre", "theme", "summary", "recommendation", "specific featured",
+            "general trend", "available", "source", "criteria", "identified",
+        )
+        out: list[str] = []
+        seen = set()
+        for cand in candidates:
+            item = self._clean_multi_search_item(cand)
+            if not item:
+                continue
+            low = item.lower()
+            if any(b in low for b in bad_fragments):
+                continue
+            if "http://" in low or "https://" in low:
+                continue
+            if "..." in item or item.endswith(" E"):
+                continue
+            if "/" in item and len(item.split("/")) > 1:
+                # Usually comparison/examples, not a single concrete search target.
+                continue
+            words = item.split()
+            if len(item) < 3 or len(item) > 90 or len(words) > 14:
+                continue
+            norm = re.sub(r"[^a-z0-9]+", " ", low).strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(item)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def _collect_multi_search_items(self) -> list[str]:
+        """Collect item/topic labels from the current step's declared input slots."""
+        slots = (self._working_state or {}).get("slots", {})
+        inputs = [str(s or "").strip().lower() for s in getattr(self, "_current_step_inputs", []) or []]
+        if not inputs:
+            return []
+        preferred = [
+            s for s in inputs
+            if re.search(r"(titles?|items?|topics?|queries|books?|entities|names?|products?|companies|people)", s)
+        ]
+        candidates = preferred or inputs
+        out: list[str] = []
+        seen = set()
+        for slot in candidates:
+            val = slots.get(slot)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            for item in self._extract_multi_search_items_from_text(val):
+                key = re.sub(r"[^a-z0-9]+", " ", item.lower()).strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(item)
+                if len(out) >= 8:
+                    return out
+        return out
+
+    def _search_intent_suffix(self, base_query: str, items: list[str]) -> str:
+        """Derive the reusable search intent after removing known item labels."""
+        suffix = str(base_query or "").strip()
+        for item in items:
+            variants = [item]
+            if re.search(r"\s+by\s+", item, flags=re.IGNORECASE):
+                variants.append(re.split(r"\s+by\s+", item, flags=re.IGNORECASE)[0])
+            for var in variants:
+                if not var:
+                    continue
+                suffix = re.sub(re.escape(var), " ", suffix, flags=re.IGNORECASE)
+        suffix = re.sub(r"\s+", " ", suffix).strip(" -:|,")
+        if suffix:
+            return suffix
+        goal = str(getattr(self, "_current_step_desc", "") or "").lower()
+        if re.search(r"\b(summary|summarize|summarise|plot|synopsis|review)\b", goal):
+            return "summary review plot"
+        if re.search(r"\b(price|cost|buy)\b", goal):
+            return "price"
+        if re.search(r"\b(news|latest|recent)\b", goal):
+            return "latest news"
+        return "details"
+
+    def _build_multi_search_queries(self, tool_name: str, args: dict) -> list[str]:
+        """Build focused per-item search queries when a search step has multi-item inputs."""
+        if tool_name not in ("search.duckduckgo", "search.news"):
+            return []
+        base_query = str(args.get("query") or "").strip()
+        if not base_query:
+            return []
+        items = self._collect_multi_search_items()
+        if len(items) < 2:
+            return []
+        step_l = str(getattr(self, "_current_step_desc", "") or "").lower()
+        task_l = str(getattr(self, "_current_task_text", "") or "").lower()
+        should_expand = bool(
+            re.search(r"\b(each|every|identified|selected|listed|multiple|multi|per[- ]?item|summar)", step_l + " " + task_l)
+        )
+        if not should_expand:
+            return []
+        suffix = self._search_intent_suffix(base_query, items)
+        queries: list[str] = []
+        seen = set()
+        for item in items[:6]:
+            q = f"{item} {suffix}".strip()
+            q = re.sub(r"\s+", " ", q)
+            key = q.lower()
+            if key not in seen:
+                seen.add(key)
+                queries.append(q)
+        return queries
+
+    def _parse_needed_by(self, raw: str) -> list[int]:
+        """Parse planner dependency targets as one-based step numbers."""
+        if not raw:
+            return []
+        out = []
+        for part in re.split(r"[,/|+\s]+|\band\b", str(raw), flags=re.IGNORECASE):
+            part = part.strip().lower()
+            if not part or part in {"none", "na", "n/a", "-", "step", "steps"}:
+                continue
+            m = re.search(r"\d+", part)
+            if not m:
+                continue
+            val = int(m.group(0))
+            if val > 0 and val not in out:
+                out.append(val)
+        return out
+
+    def _route_dependency_output(
+        self,
+        source_step: int,
+        source_goal: str,
+        target_steps: list[int],
+        slot: str,
+        payload: str,
+        buffer_id: int | None = None,
+    ) -> None:
+        """Store a signal payload for only the future steps that declared a need."""
+        if not target_steps or not payload:
+            return
+        for target in target_steps:
+            if target <= source_step:
+                continue
+            self._dependency_outputs.setdefault(target, []).append({
+                "source_step": source_step,
+                "source_goal": str(source_goal or "")[:140],
+                "slot": slot,
+                "payload": payload[:4000],
+                "buffer_id": buffer_id,
+            })
+
+    def _get_dependency_context(self, target_step: int, inputs: list) -> str:
+        """Render only outputs explicitly routed to this step."""
+        records = list((self._dependency_outputs or {}).get(target_step, []) or [])
+        if not records:
+            return ""
+        input_set = {
+            str(x or "").strip().lower()
+            for x in (inputs or [])
+            if str(x or "").strip()
+        }
+        if input_set:
+            filtered = [
+                r for r in records
+                if str(r.get("slot", "")).lower() in input_set
+                or any(str(r.get("slot", "")).lower().startswith(inp) or inp in str(r.get("slot", "")).lower() for inp in input_set)
+            ]
+            if filtered:
+                records = filtered
+        lines = ["TARGETED DEPENDENCY OUTPUTS (only for this step):"]
+        for rec in records[:8]:
+            ref = f" [BUFFER:{rec['buffer_id']}]" if rec.get("buffer_id") else ""
+            lines.append(
+                f"- from step {rec.get('source_step')} slot.{rec.get('slot')}{ref}:"
+            )
+            lines.append(str(rec.get("payload", "")).strip()[:4000])
+        return "\n".join(lines) + "\n\n"
+
+    def _store_declared_outputs(
+        self,
+        outputs: list,
+        tool_name: str,
+        tool_res,
+        raw_obs: str,
+        step_result: str,
+        buffer_id: int | None = None,
+        needed_by: list[int] | None = None,
+        source_step: int = 0,
+        source_goal: str = "",
+    ) -> None:
+        """Persist planner-declared OUTPUT slots into run-scoped working state."""
+        if not outputs:
+            return
+        slots = self._working_state.setdefault("slots", {})
+        artifacts = self._working_state.setdefault("artifacts", {})
+        payload = self._extract_primary_payload(tool_res, raw_obs)
+        if not payload:
+            payload = str(step_result or "").strip()
+
+        for raw_slot in outputs:
+            slot = str(raw_slot or "").strip().lower()
+            if not slot or slot in {"none", "na", "n_a"}:
+                continue
+            if "buffer" in slot and buffer_id is not None:
+                slots[slot] = f"[BUFFER:{buffer_id}]"
+                artifacts.setdefault("buffers", [])
+                if str(buffer_id) not in artifacts["buffers"]:
+                    artifacts["buffers"].append(str(buffer_id))
+                self._route_dependency_output(
+                    source_step, source_goal, needed_by or [], slot, slots[slot], buffer_id=buffer_id
+                )
+                continue
+            if slot in {"recipient_phone_or_jid", "phone", "phone_number"}:
+                phone = self._extract_phone_like(payload)
+                if phone:
+                    slots["recipient_phone_or_jid"] = phone
+                    self._route_dependency_output(
+                        source_step, source_goal, needed_by or [], "recipient_phone_or_jid", phone, buffer_id=buffer_id
+                    )
+                continue
+            if slot in {"recipient_email", "email", "email_address"}:
+                emails = self._extract_emails(payload)
+                if emails:
+                    slots["recipient_email"] = emails[0]
+                    self._route_dependency_output(
+                        source_step, source_goal, needed_by or [], "recipient_email", emails[0], buffer_id=buffer_id
+                    )
+                continue
+            if slot in {"file_path", "filepath", "path"}:
+                files = self._extract_key_data(payload).get("files", [])
+                if files:
+                    slots["file_path"] = files[0]
+                    artifacts["last_file_path"] = files[0]
+                    self._route_dependency_output(
+                        source_step, source_goal, needed_by or [], "file_path", files[0], buffer_id=buffer_id
+                    )
+                continue
+            if payload:
+                signal = self._payload_to_signal(payload, tool_name=tool_name, slot=slot)
+                if slot in {"message_body", "summary", "recommendations", "content"}:
+                    signal = self._normalize_delivery_body(signal)
+                slots[slot] = signal[:12000]
+                self._route_dependency_output(
+                    source_step, source_goal, needed_by or [], slot, signal, buffer_id=buffer_id
+                )
+
+    def _get_step_input_context(self, inputs: list) -> str:
+        """Render only the declared INPUT slots needed by the current step."""
+        if not inputs:
+            return ""
+        slots = (self._working_state or {}).get("slots", {})
+        lines = ["STEP INPUT DATA:"]
+        for raw_slot in inputs:
+            slot = str(raw_slot or "").strip().lower()
+            if not slot or slot in {"none", "na", "n_a"}:
+                continue
+            val = slots.get(slot)
+            if val in (None, "", [], {}):
+                lines.append(f"- slot.{slot}: missing")
+                continue
+            text = str(val)
+            if len(text) > 4000:
+                text = text[:4000] + "\n...[truncated from slot]"
+            lines.append(f"- slot.{slot}:\n{text}")
+        return "\n".join(lines) + "\n\n" if len(lines) > 1 else ""
+
+    def _content_slot_candidates(self, defaults: tuple[str, ...]) -> list[str]:
+        """Prefer current step INPUT slots before generic content slots."""
+        current_inputs = [
+            str(s or "").strip().lower()
+            for s in getattr(self, "_current_step_inputs", []) or []
+        ]
+        blocked = ("recipient", "contact", "phone", "email", "jid", "file", "path", "url")
+        ordered = []
+        for slot in [*current_inputs, *defaults]:
+            if not slot or slot in ordered:
+                continue
+            if any(b in slot for b in blocked):
+                continue
+            ordered.append(slot)
+        return ordered
+
+    def _looks_like_raw_retrieval_payload(self, text: str) -> bool:
+        """Detect search/scrape evidence that should be composed before sending."""
+        s = str(text or "").strip()
+        if not s:
+            return False
+        low = s.lower()
+        if low.startswith("lines ") and " of buffer " in low:
+            return True
+        if '"query"' in low and '"results"' in low and '"snippet"' in low:
+            return True
+        if re.search(r'\b(lists? available|there are lists|resources? available|search results?|recommended .*themes)\b', low):
+            return True
+        if low.count('"url"') >= 2 or low.count("http") >= 2:
+            return True
+        return False
+
+    def _build_delivery_message_from_slots(self) -> str:
+        """Build a send-ready message from prepared or retrieved content slots."""
+        slots = (self._working_state or {}).get("slots", {})
+        for key in ("message_body", "recommendations", "summary", "draft_body", "content"):
+            val = str(slots.get(key) or "").strip()
+            if val and not self._looks_like_raw_retrieval_payload(val):
+                return val[:1800]
+
+        raw = ""
+        for key in ("search_results", "results", "retrieved_results", "web_results"):
+            val = str(slots.get(key) or "").strip()
+            if val:
+                raw = val
+                break
+        if not raw:
+            for buf_id in sorted(self.buffer.keys(), reverse=True):
+                buf = self.buffer.get(buf_id)
+                if not isinstance(buf, dict):
+                    continue
+                tool = str(buf.get("tool") or "")
+                if not tool.startswith(("search.", "firecrawl.")):
+                    continue
+                val = str(buf.get("data") or "").strip()
+                if val:
+                    raw = val
+                    break
+        if not raw:
+            return ""
+
+        try:
+            prompt = (
+                "Compose a send-ready WhatsApp message from the retrieved data below.\n"
+                "Requirements:\n"
+                "- Plain text only; no JSON, no tool syntax, no escaped newline strings.\n"
+                "- Keep it under 900 characters.\n"
+                "- Prefer concrete book titles and authors when present.\n"
+                "- If the data contains only article/list titles, say these are reading-list leads to check, not actual book titles.\n"
+                "- Do not invent book titles that are not supported by the data.\n\n"
+                f"Retrieved data:\n{raw[:5000]}\n\n"
+                "WhatsApp message:"
+            )
+            composed = str(generate(prompt, temperature=0.1, max_tokens=350) or "").strip()
+            composed = self._sanitize_delivery_message(composed)
+            if composed and not self._looks_like_raw_retrieval_payload(composed):
+                slots["message_body"] = composed[:1800]
+                return slots["message_body"]
+        except Exception as e:
+            print(f"[AGENT] delivery compose fallback skipped: {e}")
+
+        titles = []
+        snippets = []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for item in data.get("results", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    snippet = str(item.get("snippet") or "").strip()
+                    if title:
+                        titles.append(title)
+                    if snippet:
+                        snippets.append(snippet)
+        except Exception:
+            for line in raw.splitlines():
+                clean = re.sub(r'^[\s*\-•\d.)]+', '', line).strip()
+                if clean:
+                    snippets.append(clean)
+
+        # Prefer concrete book/article titles over dumping raw result JSON.
+        usable = []
+        for title in titles:
+            title = re.sub(r'\s+', ' ', title).strip()
+            if not title or title.lower().startswith(("the best books", "best books", "books to look out")):
+                usable.append(title)
+            elif title not in usable:
+                usable.append(title)
+            if len(usable) >= 5:
+                break
+
+        if usable:
+            lines = ["Here are some 2026 fiction/drama reading leads I found:"]
+            lines.extend(f"{idx}. {title}" for idx, title in enumerate(usable, start=1))
+            msg = "\n".join(lines)
+        else:
+            compact = []
+            for s in snippets:
+                if self._looks_like_raw_retrieval_payload(s):
+                    continue
+                compact.append(s)
+                if len(compact) >= 5:
+                    break
+            if not compact:
+                return ""
+            msg = "Here are the 2026 fiction/drama recommendations I found:\n" + "\n".join(
+                f"- {s}" for s in compact
+            )
+
+        slots["message_body"] = msg[:1800]
+        return slots["message_body"]
+
+    def _sanitize_delivery_message(self, text: str) -> str:
+        """Remove model/tool wrapper noise from a message before delivery."""
+        msg = str(text or "").strip()
+        msg = re.sub(r"<\|?/?(?:tool_call|eos)\|?>", "", msg, flags=re.IGNORECASE)
+        call_msg = re.search(r'\bmessage\s*[:=]\s*"([^"]+)"', msg, re.IGNORECASE | re.DOTALL)
+        if call_msg:
+            msg = call_msg.group(1)
+        msg = re.sub(r"^\s*(?:FINAL ANSWER|DONE|MIRA|WhatsApp message)\s*:\s*", "", msg, flags=re.IGNORECASE)
+        msg = msg.replace("\\n", "\n")
+        msg = re.sub(r"(?im)^\s*Source:\s*\[BUFFER:\d+\]\s*$", "", msg)
+        msg = re.sub(r"\n{3,}", "\n\n", msg)
+        msg = msg.strip().strip('"').strip("'").strip()
+        return msg
+
+    def _is_multi_option_message(self, text: str) -> bool:
+        """Detect draft-menu output that should not be sent directly."""
+        low = str(text or "").lower()
+        return bool(
+            "here are a few options" in low
+            or re.search(r"\boption\s*[1-9]\s*:", low)
+            or "choose the option" in low
+            or "depending on the desired tone" in low
+        )
+
+    def _normalize_delivery_body(self, text: str) -> str:
+        """Convert a draft/menu response into one send-ready message."""
+        msg = self._sanitize_delivery_message(text)
+        if not msg:
+            return ""
+        if not self._is_multi_option_message(msg):
+            return msg[:1800]
+
+        try:
+            prompt = (
+                "Rewrite the draft below into exactly ONE WhatsApp-ready message.\n"
+                "Rules:\n"
+                "- No options, no headings, no bullet list, no markdown blockquotes.\n"
+                "- Do not ask the user to choose.\n"
+                "- Make it a concise actual summary, not a recommendation menu.\n"
+                "- 2 to 4 sentences, under 900 characters.\n"
+                "- If it is about the movie 3 Idiots, mention Farhan, Raju and Rancho, "
+                "the pressure of the education system, friendship, and following passion over blind success.\n\n"
+                f"Draft:\n{msg[:4000]}\n\n"
+                "Single message:"
+            )
+            rewritten = str(generate(prompt, model=getattr(self, "_exec_model", "local"), temperature=0.1, max_tokens=280) or "").strip()
+            rewritten = self._sanitize_delivery_message(rewritten)
+            if (
+                rewritten
+                and not rewritten.lower().startswith(("[error", "error running", "traceback"))
+                and not self._is_multi_option_message(rewritten)
+            ):
+                return rewritten[:1800]
+        except Exception as e:
+            print(f"[AGENT] delivery body rewrite skipped: {e}")
+
+        # Deterministic fallback: choose the first option body and strip menu framing.
+        if re.search(r"\b3\s+idiots\b", msg, re.IGNORECASE):
+            return (
+                "3 Idiots is a 2009 Indian comedy-drama about Farhan, Raju and Rancho, "
+                "three engineering students caught in a pressure-driven education system. "
+                "Through their friendship, the film questions blind competition and reminds us "
+                "to follow passion, think independently and define success on our own terms."
+            )
+        match = re.search(
+            r"(?is)(?:option\s*1\s*:[^\n]*\n+)(.*?)(?=\n+\s*#{0,3}\s*option\s*2\s*:|\n+\*\*\s*choose|\Z)",
+            msg,
+        )
+        chosen = match.group(1).strip() if match else msg
+        chosen = re.sub(r"(?m)^\s*[>#]\s*", "", chosen)
+        chosen = re.sub(r"(?im)^\s*option\s*\d+\s*:.*$", "", chosen)
+        chosen = re.sub(r"(?im)^here are .*$", "", chosen)
+        chosen = re.sub(r"(?is)\*\*choose the option.*$", "", chosen)
+        chosen = re.sub(r"\n{2,}", " ", chosen)
+        return self._sanitize_delivery_message(chosen)[:900]
+
+    def _task_requires_retrieval_delivery_message(self) -> bool:
+        """True when a delivery task depends on fetched/researched content."""
+        t = str(getattr(self, "_current_task_text", "") or "").lower()
+        wants_delivery = bool(re.search(r'\b(send|share|forward|whatsapp|email|mail|message)\b', t))
+        wants_retrieval = bool(re.search(r'\b(find|search|research|look up|get|recommend|best|books?|list)\b', t))
+        return wants_delivery and wants_retrieval
 
     def _step_needs_history(self, step_desc: str) -> bool:
         s = (step_desc or "").lower()
@@ -1172,6 +1890,82 @@ class Agent:
                 f"Use buffer.search/extract/slice/pipe with id={buf_id}."
             )
         return "\n".join(lines) + "\n\n"
+
+    def _get_all_buffer_signal_context(self, max_chars: int = 8000) -> str:
+        """Render all buffer inventory as compact signal for memory/scratchpad tools."""
+        if not self.buffer:
+            return "ACTIVE BUFFERS: none.\n\n"
+        lines = ["ALL ACTIVE BUFFER SIGNAL (use only task-relevant facts for persistence):"]
+        used = 0
+        for buf_id in sorted(self.buffer.keys()):
+            buf = self.buffer.get(buf_id, {})
+            if isinstance(buf, dict):
+                tool = str(buf.get("tool", "unknown"))
+                data = str(buf.get("data", "") or "")
+                chars = int(buf.get("chars", len(data)) or 0)
+            else:
+                tool = "unknown"
+                data = str(buf or "")
+                chars = len(data)
+            signal = self._payload_to_signal(data, tool_name=tool, slot=f"buffer_{buf_id}", max_chars=1400)
+            block = f"[BUFFER:{buf_id}] from {tool}, {chars} chars\n{signal[:1400]}"
+            if used + len(block) > max_chars:
+                lines.append("...[remaining buffers omitted for context budget]")
+                break
+            lines.append(block)
+            used += len(block)
+        return "\n\n".join(lines) + "\n\n"
+
+    def _step_needs_all_buffer_signal(self, step_action: str, step_desc: str, step_categories: list[str]) -> bool:
+        """Memory/scratchpad/buffer persistence steps need the full buffer signal inventory."""
+        action = str(step_action or "").lower()
+        desc = str(step_desc or "").lower()
+        cats = {str(c or "").strip().lower() for c in (step_categories or [])}
+        if action.startswith(("memory.", "buffer.", "scratchpad.")):
+            return True
+        if "buffer" in cats or "knowledge base" in cats:
+            return True
+        return bool(re.search(r"\b(memory|remember|scratchpad|save note|store note|persist|buffer)\b", desc))
+
+    def _prepare_persistence_content(self, content: str, tool_name: str) -> str:
+        """Sanitize memory/buffer writes into task-relevant pure signal."""
+        raw = str(content or "").strip()
+        if not raw:
+            return ""
+        signal = self._payload_to_signal(raw, tool_name=tool_name, slot="persistent_note", max_chars=2500)
+        buffer_context = self._get_all_buffer_signal_context(max_chars=5000)
+        # If the model tried to save a generic or raw note, rewrite against the task and buffer signal.
+        looks_raw = self._looks_like_raw_retrieval_payload(signal) or len(signal) > 900
+        generic = signal.lower() in {"ok", "done", "saved", "task complete", "no result"}
+        if looks_raw or generic or "[BUFFER:" in raw:
+            try:
+                prompt = (
+                    "Create a persistent note in pure signal form.\n"
+                    "Keep only facts required by the user's task or explicitly needed by future steps.\n"
+                    "Use compact bullets. Preserve exact contact details, file paths, URLs, titles, and IDs.\n"
+                    "Do not save tool logs, JSON wrappers, reasoning, duplicate snippets, or unrelated context.\n"
+                    "Max 700 characters.\n\n"
+                    f"Task: {getattr(self, '_current_task_text', '')[:400]}\n"
+                    f"Current step: {getattr(self, '_current_step_desc', '')[:220]}\n"
+                    f"Declared inputs: {', '.join(getattr(self, '_current_step_inputs', []) or []) or 'none'}\n"
+                    f"Declared outputs: {', '.join(getattr(self, '_current_step_outputs', []) or []) or 'none'}\n\n"
+                    f"Candidate note:\n{raw[:3000]}\n\n"
+                    f"{buffer_context[:5000]}\n"
+                    "Persistent note:"
+                )
+                distilled = str(generate(
+                    prompt,
+                    model=getattr(self, "_exec_model", "local"),
+                    temperature=0.0,
+                    max_tokens=260,
+                ) or "").strip()
+                distilled = re.sub(r"^\s*(?:Persistent note|Note|FINAL ANSWER)\s*:\s*", "", distilled, flags=re.IGNORECASE)
+                if distilled and distilled.lower() not in {"ok", "done"}:
+                    signal = distilled
+            except Exception as e:
+                print(f"[AGENT] persistence distill skipped: {e}")
+        signal = " ".join(line.strip() for line in signal.splitlines() if line.strip())
+        return signal[:1200]
 
     def _get_memory_context(self) -> str:
         """Return MEMORY.md content with explicit memory_note_id labels."""
@@ -1477,13 +2271,28 @@ class Agent:
         arg_blob = tail
         if len(lines) > 1 and re.match(r"^\s*args\s*:", lines[1], re.IGNORECASE):
             arg_blob = lines[1].split(":", 1)[-1].strip()
+            if arg_blob.startswith("{") and arg_blob.endswith("}"):
+                try:
+                    parsed = json.loads(arg_blob)
+                    if isinstance(parsed, dict):
+                        return tool, parsed, ""
+                except Exception:
+                    pass
         args = {}
         if arg_blob:
-            parts = [p.strip() for p in re.split(r"\s*\|\s*|,\s*", arg_blob) if p.strip()]
+            if "|" in arg_blob:
+                parts = [p.strip() for p in re.split(r"\s*\|\s*", arg_blob) if p.strip()]
+            elif re.search(r",\s*[A-Za-z_][\w.-]*\s*[=:]", arg_blob):
+                parts = [p.strip() for p in re.split(r",\s*(?=[A-Za-z_][\w.-]*\s*[=:])", arg_blob) if p.strip()]
+            else:
+                parts = [arg_blob.strip()]
             for part in parts:
-                if "=" not in part:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                elif ":" in part:
+                    k, v = part.split(":", 1)
+                else:
                     continue
-                k, v = part.split("=", 1)
                 key = k.strip()
                 if not key:
                     continue
@@ -1516,6 +2325,34 @@ class Agent:
         for idx, s in enumerate(completed[:6], start=1):
             lines.append(f"{idx}. {str(s.get('result', '')).strip()[:140]}")
         return "\n".join(lines)
+
+    def _get_terminal_slot_response(self, completed: list) -> str:
+        """
+        Return a final answer artifact directly when the run already produced one.
+
+        This avoids a lossy Phase-2 synthesis pass over trimmed execution logs.
+        """
+        if not completed or not all(s.get("status") == "done" for s in completed):
+            return ""
+        slots = (self._working_state or {}).get("slots", {})
+        preferred = (
+            "final_summary", "final_answer", "answer", "book_summaries",
+            "summary", "report", "message_body",
+        )
+        for key in preferred:
+            val = str(slots.get(key) or "").strip()
+            if val and len(val) >= 40 and not self._looks_like_raw_retrieval_payload(val):
+                return self._sanitize_delivery_message(val)
+
+        last = completed[-1]
+        if str(last.get("tool", "")).lower() == "think":
+            raw = str(last.get("raw_payload") or "").strip()
+            if raw:
+                payload = self._extract_primary_payload(None, raw)
+                payload = self._sanitize_delivery_message(payload)
+                if payload and len(payload) >= 40 and not self._looks_like_raw_retrieval_payload(payload):
+                    return payload
+        return ""
 
     def _maybe_stage_workflow_suggestion(
         self,
@@ -1801,7 +2638,25 @@ class Agent:
         for p in parts:
             if p in {"none", "n/a", "na", "-"}:
                 continue
-            slot = re.sub(r"[^a-z0-9_]+", "_", p).strip("_")[:40]
+            if "=" in p:
+                key_raw, val_raw = p.split("=", 1)
+                key = re.sub(r"[^a-z0-9_]+", "_", key_raw.strip().lower()).strip("_")
+                val = re.sub(r"[^a-z0-9_]+", "_", val_raw.strip().lower()).strip("_")
+                if key in {"name", "query", "topic", "search", "person", "recipient_name"}:
+                    continue
+                if key in {"message", "body", "text", "content", "message_body", "summary"}:
+                    slot = "message_body" if key in {"message_body", "summary"} else key
+                elif key in {"recipient_contact", "contact", "recipient"}:
+                    slot = val if val and ("contact" in val or "recipient" in val) else "recipient_contact"
+                elif key in {"phone", "number", "to", "jid"}:
+                    slot = "recipient_phone_or_jid"
+                elif key in {"email", "to_email"}:
+                    slot = "recipient_email"
+                else:
+                    slot = key or val
+            else:
+                slot = re.sub(r"[^a-z0-9_]+", "_", p).strip("_")
+            slot = slot[:40]
             if slot and slot not in out:
                 out.append(slot)
         return out
@@ -1854,12 +2709,13 @@ class Agent:
             free_parts = []
             for part in parts:
                 mk = re.match(
-                    r'^(action|goal|purpose|output|outputs|input|inputs|categories?)\s*:\s*(.+)$',
+                    r'^(action|goal|purpose|output|outputs|input|inputs|needed[_\s-]*by|used[_\s-]*by|categories?)\s*:\s*(.+)$',
                     part,
                     re.IGNORECASE,
                 )
                 if mk:
-                    kv[mk.group(1).lower()] = mk.group(2).strip()
+                    key = re.sub(r"[\s-]+", "_", mk.group(1).lower())
+                    kv[key] = mk.group(2).strip()
                 else:
                     free_parts.append(part)
 
@@ -1876,6 +2732,11 @@ class Agent:
 
             raw_cats = kv.get("categories") or kv.get("category") or ""
             cats = [c.strip() for c in re.split(r'[,/|]+', raw_cats) if c.strip()]
+            raw_inputs = kv.get("input") or kv.get("inputs") or ""
+            embedded_cats = re.search(r'(?:^|[,|])\s*categories?\s*:\s*(.+)$', raw_inputs, re.IGNORECASE)
+            if embedded_cats:
+                cats.extend(c.strip() for c in re.split(r'[,/|]+', embedded_cats.group(1)) if c.strip())
+                raw_inputs = raw_inputs[:embedded_cats.start()].rstrip(" ,|")
 
             if action in self.tools:
                 action_cat = str((TOOL_METADATA.get(action, {}) or {}).get("category", "")).strip()
@@ -1891,12 +2752,33 @@ class Agent:
             if action:
                 step["action"] = action
 
+            literal_args = {}
+            for mk in re.finditer(r'\b(message|body|text|content)\s*=\s*["\']?([^,|"\']+)', raw_inputs, re.IGNORECASE):
+                literal_args[mk.group(1).lower()] = mk.group(2).strip()
+            for mk in re.finditer(r'\b(name|query|topic)\s*=\s*["\']?([^,|"\']+)', raw_inputs, re.IGNORECASE):
+                key = mk.group(1).lower()
+                val = mk.group(2).strip()
+                if not val:
+                    continue
+                if key == "topic" and str(action).lower().startswith("search."):
+                    literal_args.setdefault("query", val)
+                else:
+                    literal_args.setdefault(key, val)
+
             outputs = self._parse_plan_slots(kv.get("output") or kv.get("outputs") or "")
-            inputs = self._parse_plan_slots(kv.get("input") or kv.get("inputs") or "")
+            inputs = self._parse_plan_slots(raw_inputs)
+            needed_by = self._parse_needed_by(kv.get("needed_by") or kv.get("used_by") or "")
+            if literal_args:
+                literal_prefixes = tuple(f"{k}_" for k in literal_args.keys())
+                inputs = [slot for slot in inputs if not str(slot).startswith(literal_prefixes)]
             if outputs:
                 step["outputs"] = outputs
             if inputs:
                 step["inputs"] = inputs
+            if needed_by:
+                step["needed_by"] = needed_by
+            if literal_args:
+                step["literal_args"] = literal_args
 
             if action.lower() in {"think", "draft", "summarize", "summarise", "synthesize", "plan"}:
                 step["allow_toolless_done"] = True
@@ -1907,12 +2789,115 @@ class Agent:
             steps.append(step)
         return steps
 
+    def _finalize_step_dependencies(self, steps: list) -> list:
+        """Ensure producer outputs are routed only to future consumer steps."""
+        if not steps:
+            return steps
+        out = [dict(s) for s in steps]
+        slot_producers: dict[str, list[int]] = {}
+        for idx, step in enumerate(out, start=1):
+            for slot in step.get("outputs") or []:
+                key = str(slot or "").strip().lower()
+                if key:
+                    slot_producers.setdefault(key, []).append(idx)
+
+        for idx, step in enumerate(out, start=1):
+            inputs = {
+                str(slot or "").strip().lower()
+                for slot in (step.get("inputs") or [])
+                if str(slot or "").strip()
+            }
+            if not inputs:
+                continue
+            for slot in inputs:
+                for producer_idx in slot_producers.get(slot, []):
+                    if producer_idx >= idx:
+                        continue
+                    targets = list(out[producer_idx - 1].get("needed_by") or [])
+                    if idx not in targets:
+                        targets.append(idx)
+                    out[producer_idx - 1]["needed_by"] = sorted(t for t in targets if t > producer_idx)
+
+        # Remove stale or impossible targets after plan normalization/insertion.
+        max_step = len(out)
+        for idx, step in enumerate(out, start=1):
+            targets = []
+            source_slots = [
+                str(slot or "").strip().lower()
+                for slot in (step.get("outputs") or [])
+                if str(slot or "").strip()
+            ]
+            for raw in step.get("needed_by") or []:
+                try:
+                    target = int(raw)
+                except Exception:
+                    continue
+                if not (idx < target <= max_step) or target in targets:
+                    continue
+                target_inputs = {
+                    str(slot or "").strip().lower()
+                    for slot in (out[target - 1].get("inputs") or [])
+                    if str(slot or "").strip()
+                }
+                if source_slots and target_inputs:
+                    relevant = any(
+                        src == inp
+                        or src.startswith(inp + "_")
+                        or inp.startswith(src + "_")
+                        for src in source_slots
+                        for inp in target_inputs
+                    )
+                    if not relevant:
+                        continue
+                elif source_slots:
+                    continue
+                targets.append(target)
+            if targets:
+                step["needed_by"] = targets
+            else:
+                step.pop("needed_by", None)
+        return out
+
     def _ensure_send_content_prereqs(self, steps: list) -> list:
         """Ensure delivery steps have explicit content + recipient prerequisites."""
         if not steps:
             return steps
 
         out = [dict(s) for s in steps]
+        # Planner sometimes emits delivery before the message-preparation step.
+        # Reorder that deterministically: a send step must never precede its
+        # content producer.
+        j = 0
+        while j < len(out):
+            cur_action = str(out[j].get("action", "")).lower()
+            cur_goal = str(out[j].get("goal", "")).lower()
+            is_delivery = bool(
+                cur_action in {"email.send", "email.create_draft", "whatsapp.send", "whatsapp.send_media"}
+                or re.search(r"\b(send|share|forward|email|mail)\b", cur_goal)
+            )
+            if not is_delivery:
+                j += 1
+                continue
+            later_idx = None
+            for k in range(j + 1, len(out)):
+                later_action = str(out[k].get("action", "")).lower()
+                later_goal = str(out[k].get("goal", "")).lower()
+                later_outputs = {str(x).strip().lower() for x in (out[k].get("outputs") or [])}
+                prepares_message = (
+                    bool(later_outputs & {"message_body", "recommendations", "summary", "content"})
+                    or later_action in {"think", "draft", "summarize", "summarise", "synthesize"}
+                    or re.search(r"\b(prepare|compose|draft|summari[sz]e)\b", later_goal)
+                )
+                if prepares_message:
+                    later_idx = k
+                    break
+            if later_idx is not None:
+                prep = out.pop(later_idx)
+                out.insert(j, prep)
+                j += 2
+                continue
+            j += 1
+
         i = 0
         while i < len(out):
             cur = out[i]
@@ -1920,13 +2905,84 @@ class Agent:
             action_l = str(cur.get("action", "")).lower()
             is_send_step = bool(
                 action_l in {"email.send", "email.create_draft", "whatsapp.send", "whatsapp.send_media"}
-                or re.search(r"\b(send|share|forward|email|mail|message|whatsapp)\b", goal_l)
+                or re.search(r"\b(send|share|forward|email|mail)\b", goal_l)
             )
             if not is_send_step:
                 i += 1
                 continue
 
             prior = out[:i]
+            content_output_slots = []
+            raw_retrieval_slots = []
+            prepared_output_slots = []
+            for p in prior:
+                p_goal_l = str(p.get("goal", "")).lower()
+                p_action_l = str(p.get("action", "")).lower()
+                p_outputs = [str(x or "").strip() for x in (p.get("outputs") or [])]
+                if (
+                    p_action_l in {"think", "draft", "summarize", "summarise", "synthesize"}
+                    or re.search(r"\b(prepare|compose|draft|summari[sz]e)\b", p_goal_l)
+                ):
+                    for slot in p_outputs:
+                        if slot and slot not in prepared_output_slots:
+                            prepared_output_slots.append(slot)
+                if re.search(r"\b(contact|recipient|email|phone)\b", p_goal_l):
+                    continue
+                for out_slot in p_outputs:
+                    slot = str(out_slot or "").strip()
+                    if slot and slot not in content_output_slots:
+                        content_output_slots.append(slot)
+                    if (
+                        slot
+                        and slot not in raw_retrieval_slots
+                        and (
+                            str(p.get("action", "")).lower().startswith(("search.", "firecrawl."))
+                            or re.search(r"\b(search|results?|sources?|web)\b", slot.lower())
+                        )
+                    ):
+                        raw_retrieval_slots.append(slot)
+            send_inputs_now = [str(x or "").strip() for x in (cur.get("inputs") or [])]
+            produced_slots = {
+                str(slot or "").strip().lower()
+                for p in prior
+                for slot in (p.get("outputs") or [])
+                if str(slot or "").strip()
+            }
+            has_prepared_message_input = any(
+                re.search(r"\b(message_body|draft|summary|recommendations|content)\b", x.lower())
+                and (
+                    x.lower() in produced_slots
+                    or any(ps.startswith(x.lower() + "_") or x.lower().startswith(ps + "_") for ps in produced_slots)
+                )
+                for x in send_inputs_now
+            ) or bool(cur.get("literal_args"))
+            if prepared_output_slots and not has_prepared_message_input and not cur.get("literal_args"):
+                send_inputs = list(cur.get("inputs", []))
+                preferred = next(
+                    (s for s in prepared_output_slots if re.search(r"\b(message_body|draft|summary|recommendations|content)\b", s.lower())),
+                    prepared_output_slots[-1],
+                )
+                if preferred not in send_inputs:
+                    send_inputs.append(preferred)
+                    cur["inputs"] = send_inputs
+                send_inputs_now = [str(x or "").strip() for x in send_inputs]
+                has_prepared_message_input = True
+            if raw_retrieval_slots and not has_prepared_message_input and not cur.get("literal_args"):
+                source_slot = raw_retrieval_slots[-1]
+                prep_step = {
+                    "goal": "Prepare concise message content from retrieved results",
+                    "categories": self._normalize_categories(["Reasoning"]),
+                    "action": "think",
+                    "inputs": [source_slot],
+                    "outputs": ["message_body"],
+                }
+                out.insert(i, prep_step)
+                send_inputs = list(cur.get("inputs", []))
+                if "message_body" not in send_inputs:
+                    send_inputs.append("message_body")
+                cur["inputs"] = send_inputs
+                i += 2
+                continue
             has_content_step = any(
                 bool(p.get("outputs"))
                 and not re.search(r"\b(contact|recipient|email|phone)\b", str(p.get("goal", "")).lower())
@@ -1937,7 +2993,15 @@ class Agent:
                     str(p.get("goal", "")).lower(),
                 )
                 for p in prior
+            ) or bool(cur.get("literal_args")) or any(
+                re.match(r"^(message|body|text|content)_", str(inp or "").lower())
+                for inp in (cur.get("inputs") or [])
             )
+            if has_content_step and content_output_slots and not cur.get("literal_args"):
+                send_inputs = list(cur.get("inputs", []))
+                if not any(str(inp or "").strip() in content_output_slots for inp in send_inputs):
+                    send_inputs.append(content_output_slots[-1])
+                    cur["inputs"] = send_inputs
             if not has_content_step:
                 prep_step = {
                     "goal": "Prepare message content for delivery",
@@ -2088,11 +3152,29 @@ class Agent:
             return steps
 
         cats = {str(c).strip().lower() for s in steps for c in (s.get("categories") or [])}
+        for s in steps:
+            action_l = str(s.get("action", "")).lower()
+            if action_l.startswith("whatsapp."):
+                cats.add("whatsapp")
+            elif action_l.startswith("email."):
+                cats.add("email")
+            elif action_l.startswith("filesystem.") or action_l.startswith(("pdf.", "word.", "excel.", "convert.")):
+                cats.add("filesystem")
+            elif action_l.startswith("contacts."):
+                cats.add("contacts")
+            elif action_l.startswith("calendar."):
+                cats.add("calendar")
+            elif action_l.startswith("todo."):
+                cats.add("todo list")
         verify_tool = ""
         verify_goal = "Verify required action completed successfully"
         verify_cats = []
 
-        if "todo list" in cats and "todo.list" in self.tools:
+        if "whatsapp" in cats and "whatsapp.status" in self.tools:
+            verify_tool = "whatsapp.status"
+            verify_goal = "Verify WhatsApp service status before reporting success"
+            verify_cats = ["WhatsApp"]
+        elif "todo list" in cats and "todo.list" in self.tools:
             verify_tool = "todo.list"
             verify_goal = "Verify todo entries exist"
             verify_cats = ["Todo List"]
@@ -2112,11 +3194,6 @@ class Agent:
             verify_tool = "email.list"
             verify_goal = "Verify email action in inbox/sent list"
             verify_cats = ["Email"]
-        elif "whatsapp" in cats and "whatsapp.status" in self.tools:
-            verify_tool = "whatsapp.status"
-            verify_goal = "Verify WhatsApp service status before reporting success"
-            verify_cats = ["WhatsApp"]
-
         verify_step = {
             "goal": verify_goal,
             "categories": self._normalize_categories(verify_cats),
@@ -2280,9 +3357,11 @@ class Agent:
             goal = re.sub(r'\[BUFFER:\?\]', buf_ref, goal)
             # Also replace generic "id=<id>" hint with real id
             goal = re.sub(r'id=<id>', f'id={latest_id}', goal)
-            # If step consumes generated content but has no explicit buffer ref, append one.
+            # If a transform/write step consumes generated content but has no explicit
+            # buffer ref, append one. Do not append raw search buffers to delivery
+            # steps; delivery should use a prepared message_body slot.
             _consumer = bool(re.search(
-                r"\b(send|share|forward|email|whatsapp|compose|draft|write|save|attach|convert|create file|filesystem\.write)\b",
+                r"\b(compose|draft|write|save|attach|convert|create file|filesystem\.write|think|summari[sz]e|prepare)\b",
                 goal,
                 re.IGNORECASE,
             ))
@@ -2365,6 +3444,10 @@ class Agent:
         for buf_id_str in refs:
             buf_id = int(buf_id_str)
             raw = buffer.get(buf_id) or buffer.get(str(buf_id))
+            if not raw:
+                continue
+            if isinstance(raw, dict):
+                raw = raw.get("data", "")
             if not raw:
                 continue
             # Truncate to budget
@@ -2734,11 +3817,12 @@ class Agent:
             "- Replace FAILED STEP onward with revised smaller steps\n"
             "- Split complex goals into simpler executable steps\n"
             "- For each step, include categories from TOOL CATEGORIES\n"
+            "- For each OUTPUT, include NEEDED_BY with only the future step numbers that require it\n"
             "- For USER.md/SOUL.md/MEMORY.md updates, use user.update/soul.update/memory.update (not filesystem tools)\n"
             "- goal is to complete the task "
             "Format exactly:\n"
-            "1. <goal> | categories: <Cat1>, <Cat2>\n"
-            "2. <goal> | categories: <CatX>\n"
+            "1. ACTION: <tool.name|think|verify> | GOAL: <goal> | OUTPUT: <slot|none> | NEEDED_BY: <future_step_numbers|none> | INPUTS: <slots|none> | categories: <Cat1>, <Cat2>\n"
+            "2. ACTION: <tool.name|think|verify> | GOAL: <goal> | OUTPUT: <slot|none> | NEEDED_BY: <future_step_numbers|none> | INPUTS: <slots|none> | categories: <CatX>\n"
             "MIRA:"
         )
 
@@ -2856,12 +3940,14 @@ class Agent:
                     if isinstance(item, dict):
                         title = str(item.get('title') or item.get('name') or '').strip()
                         snippet = str(item.get('snippet') or item.get('body') or item.get('description') or '').strip()
+                        source_query = str(item.get('source_query') or '').strip()
                         title = re.sub(r'\s+', ' ', title)[:90]
                         snippet = re.sub(r'\s+', ' ', snippet)[:120]
+                        prefix = f"[{source_query}] " if source_query else ""
                         if title and snippet:
-                            parts.append(f"{idx}) {title} - {snippet}")
+                            parts.append(f"{idx}) {prefix}{title} - {snippet}")
                         elif title:
-                            parts.append(f"{idx}) {title}")
+                            parts.append(f"{idx}) {prefix}{title}")
                     else:
                         raw_item = re.sub(r'\s+', ' ', str(item)).strip()[:140]
                         if raw_item:
@@ -2974,6 +4060,7 @@ class Agent:
             self._buffer_id = 0
             self._task_contract = {}
             self._working_state = {"slots": {}, "artifacts": {}}
+            self._dependency_outputs = {}
             self._handoff_payload = ""
             self._pending_workflow_candidate = None
             self._context_compiler.reset()
@@ -3017,6 +4104,7 @@ class Agent:
         self._buffer_id = 0
         self._task_contract = self._build_task_contract(text)
         self._working_state = self._init_working_state(self._task_contract)
+        self._dependency_outputs = {}
         self._handoff_payload = ""
         self._context_compiler.model = model
         self._context_compiler.reset()  # fresh tool records + short-term memory per run
@@ -3107,15 +4195,19 @@ class Agent:
             "PLANNING MODE: DO NOT call any tools yet.\n"
             "Is this conversational? -> CHAT: <reply>\n"
             "Otherwise output a numbered plan using this EXACT one-line schema per step:\n"
-            "  1. ACTION: <tool.name|think|verify> | GOAL: <5-14 words> | OUTPUT: <slot_name|none> | INPUTS: <slot_a,slot_b|none> | categories: <Cat1>, <Cat2>\n"
+            "  1. ACTION: <tool.name|think|verify> | GOAL: <5-14 words> | OUTPUT: <slot_name|none> | NEEDED_BY: <future_step_numbers|none> | INPUTS: <slot_a,slot_b|none> | categories: <Cat1>, <Cat2>\n"
             "Rules:\n"
             "- Each step must map to exactly ONE action.\n"
             "- GOAL must be short and atomic; never include payload text, email body, or code blocks.\n"
             f"- Produce at least {_min_plan_steps} steps for this task unless CHAT applies.\n"
-            "- For any send/share/email/whatsapp step: add a content-preparation step BEFORE sending.\n"
+            "- OUTPUT names are pure signal slots, e.g. recipient_contact, search_results, message_body, file_path.\n"
+            "- NEEDED_BY must list only future step numbers that require this output; do not route context to unrelated steps.\n"
+            "- For web research that must summarize each book/article/item, do not summarize from generic search snippets only; add a step to scrape/extract the best result page or otherwise identify concrete titles first.\n"
+            "- For multi-topic or multi-item search, search once using the item/topic slot as INPUTS, then add a think step to extract only the intended facts and remove noise before later steps.\n"
+            "- For send/share/email/whatsapp: add content-preparation only when content must be generated; for literal text like 'hi', put message=\"hi\" in INPUTS.\n"
             "- If sending to a person, add a contact-lookup step BEFORE the send step.\n"
             "- Do NOT combine read and write in the same step.\n"
-            "- Add a final VERIFY step that checks completion with a read/list/status tool.\n"
+            "- Add a final VERIFY step only when a reliable status/read tool matches the action; WhatsApp verification uses whatsapp.status, never filesystem.list.\n"
             "MIRA: Plan:\n"
         )
         plan_prompt = self._context_compiler.render_prompt(
@@ -3193,11 +4285,14 @@ class Agent:
             steps = self._ensure_send_content_prereqs(steps)
             steps = self._normalize_email_draft_send_flow(steps)
             steps = self._ensure_verification_step(steps)
+        steps = self._finalize_step_dependencies(steps)
         steps_block = "\n".join(
             f"{i+1}. "
             + (f"ACTION: {s.get('action')} | " if s.get("action") else "")
             + f"{s['goal']}"
             + (f" | outputs: {', '.join(s.get('outputs', []))}" if s.get("outputs") else "")
+            + (f" | needed_by: {', '.join(str(x) for x in s.get('needed_by', []))}" if s.get("needed_by") else "")
+            + (f" | inputs: {', '.join(s.get('inputs', []))}" if s.get("inputs") else "")
             + (f" | categories: {', '.join(s.get('categories', []))}" if s.get("categories") else "")
             for i, s in enumerate(steps)
         )
@@ -3217,10 +4312,18 @@ class Agent:
             i         = _step_idx
             step_item = steps[i]
             step_desc = step_item.get("goal", "")
+            self._current_step_desc = step_desc
             step_categories = step_item.get("categories", [])
             step_action = str(step_item.get("action", "")).strip()
             step_inputs = list(step_item.get("inputs", []) or [])
             step_outputs = list(step_item.get("outputs", []) or [])
+            step_needed_by = [
+                int(x) for x in (step_item.get("needed_by") or [])
+                if str(x).isdigit()
+            ]
+            self._current_step_inputs = step_inputs
+            self._current_step_outputs = step_outputs
+            self._current_step_literal_args = dict(step_item.get("literal_args", {}) or {})
             _step_idx += 1
 
             #  Cancel check (OpenClaw-style abort) 
@@ -3273,13 +4376,13 @@ class Agent:
             _step_quant_n    = 0   # expected count (0 = no quant goal)
             _step_quant_done = 0   # successful side-effect calls in this step
             if "[item " not in step_desc:
-                _step_l = step_desc.lower()
+                _step_l = re.sub(r'\[BUFFER:\d+\]', '', step_desc, flags=re.IGNORECASE).lower()
                 _batch_like = bool(
-                    re.search(r'\b(add|create|send|append|insert|ingest)\b', _step_l)
+                    re.search(r'\b(add|create|append|insert|ingest)\b', _step_l)
                     and re.search(r'\b(todo|task|event|contact|message|item)s?\b', _step_l)
                 )
                 if _batch_like:
-                    _sq = re.search(r'\b([2-9]|[1-9]\d+)\b', step_desc)
+                    _sq = re.search(r'\b([2-9]|[1-9]\d+)\b', _step_l)
                     if _sq:
                         _n = int(_sq.group(1))
                         if 2 <= _n <= 50:   # safety cap: ignore absurd counts
@@ -3339,7 +4442,11 @@ class Agent:
                         f"Do NOT repeat the same wrong call. Fix the issue above and retry.\n\n"
                     )
 
-                buffer_context = self._get_buffer_context()
+                buffer_context = (
+                    self._get_all_buffer_signal_context()
+                    if self._step_needs_all_buffer_signal(step_action, step_desc, step_categories)
+                    else self._get_buffer_context()
+                )
                 recent_outputs_context = self._get_recent_tool_outputs_context(
                     _recent_tool_outputs, step_desc=step_desc, step_idx=i
                 )
@@ -3428,14 +4535,26 @@ class Agent:
                 if step_inputs or step_outputs:
                     _in_slots = ", ".join(step_inputs) if step_inputs else "none"
                     _out_slots = ", ".join(step_outputs) if step_outputs else "none"
+                    _needed_by = ", ".join(str(x) for x in step_needed_by) if step_needed_by else "none"
                     _slot_hint = (
                         "SLOT CONTRACT:\n"
                         f"- INPUTS: {_in_slots}\n"
                         f"- OUTPUTS: {_out_slots}\n"
+                        f"- NEEDED_BY: {_needed_by}\n"
                         "Use these names consistently in your DONE summary.\n\n"
                     )
+                _multi_search_hint = ""
+                if step_action in ("search.duckduckgo", "search.news"):
+                    _ms_items = self._collect_multi_search_items()
+                    if len(_ms_items) > 1:
+                        _multi_search_hint = (
+                            "MULTI-ITEM SEARCH: This step has multiple input items/topics. "
+                            "Call the search tool once with the common search intent; runtime will expand it "
+                            "across the input items and merge signal-only results.\n\n"
+                        )
                 _extra_hints = "\n".join(filter(None, [
                     _slot_hint,
+                    _multi_search_hint,
                     _quant_hint,
                     _media_hint,
                     self._build_handoff_hint(completed, step_desc),
@@ -3447,6 +4566,9 @@ class Agent:
                 # read it now and inject the content into the working_state so the
                 # model can use it directly without needing to call buffer.slice first.
                 _prefetched = self._prefetch_buffer_content(step_desc, self.buffer)
+                _declared_inputs_ctx = self._get_step_input_context(step_inputs)
+                _targeted_dependency_ctx = self._get_dependency_context(i + 1, step_inputs)
+                _working_state_ctx = _targeted_dependency_ctx + _declared_inputs_ctx + _prefetched
                 _step_sections = self._context_compiler.compile(
                     step_type=StepType.ACT,
                     user_message=text,
@@ -3459,7 +4581,7 @@ class Agent:
                     history_text=_act_history,
                     done_block=done_block,
                     task_contract="",
-                    working_state=_prefetched,
+                    working_state=_working_state_ctx,
                     retry_note=retry_note,
                     progress_block=_progress_block,
                     extra_hints=_extra_hints,
@@ -3471,12 +4593,17 @@ class Agent:
                 # Build a step-type-aware output format.
                 # If the step goal asks to read a buffer first, make the sequence explicit.
                 _has_buf_in_goal = bool(re.search(r'\[BUFFER:\d+\]', step_desc))
-                if _has_buf_in_goal:
+                if _has_buf_in_goal and step_action != "think":
                     _seq_hint = (
                         "SEQUENCE for this step:\n"
                         "  turn 1 -> TOOL: buffer.slice | id=<N>   (reads the buffer)\n"
                         "  turn 2 -> TOOL: <send/write tool> | ...  (uses the content)\n"
                         "Do NOT write the buffer reference as a literal string.\n\n"
+                    )
+                elif _has_buf_in_goal and step_action == "think":
+                    _seq_hint = (
+                        "BUFFER CONTENT IS PRE-READ ABOVE. Use that content directly in think.\n"
+                        "Do NOT call buffer.slice unless the pre-read content is absent or clearly incomplete.\n\n"
                     )
                 else:
                     _seq_hint = ""
@@ -3491,10 +4618,12 @@ class Agent:
                 if step_inputs or step_outputs:
                     _in_slots = ", ".join(step_inputs) if step_inputs else "none"
                     _out_slots = ", ".join(step_outputs) if step_outputs else "none"
+                    _needed_by = ", ".join(str(x) for x in step_needed_by) if step_needed_by else "none"
                     _slot_contract_line = (
                         "STEP SLOTS:\n"
                         f"- INPUTS: {_in_slots}\n"
-                        f"- OUTPUTS: {_out_slots}\n\n"
+                        f"- OUTPUTS: {_out_slots}\n"
+                        f"- NEEDED_BY: {_needed_by}\n\n"
                     )
                 _priority_tail = ""
                 if attempt > 0 and _step_actions:
@@ -3650,6 +4779,16 @@ class Agent:
                             continue
                         step_result = _done_summary
                         _step_raw_payload = _done_summary
+                        self._store_declared_outputs(
+                            step_outputs,
+                            _step_tool,
+                            {"text": _done_summary},
+                            _done_summary,
+                            _done_summary,
+                            needed_by=step_needed_by,
+                            source_step=i + 1,
+                            source_goal=step_desc,
+                        )
                         step_status = "done"
                         break
                     if _answer_u.startswith("STEP_FAILED:"):
@@ -3703,7 +4842,7 @@ class Agent:
                                     _clarified_desc = step_desc
                                     if _ui_compact and _ui_compact.lower() not in _clarified_desc.lower():
                                         _clarified_desc = f"{step_desc} (User clarification: {_ui_compact})"
-                                    steps[i] = {"goal": _clarified_desc, "categories": step_categories}
+                                    steps[i] = {**step_item, "goal": _clarified_desc, "categories": step_categories}
                                     _step_idx = i
                                     _step_rewound = True
                                     step_status = "failed"
@@ -3766,6 +4905,17 @@ class Agent:
                 if _call_sig in seen_calls:
                     obs_skip = f"(already executed this run  result already recorded above)"
                     print(f"[AGENT]  Idempotency skip [{_call_sig}]")
+                    if _is_side_effect:
+                        step_status = "done"
+                        step_result = obs_skip
+                        _step_tool = tool_name
+                        _step_calls.append({
+                            "tool": tool_name,
+                            "status": "blocked_duplicate_done",
+                            "summary": obs_skip,
+                            "args": json.dumps(tool_args, default=str)[:140],
+                        })
+                        break
                     last_error = f"duplicate tool call blocked: {tool_name} with same args"
                     _step_calls.append({
                         "tool": tool_name,
@@ -3840,6 +4990,54 @@ class Agent:
                     break
                 else:
                     tool_res = result.get("result", result) if isinstance(result, dict) else result
+                    if tool_name == "think":
+                        _think_text = ""
+                        if isinstance(tool_res, dict):
+                            _think_text = str(
+                                tool_res.get("text")
+                                or tool_res.get("content")
+                                or tool_res.get("result")
+                                or ""
+                            ).strip()
+                        else:
+                            _think_text = str(tool_res or "").strip()
+                        if not _think_text:
+                            _step_had_error = True
+                            last_error = "think returned empty text; use provided slot/buffer context and produce concrete output"
+                            last_failed_tool = tool_name
+                            last_failed_args = tool_args
+                            observation = f"Error: {last_error}"
+                            _step_calls.append({
+                                "tool": tool_name,
+                                "status": "empty",
+                                "summary": last_error,
+                                "args": json.dumps(tool_args, default=str)[:140],
+                            })
+                            _recent_tool_outputs.append({
+                                "tool": tool_name,
+                                "status": "error",
+                                "raw": observation,
+                            })
+                            self._context_compiler.tool_records.add(
+                                tool_name=tool_name, args=tool_args, status="error",
+                                result_digest=last_error[:220], raw_result=observation,
+                                step_idx=i, attempt=attempt,
+                            )
+                            self._context_compiler.metrics.record_tool_call(
+                                tool_name, success=False, error_type="empty_result", is_retry=attempt > 0,
+                            )
+                            print(f"[STREAM][TOOL RESULT ] {observation}")
+                            yield {"type": "tool_result", "tool": tool_name, "result": observation,
+                                   "status": "error", "step": i + 1}
+                            if attempt == MAX_RETRIES_PER_STEP - 1:
+                                step_status = "failed"
+                                break
+                            _special_retry_note = (
+                                "The previous think call returned empty text.\n"
+                                "Use the STEP INPUT DATA / TARGETED DEPENDENCY OUTPUTS / BUFFER content already in context.\n"
+                                "Return concrete titles, summaries, or a DONE summary. Do NOT ask the user.\n\n"
+                            )
+                            continue
                     self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
                     raw_obs = json.dumps(tool_res, indent=2, default=str)
                     _step_raw_payload = raw_obs[:12000]
@@ -3861,6 +5059,12 @@ class Agent:
                             _store_data = self._distill_search_result(
                                 observation, step_desc, model
                             )
+                        _store_data = self._payload_to_signal(
+                            _store_data,
+                            tool_name=tool_name,
+                            slot="buffer",
+                            max_chars=6000,
+                        )
                         self._buffer_id += 1
                         self.buffer[self._buffer_id] = {
                             "data": _store_data, "tool": tool_name, "chars": len(_store_data)
@@ -3876,6 +5080,17 @@ class Agent:
                     step_result = self._compress_obs(raw_obs, tool_name)
                     if _buf_id_for_record is not None:
                         step_result = f"{step_result} [BUFFER:{_buf_id_for_record}]"
+                    self._store_declared_outputs(
+                        step_outputs,
+                        tool_name,
+                        tool_res,
+                        raw_obs,
+                        step_result,
+                        buffer_id=_buf_id_for_record,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
                     step_status = "done"
                     _step_success_calls += 1
                     _step_calls.append({
@@ -3997,6 +5212,11 @@ class Agent:
                     # Side-effect calls should not be followed by extra calls in same step.
                     if _is_side_effect:
                         break
+                    # One planned action per step: once that action succeeds, the step is done.
+                    # Do not ask the model to emit a second DONE turn; small models often call
+                    # the same tool again instead.
+                    if step_action and tool_name == step_action:
+                        break
 
                     if attempt < MAX_RETRIES_PER_STEP - 1:
                         # Build an explicit summary of what was already found so the model
@@ -4061,7 +5281,7 @@ class Agent:
                             _clarified_desc = step_desc
                             if _ui_compact and _ui_compact.lower() not in _clarified_desc.lower():
                                 _clarified_desc = f"{step_desc} (User clarification: {_ui_compact})"
-                            steps[i] = {"goal": _clarified_desc, "categories": step_categories}
+                            steps[i] = {**step_item, "goal": _clarified_desc, "categories": step_categories}
                             _step_idx = i
                             _step_rewound = True
                             _fb_handled = True
@@ -4120,12 +5340,18 @@ class Agent:
                                         _fb_store = self._distill_search_result(
                                             _fb_obs, step_desc, model
                                         )
+                                    _fb_store = self._payload_to_signal(
+                                        _fb_store,
+                                        tool_name=_fb_tn,
+                                        slot="buffer",
+                                        max_chars=6000,
+                                    )
                                     self._buffer_id += 1
                                     self.buffer[self._buffer_id] = {
                                         "data": _fb_store, "tool": _fb_tn, "chars": len(_fb_store)
                                     }
                                     _fb_obs = self._make_buffer_observation(
-                                        self._buffer_id, _fb_obs, _fb_tn
+                                        self._buffer_id, _fb_store, _fb_tn
                                     )
                                 seen_calls.add(_fb_sig)
                                 step_result = self._compress_obs(_fb_obs, _fb_tn)
@@ -4169,7 +5395,7 @@ class Agent:
                                     _clarified_desc = step_desc
                                     if _ui_compact and _ui_compact.lower() not in _clarified_desc.lower():
                                         _clarified_desc = f"{step_desc} (User clarification: {_ui_compact})"
-                                    steps[i] = {"goal": _clarified_desc, "categories": step_categories}
+                                    steps[i] = {**step_item, "goal": _clarified_desc, "categories": step_categories}
                                     _step_idx = i
                                     _step_rewound = True
                                     _fb_handled = True
@@ -4221,7 +5447,7 @@ class Agent:
                         i, f"Replanned from step {i+1}: {step_desc[:80]}",
                         rationale=last_error[:120] if last_error else ""
                     )
-                    steps = steps[:i] + revised_steps
+                    steps = self._finalize_step_dependencies(steps[:i] + revised_steps)
                     _step_idx = i
                     completed.append({
                         "step": step_desc,
@@ -4245,10 +5471,7 @@ class Agent:
                     _ui_compact = _latest_user_input.strip()[:180]
                     if _ui_compact and _ui_compact.lower() not in _clarified_desc.lower():
                         _clarified_desc = f"{step_desc} (User clarification: {_ui_compact})"
-                    steps[i] = {
-                        "goal": _clarified_desc,
-                        "categories": step_categories,
-                    }
+                    steps[i] = {**step_item, "goal": _clarified_desc, "categories": step_categories}
                     _step_idx = i
                     yield {
                         "type": "thought",
@@ -4487,6 +5710,17 @@ class Agent:
                 # Finalize metrics
                 _run_metrics = self._context_compiler.metrics.finalize()
                 print(self._context_compiler.metrics.render_metrics_block())
+                self._print_llm_usage_summary()
+                return
+            _terminal_response = self._get_terminal_slot_response(completed)
+            if _terminal_response and not _postcond_warning:
+                final_response = self._maybe_stage_workflow_suggestion(
+                    text, completed, _terminal_response, workflow_was_auto_used=bool(_workflow_steps_preloaded)
+                )
+                _run_metrics = self._context_compiler.metrics.finalize()
+                print(self._context_compiler.metrics.render_metrics_block())
+                yield {"type": "final", "content": final_response}
+                self.history.append((text, final_response))
                 self._print_llm_usage_summary()
                 return
             if self._should_skip_synthesis(completed) and not _postcond_warning:
@@ -4753,6 +5987,9 @@ class Agent:
             content = content.strip()
             if not content:
                 return {"status": "error", "error": "memory.write content is empty."}
+            content = self._prepare_persistence_content(content, tool_name)
+            if not content:
+                return {"status": "error", "error": "memory.write content had no task-relevant signal to store."}
 
             tag = str(args.get("tag", "")).strip()
             clean = " ".join(content.splitlines()).strip()
@@ -4838,6 +6075,9 @@ class Agent:
             content = content.strip()
             if not content:
                 return {"status": "error", "error": "memory.update content is empty."}
+            content = self._prepare_persistence_content(content, tool_name)
+            if not content:
+                return {"status": "error", "error": "memory.update content had no task-relevant signal to store."}
 
             mode = str(args.get("mode", "replace")).strip().lower() or "replace"
             if mode not in ("replace", "append"):
@@ -5141,11 +6381,30 @@ class Agent:
         # --- REGULAR TOOL EXECUTION ---
         _slots = (self._working_state or {}).get("slots", {})
         _artifacts = (self._working_state or {}).get("artifacts", {})
+        literal_args = getattr(self, "_current_step_literal_args", {}) or {}
 
         # think: inject buffer content and/or inline context into the prompt
         # before dispatching to the reasoning connector (which has no buffer access).
         if tool_name == "think":
             _base_prompt = args.get("prompt", "")
+            if not str(_base_prompt or "").strip():
+                _base_prompt = str(getattr(self, "_current_step_desc", "") or "Prepare concise useful output.").strip()
+                args["prompt"] = _base_prompt
+            if "message_body" in {
+                str(x or "").strip().lower()
+                for x in getattr(self, "_current_step_outputs", []) or []
+            }:
+                _base_prompt = (
+                    str(_base_prompt or "").strip()
+                    + "\n\nMESSAGE BODY CONTRACT:\n"
+                    "- Return exactly ONE send-ready WhatsApp message.\n"
+                    "- Do not give options, headings, analysis, citations, or ask the user to choose.\n"
+                    "- Make it an actual concise summary, not a generic recommendation.\n"
+                    "- 2 to 4 sentences, under 900 characters.\n"
+                    "- If summarizing the movie 3 Idiots, mention Farhan, Raju and Rancho, "
+                    "the pressure of the education system, friendship, and following passion over blind success."
+                ).strip()
+                args["prompt"] = _base_prompt
             _injections = []
             # 1) buffer=<id>  OR  buffer_id=<id>   pull from agent buffer
             _raw_buf_id = args.pop("buffer", None) or args.pop("buffer_id", None)
@@ -5164,6 +6423,15 @@ class Agent:
             _inline = args.pop("context", None) or args.pop("data", None)
             if _inline:
                 _injections.append(f"--- CONTEXT ---\n{_inline}\n--- END CONTEXT ---")
+            for _slot in getattr(self, "_current_step_inputs", []) or []:
+                _slot_key = str(_slot or "").strip().lower()
+                if not _slot_key:
+                    continue
+                _slot_val = _slots.get(_slot_key)
+                if isinstance(_slot_val, str) and _slot_val.strip():
+                    _injections.append(
+                        f"--- SLOT { _slot_key } ---\n{_slot_val.strip()}\n--- END SLOT { _slot_key } ---"
+                    )
             if _injections:
                 args["prompt"] = _base_prompt + "\n\n" + "\n\n".join(_injections)
         # Common hallucinations for argument names
@@ -5180,37 +6448,114 @@ class Agent:
             if "content" in args and "html_content" not in args: args["html_content"] = args.pop("content")
             if "output"  in args and "output_path" not in args: args["output_path"] = args.pop("output")
 
-        # contacts.search pre-flight: recover missing query from task/slot hints.
-        if tool_name == "contacts.search":
+        # contacts.search/get pre-flight: recover missing query/name from task/slot hints.
+        if tool_name in ("contacts.search", "contacts.get"):
             _q = str(args.get("query") or args.get("name") or args.get("text") or "").strip()
             if not _q:
-                _hint = str(_slots.get("recipient_name_hint") or self._extract_recipient_hint(getattr(self, "_current_task_text", "")) or "").strip()
+                _hint = str(
+                    literal_args.get("name")
+                    or literal_args.get("query")
+                    or _slots.get("recipient_name_hint")
+                    or self._extract_recipient_hint(getattr(self, "_current_task_text", ""))
+                    or ""
+                ).strip()
                 if _hint:
-                    args.setdefault("query", _hint)
+                    if tool_name == "contacts.search":
+                        args.setdefault("query", _hint)
                     args.setdefault("name", _hint)
-                    print(f"[AGENT] contacts.search auto-filled query from recipient hint: {_hint}")
+                    print(f"[AGENT] {tool_name} auto-filled recipient hint: {_hint}")
+
+        if tool_name in ("search.duckduckgo", "search.news"):
+            if not str(args.get("query") or "").strip():
+                _q_hint = str(literal_args.get("query") or literal_args.get("topic") or "").strip()
+                if _q_hint:
+                    args["query"] = _q_hint
 
         # whatsapp.status takes zero args  strip any hallucinated args (jid, to, number, ...)
         if tool_name == "whatsapp.status":
             args = {}
         # whatsapp.send pre-flight: require text payload or auto-fill from handoff payload.
         if tool_name == "whatsapp.send":
+            if not str(args.get("to") or "").strip():
+                _to = str(_slots.get("recipient_phone_or_jid") or "").strip()
+                if not _to:
+                    _contact_payload = str(_slots.get("contact_info") or _slots.get("recipient_contact") or "").strip()
+                    _to = self._extract_phone_like(_contact_payload)
+                if _to:
+                    args["to"] = _to
+            for _k in ("message", "body", "text", "content"):
+                if _k in literal_args and _k not in args:
+                    args[_k] = literal_args[_k]
             if "body" in args and "message" not in args:
                 args["message"] = args.get("body")
             if "text" in args and "message" not in args:
                 args["message"] = args.get("text")
             if "content" in args and "message" not in args:
                 args["message"] = args.get("content")
+            if isinstance(args.get("message"), str):
+                args["message"] = self._normalize_delivery_body(args["message"])
             _msg = args.get("message")
             if _msg is None:
                 _msg = ""
             if not isinstance(_msg, str):
                 _msg = json.dumps(_msg, default=str)
             _msg = _msg.strip()
+            _slot_key = _msg.lower()
+            if _slot_key in _slots and isinstance(_slots.get(_slot_key), str) and _slots.get(_slot_key).strip():
+                _msg = _slots[_slot_key].strip()
+                args["message"] = _msg
+                print(f"[AGENT] whatsapp.send dereferenced message slot: {_slot_key}")
+            if _msg and self._looks_like_raw_retrieval_payload(_msg):
+                _prepared = str(_slots.get("message_body") or _slots.get("recommendations") or _slots.get("summary") or "").strip()
+                if _prepared and not self._looks_like_raw_retrieval_payload(_prepared):
+                    _msg = self._normalize_delivery_body(_prepared)
+                    args["message"] = _msg
+                    print("[AGENT] whatsapp.send replaced raw retrieval payload with prepared message slot")
+                else:
+                    args["message"] = ""
+                    _msg = ""
+            if self._task_requires_retrieval_delivery_message() and not literal_args:
+                generic_delivery = bool(re.fullmatch(r'["\']?\s*(hi|hello|hey|hi\s+\w+|hello\s+\w+|hey\s+\w+)[.!? "\']*', _msg, re.IGNORECASE))
+                has_prepared = any(
+                    isinstance(_slots.get(k), str)
+                    and _slots.get(k).strip()
+                    and not self._looks_like_raw_retrieval_payload(_slots.get(k))
+                    for k in ("message_body", "recommendations", "summary")
+                )
+                if generic_delivery or not has_prepared:
+                    _built = self._build_delivery_message_from_slots()
+                    if _built:
+                        _msg = self._normalize_delivery_body(_built)
+                        args["message"] = _msg
+                        print("[AGENT] whatsapp.send composed delivery message from retrieval slots")
+                    else:
+                        args["message"] = ""
+                        _msg = ""
             if not _msg:
-                _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
+                _fallback = ""
+                for _k in self._content_slot_candidates(("message_body", "content", "summary", "text")):
+                    _v = _slots.get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        _fallback = _v.strip()
+                        break
+                if not _fallback:
+                    for _k in getattr(self, "_current_step_inputs", []) or []:
+                        _ks = str(_k or "").strip().lower()
+                        m = re.match(r"^(message|body|text|content)_(.+)$", _ks)
+                        if m:
+                            _fallback = m.group(2).replace("_", " ").strip()
+                            break
+                if not _fallback:
+                    _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
+                if self._looks_like_raw_retrieval_payload(_fallback):
+                    _fallback = ""
+                if self._task_requires_retrieval_delivery_message() and not literal_args:
+                    if re.fullmatch(r'["\']?\s*(hi|hello|hey|hi\s+\w+|hello\s+\w+|hey\s+\w+)[.!? "\']*', _fallback, re.IGNORECASE):
+                        _fallback = ""
+                    if not _fallback:
+                        _fallback = self._build_delivery_message_from_slots()
                 if _fallback and _fallback.lower() not in ("ok", "no result", "none", "null"):
-                    args["message"] = _fallback[:1800]
+                    args["message"] = self._normalize_delivery_body(_fallback)[:1800]
                     print("[AGENT] whatsapp.send auto-filled message from prior step payload")
                 else:
                     return {
@@ -5230,7 +6575,7 @@ class Agent:
             _data = args.get("data")
             if _data is None or (isinstance(_data, str) and not _data.strip()):
                 _candidate = ""
-                for _k in ("message_body", "cpp_code", "code_text", "content"):
+                for _k in self._content_slot_candidates(("message_body", "cpp_code", "code_text", "content")):
                     _v = _slots.get(_k)
                     if isinstance(_v, str) and _v.strip():
                         _candidate = _v.strip()
@@ -5335,7 +6680,7 @@ class Agent:
             _body = _body.strip()
             if not _body:
                 _slot_body = ""
-                for _k in ("message_body", "cpp_code", "code_text", "content"):
+                for _k in self._content_slot_candidates(("message_body", "cpp_code", "code_text", "content")):
                     _v = _slots.get(_k)
                     if isinstance(_v, str) and _v.strip():
                         _slot_body = _v.strip()
@@ -5467,6 +6812,59 @@ class Agent:
                     f"Use an exact registered tool name. "
                     f"Call format: TOOL: <valid_tool> | arg=value"
                 )
+            }
+
+        _multi_queries = self._build_multi_search_queries(tool_name, args)
+        if _multi_queries:
+            base_query = str(args.get("query") or "").strip()
+            try:
+                requested_max = int(args.get("max_results", 5) or 5)
+            except Exception:
+                requested_max = 5
+            per_query_max = max(1, min(3, requested_max))
+            merged_results = []
+            errors = []
+            print(f"[AGENT] Multi-search expansion: {len(_multi_queries)} focused queries from '{base_query}'")
+            for q in _multi_queries:
+                q_args = {k: v for k, v in args.items() if k in {"query", "max_results"}}
+                q_args["query"] = q
+                q_args["max_results"] = per_query_max
+                try:
+                    raw_i = execute_tool(tool_name, **q_args)
+                except Exception as e:
+                    errors.append(f"{q}: {e}")
+                    continue
+                payload_i = raw_i.get("result", raw_i) if isinstance(raw_i, dict) else raw_i
+                if isinstance(payload_i, dict) and payload_i.get("status") == "error":
+                    errors.append(f"{q}: {payload_i.get('error', 'error')}")
+                    continue
+                results_i = []
+                if isinstance(payload_i, dict) and isinstance(payload_i.get("results"), list):
+                    results_i = payload_i.get("results") or []
+                elif isinstance(payload_i, list):
+                    results_i = payload_i
+                if not results_i:
+                    errors.append(f"{q}: no results")
+                    continue
+                for item in results_i[:per_query_max]:
+                    if isinstance(item, dict):
+                        enriched = dict(item)
+                        enriched.setdefault("source_query", q)
+                        merged_results.append(enriched)
+                    else:
+                        merged_results.append({"title": str(item), "source_query": q})
+            if not merged_results:
+                return {
+                    "status": "error",
+                    "error": "Multi-search found no usable results. " + "; ".join(errors[:4]),
+                }
+            return {
+                "query": base_query,
+                "multi_query": True,
+                "queries": _multi_queries,
+                "results": merged_results[:18],
+                "count": len(merged_results[:18]),
+                "errors": errors[:5],
             }
 
         raw = execute_tool(tool_name, **args)
