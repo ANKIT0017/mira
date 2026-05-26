@@ -1,379 +1,545 @@
 """
-Firecrawl Connector for MIRA
-Provides advanced web scraping, crawling, and extraction tools using self-hosted Firecrawl
+Local Firecrawl-compatible connector for MIRA.
+
+This keeps the existing firecrawl.* tool names, but it does not require the
+separate Firecrawl Docker/API service. The implementation borrows the useful
+parts of the local Firecrawl codebase: browser-style fetching, ad/media request
+blocking, clean markdown extraction, URL mapping, small crawls, search+scrape,
+and LLM-backed structured extraction.
 """
 
-import sys
-import os
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent.parent))
-from mcp_server.tools import register_tool
+from __future__ import annotations
+
 import json
+import re
+import time
+from collections import deque
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urldefrag, urljoin, urlparse
 
-# Initialize Firecrawl client (lazy loading to avoid import errors if not installed)
-_firecrawl_client = None
+import requests
+try:
+    import html2text
+except Exception:
+    html2text = None
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+try:
+    from readability import Document
+except Exception:
+    Document = None
 
-def get_firecrawl_client():
-    """Lazy initialization of Firecrawl client"""
-    global _firecrawl_client
-    if _firecrawl_client is None:
+from mcp_server.tools import register_tool
+
+
+DEFAULT_TIMEOUT = 20
+MAX_HTML_CHARS = 300_000
+MAX_MARKDOWN_CHARS = 80_000
+SANDBOX = Path(__file__).resolve().parents[2] / "SANDBOX"
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+AD_SERVING_DOMAINS = (
+    "doubleclick.net",
+    "adservice.google.com",
+    "googlesyndication.com",
+    "googletagservices.com",
+    "googletagmanager.com",
+    "google-analytics.com",
+    "adsystem.com",
+    "adservice.com",
+    "adnxs.com",
+    "ads-twitter.com",
+    "facebook.net",
+    "fbcdn.net",
+    "amazon-adsystem.com",
+)
+
+MEDIA_RESOURCE_RE = re.compile(
+    r"\.(png|jpg|jpeg|gif|svg|webp|ico|mp3|mp4|avi|flac|ogg|wav|webm|woff2?|ttf)(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _valid_url(url: str) -> bool:
+    try:
+        p = urlparse(str(url))
+        return p.scheme in {"http", "https"} and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def _same_site(base: str, candidate: str) -> bool:
+    b = urlparse(base)
+    c = urlparse(candidate)
+    b_host = b.netloc.lower().removeprefix("www.")
+    c_host = c.netloc.lower().removeprefix("www.")
+    return b_host == c_host
+
+
+def _normalize_url(base: str, href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+        return ""
+    joined = urljoin(base, href)
+    joined = urldefrag(joined)[0]
+    parsed = urlparse(joined)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return joined
+
+
+def _request_html(
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    skip_tls_verification: bool = False,
+) -> dict[str, Any]:
+    final_headers = dict(DEFAULT_HEADERS)
+    if isinstance(headers, dict):
+        final_headers.update({str(k): str(v) for k, v in headers.items()})
+    response = requests.get(
+        url,
+        headers=final_headers,
+        timeout=max(1, int(timeout or DEFAULT_TIMEOUT)),
+        verify=not bool(skip_tls_verification),
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    if response.encoding is None or response.encoding.lower() == "iso-8859-1":
+        response.encoding = response.apparent_encoding or "utf-8"
+    return {
+        "html": response.text[:MAX_HTML_CHARS],
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "final_url": response.url,
+        "content_type": response.headers.get("content-type", ""),
+    }
+
+
+def _playwright_html(
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    wait_after_load: int = 0,
+    check_selector: str | None = None,
+    skip_tls_verification: bool = False,
+) -> dict[str, Any]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        raise RuntimeError(f"playwright is not installed: {e}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         try:
-            from firecrawl import Firecrawl
-            # Read API URL from environment or use default (port 3100 to avoid Windows port conflicts)
-            api_url = os.getenv("FIRECRAWL_API_URL", "http://localhost:3100")
-            _firecrawl_client = Firecrawl(api_url=api_url)
-            print(f"[FIRECRAWL] Connected to self-hosted instance at {api_url}")
-        except ImportError:
-            raise ImportError(
-                "firecrawl-py is not installed. Run: pip install firecrawl-py"
+            context = browser.new_context(
+                user_agent=DEFAULT_HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+                ignore_https_errors=bool(skip_tls_verification),
+                extra_http_headers=headers or {},
             )
-        except Exception as e:
-            api_url = os.getenv("FIRECRAWL_API_URL", "http://localhost:3100")
-            raise ConnectionError(
-                f"Failed to connect to Firecrawl at {api_url}. "
-                f"Ensure Firecrawl Docker containers are running. Error: {e}"
+
+            def route_handler(route, request):
+                host = urlparse(request.url).hostname or ""
+                if MEDIA_RESOURCE_RE.search(request.url):
+                    return route.abort()
+                if any(domain in host for domain in AD_SERVING_DOMAINS):
+                    return route.abort()
+                return route.continue_()
+
+            context.route("**/*", route_handler)
+            page = context.new_page()
+            response = page.goto(url, wait_until="load", timeout=max(1, int(timeout or DEFAULT_TIMEOUT)) * 1000)
+            if wait_after_load:
+                page.wait_for_timeout(int(wait_after_load))
+            if check_selector:
+                page.wait_for_selector(check_selector, timeout=max(1, int(timeout or DEFAULT_TIMEOUT)) * 1000)
+            html = page.content()
+            return {
+                "html": html[:MAX_HTML_CHARS],
+                "status_code": response.status if response else None,
+                "headers": response.all_headers() if response else {},
+                "final_url": page.url,
+                "content_type": (response.header_value("content-type") if response else "") or "",
+            }
+        finally:
+            browser.close()
+
+
+def _html_to_clean_markdown(html: str, url: str = "") -> dict[str, Any]:
+    if BeautifulSoup is None:
+        plain = re.sub(r"<[^>]+>", " ", html or "")
+        plain = re.sub(r"\s+", " ", plain).strip()
+        return {
+            "title": "",
+            "description": "",
+            "markdown": plain[:MAX_MARKDOWN_CHARS],
+            "text": plain[:MAX_MARKDOWN_CHARS],
+            "links": [],
+        }
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style", "noscript", "iframe", "svg", "canvas", "form"]):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    description = ""
+    desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if desc_tag:
+        description = str(desc_tag.get("content") or "").strip()
+
+    links = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = _normalize_url(url, str(a.get("href") or ""))
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        text = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+        links.append({"url": href, "text": text[:160]})
+
+    content_html = ""
+    try:
+        if Document is None:
+            raise RuntimeError("readability not installed")
+        doc = Document(str(soup))
+        content_html = doc.summary()
+        title = doc.title() or title
+    except Exception:
+        body = soup.body or soup
+        content_html = str(body)
+
+    if html2text is not None:
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.ignore_emphasis = False
+        h.body_width = 0
+        markdown = h.handle(content_html or "")
+    else:
+        markdown = BeautifulSoup(content_html or "", "html.parser").get_text("\n", strip=True)
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
+    text = re.sub(r"\s+", " ", BeautifulSoup(content_html or "", "html.parser").get_text(" ", strip=True)).strip()
+    return {
+        "title": title,
+        "description": description,
+        "markdown": markdown[:MAX_MARKDOWN_CHARS],
+        "text": text[:MAX_MARKDOWN_CHARS],
+        "links": links,
+    }
+
+
+def _scrape_local(
+    url: str,
+    formats: list | None = None,
+    headers: dict[str, str] | None = None,
+    wait_after_load: int = 0,
+    timeout: int = DEFAULT_TIMEOUT,
+    check_selector: str | None = None,
+    skip_tls_verification: bool = False,
+    use_browser: bool | None = None,
+) -> dict[str, Any]:
+    if not _valid_url(url):
+        return {"status": "error", "error": "Invalid URL.", "url": url}
+    formats = formats or ["markdown"]
+    try:
+        fetched = None
+        if use_browser:
+            fetched = _playwright_html(
+                url,
+                headers=headers,
+                timeout=timeout,
+                wait_after_load=wait_after_load,
+                check_selector=check_selector,
+                skip_tls_verification=skip_tls_verification,
             )
-    return _firecrawl_client
+        else:
+            try:
+                fetched = _request_html(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    skip_tls_verification=skip_tls_verification,
+                )
+            except Exception as req_error:
+                # If requests fails and Playwright is installed, use the browser path.
+                try:
+                    fetched = _playwright_html(
+                        url,
+                        headers=headers,
+                        timeout=timeout,
+                        wait_after_load=wait_after_load,
+                        check_selector=check_selector,
+                        skip_tls_verification=skip_tls_verification,
+                    )
+                except Exception:
+                    raise req_error
+
+        html = str(fetched.get("html") or "")
+        final_url = str(fetched.get("final_url") or url)
+        converted = _html_to_clean_markdown(html, final_url)
+        result = {
+            "success": True,
+            "url": final_url,
+            "metadata": {
+                "title": converted.get("title"),
+                "description": converted.get("description"),
+                "sourceURL": final_url,
+                "statusCode": fetched.get("status_code"),
+                "contentType": fetched.get("content_type"),
+                "scraped_at": datetime.now().isoformat(),
+                "engine": "local-playwright" if use_browser else "local-requests",
+            },
+        }
+        if "markdown" in formats:
+            result["markdown"] = converted.get("markdown", "")
+        if "html" in formats:
+            result["html"] = html
+        if "text" in formats:
+            result["text"] = converted.get("text", "")
+        result["links"] = converted.get("links", [])
+        return result
+    except Exception as e:
+        return {"status": "error", "success": False, "error": f"Failed to scrape {url}: {e}", "url": url}
 
 
 @register_tool(
     "firecrawl.scrape",
     category="Web Scraping",
-    description="Scrape a single URL → Returns full markdown content",
+    description="Scrape a single URL locally and return clean markdown/html/links",
     example='{"tool": "firecrawl.scrape", "args": {"url": "https://example.com"}}',
-    notes="⚠️ Returns full content in 'markdown' field. DO NOT call web.summarize after this!"
+    notes="Runs inside MIRA; no external Firecrawl Docker/API service required.",
 )
-def scrape_url(url: str, formats: list = None):
-    """
-    Scrape a single URL with Firecrawl
-    
-    Args:
-        url: URL to scrape
-        formats: List of output formats (markdown, html, screenshot)
-    
-    Returns:
-        dict: Scraped content with markdown, url, and metadata
-    """
-    if formats is None:
-        formats = ["markdown"]
-    
-    try:
-        print(f"[FIRECRAWL] Scraping {url} with formats: {formats}")
-        client = get_firecrawl_client()
-        print(f"[FIRECRAWL] Client obtained, calling scrape()...")
-        
-        # Anti-bot options (passed as keyword args to ScrapeOptions)
-        doc = client.scrape(
-            url,
-            formats=formats,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            skip_tls_verification=True,
-            timeout=60000
-        )
-        print(f"[FIRECRAWL] Scrape complete, doc type: {type(doc)}")
-        
-        # doc is a Document object with attributes: markdown, html, links, metadata, etc.
-        result = {
-            "success": True,
-            "url": url,  # Original URL (doc doesn't have .url attribute)
-            "markdown": doc.markdown if hasattr(doc, 'markdown') and doc.markdown else None,
-            "html": doc.html if hasattr(doc, 'html') and doc.html else None,
-            "metadata": {
-                "title": doc.metadata.title if doc.metadata and hasattr(doc.metadata, 'title') else None,
-                "description": doc.metadata.description if doc.metadata and hasattr(doc.metadata, 'description') else None,
-                "language": doc.metadata.language if doc.metadata and hasattr(doc.metadata, 'language') else None,
-                "scraped_at": datetime.now().isoformat()
-            }
-        }
-        print(f"[FIRECRAWL] Success! Got {len(result.get('markdown', '') or '')} chars of markdown")
-        return result
-    except Exception as e:
-        import traceback
-        print(f"[FIRECRAWL] ERROR in scrape_url: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return {
-            "success": False,
-            "error": f"Failed to scrape {url}: {str(e)}",
-            "url": url
-        }
-
-
-@register_tool(
-    "firecrawl.crawl",
-    category="Web Scraping",
-    description="Crawl entire website recursively → Saves JSON file with all pages",
-    example='{"tool": "firecrawl.crawl", "args": {"url": "https://docs.site.com", "limit": 20}}',
-    notes="⚠️ Resource intensive. Saves crawl JSON to SANDBOX/. Read the saved file for full content."
-)
-def crawl_website(url: str, limit: int = 50, max_depth: int = 3):
-    """
-    Crawl entire website recursively
-    
-    Args:
-        url: Root URL to start crawling
-        limit: Max pages to crawl
-        max_depth: Max depth from root
-    
-    Returns:
-        dict: Crawl results with page count and saved file path
-    """
-    try:
-        client = get_firecrawl_client()
-        
-        print(f"[FIRECRAWL] Starting crawl of {url} (limit: {limit}, depth: {max_depth})...")
-        
-        # Anti-bot scrape options (snake_case for ScrapeOptions)
-        scrape_options = {
-            "formats": ["markdown"],
-            "headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            "skip_tls_verification": True,
-            "timeout": 60000
-        }
-
-        response = client.crawl(
-            url,
-            limit=limit,
-            scrape_options=scrape_options,
-            poll_interval=10  # Check status every 10 seconds
-        )
-        
-        # response can be a dict or a CrawlStatus object in v4
-        pages = []
-        if isinstance(response, dict):
-            pages = response.get("data", [])
-        elif hasattr(response, 'data'):
-            pages = response.data
-            
-        # Save to SANDBOX folder
-        output_dir = Path(__file__).parent.parent.parent / "SANDBOX"
-        output_dir.mkdir(exist_ok=True)
-        
-        # Create filename from URL
-        safe_url = url.replace("https://", "").replace("http://", "").replace("/", "_")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"crawl_{safe_url}_{timestamp}.json"
-        
-        # Save full crawl data
-        crawl_data = {
-            "url": url,
-            "crawled_at": datetime.now().isoformat(),
-            "total_pages": len(pages),
-            "pages": [
-                {
-                    "url": getattr(page, 'url', None) or (page.get('url') if isinstance(page, dict) else None),
-                    "markdown": getattr(page, 'markdown', None) or (page.get('markdown') if isinstance(page, dict) else None),
-                    "metadata": getattr(page, 'metadata', None) or (page.get('metadata') if isinstance(page, dict) else None)
-                }
-                for page in pages
-            ]
-        }
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(crawl_data, f, indent=2, default=str, ensure_ascii=False)
-        
-        print(f"[FIRECRAWL] Crawl complete! Saved to {output_file.name}")
-        
-        return {
-            "success": True,
-            "url": url,
-            "pages_crawled": len(pages),
-            "saved_to": str(output_file),
-            "filename": output_file.name,
-            "preview": [
-                {"url": getattr(page, 'url', None) or (page.get('url') if isinstance(page, dict) else None)}
-                for page in pages[:5]
-            ]
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to crawl {url}: {str(e)}",
-            "url": url
-        }
+def scrape_url(
+    url: str,
+    formats: list = None,
+    wait_after_load: int = 0,
+    timeout: int = DEFAULT_TIMEOUT,
+    headers: dict = None,
+    check_selector: str = None,
+    skip_tls_verification: bool = False,
+    use_browser: bool = False,
+) -> dict:
+    return _scrape_local(
+        url,
+        formats=formats,
+        headers=headers,
+        wait_after_load=wait_after_load,
+        timeout=timeout,
+        check_selector=check_selector,
+        skip_tls_verification=skip_tls_verification,
+        use_browser=use_browser,
+    )
 
 
 @register_tool(
     "firecrawl.map",
     category="Web Scraping",
-    description="Discover all URLs on a website (no content scraping)",
+    description="Discover URLs linked from a page locally",
     example='{"tool": "firecrawl.map", "args": {"url": "https://example.com"}}',
-    notes="⚠️ Result truncated to 200 chars in history. Saves full list to a .txt file automatically."
 )
-def map_website(url: str):
-    """
-    Map all URLs on a website
-    
-    Args:
-        url: Website URL to map
-    
-    Returns:
-        dict: List of discovered URLs
-    """
-    try:
-        client = get_firecrawl_client()
-        
-        print(f"[FIRECRAWL] Mapping URLs on {url}...")
-        
-        result = client.map(url)
-        # result is a MapData object with .links attribute
-        links = result.links if hasattr(result, 'links') else []
-        
-        print(f"[FIRECRAWL] Found {len(links)} URLs")
-        
-        # Auto-save to file if there are many URLs (to avoid context overflow)
-        saved_file = None
-        if len(links) > 20:
-            from pathlib import Path
-            import json
-            from datetime import datetime
-            
-            output_dir = Path(__file__).parent.parent.parent / "SANDBOX"
-            output_dir.mkdir(exist_ok=True)
-            
-            safe_url = url.replace("https://", "").replace("http://", "").replace("/", "_")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f"map_{safe_url}_{timestamp}.txt"
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                for link in links:
-                    f.write(f"{link}\n")
-            
-            saved_file = str(output_file)
-            print(f"[FIRECRAWL] Saved {len(links)} URLs to {output_file.name}")
-        
-        return {
-            "success": True,
-            "url": url,
-            "total_urls": len(links),
-            "urls": links if len(links) <= 20 else links[:10],  # Only include sample if too many
-            "saved_to": saved_file,
-            "note": f"Full list of {len(links)} URLs saved to file (showing first 10)" if saved_file else None
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to map {url}: {str(e)}",
-            "url": url
-        }
+def map_website(url: str, limit: int = 200, same_domain: bool = True) -> dict:
+    scraped = _scrape_local(url, formats=["markdown"], timeout=DEFAULT_TIMEOUT)
+    if scraped.get("status") == "error":
+        return scraped
+    urls = []
+    seen = set()
+    for link in scraped.get("links", []) or []:
+        href = str(link.get("url") or "")
+        if same_domain and not _same_site(url, href):
+            continue
+        if href and href not in seen:
+            seen.add(href)
+            urls.append(href)
+        if len(urls) >= int(limit or 200):
+            break
+    saved_to = None
+    if len(urls) > 20:
+        SANDBOX.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc + urlparse(url).path).strip("_")
+        output = SANDBOX / f"map_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        output.write_text("\n".join(urls), encoding="utf-8")
+        saved_to = str(output)
+    return {
+        "success": True,
+        "url": url,
+        "total_urls": len(urls),
+        "urls": urls[:20],
+        "saved_to": saved_to,
+    }
+
+
+@register_tool(
+    "firecrawl.crawl",
+    category="Web Scraping",
+    description="Crawl a small same-domain site locally and save scraped pages to SANDBOX",
+    example='{"tool": "firecrawl.crawl", "args": {"url": "https://docs.site.com", "limit": 20}}',
+)
+def crawl_website(url: str, limit: int = 20, max_depth: int = 2, same_domain: bool = True) -> dict:
+    if not _valid_url(url):
+        return {"status": "error", "error": "Invalid URL.", "url": url}
+    limit = max(1, min(int(limit or 20), 100))
+    max_depth = max(0, min(int(max_depth or 2), 5))
+    queue = deque([(url, 0)])
+    seen = set()
+    pages = []
+    while queue and len(pages) < limit:
+        current, depth = queue.popleft()
+        if current in seen:
+            continue
+        seen.add(current)
+        if same_domain and not _same_site(url, current):
+            continue
+        scraped = _scrape_local(current, formats=["markdown"], timeout=DEFAULT_TIMEOUT)
+        if scraped.get("status") == "error":
+            pages.append({"url": current, "error": scraped.get("error", "")})
+            continue
+        pages.append({
+            "url": current,
+            "markdown": scraped.get("markdown", ""),
+            "metadata": scraped.get("metadata", {}),
+        })
+        if depth < max_depth:
+            for link in scraped.get("links", []) or []:
+                href = str(link.get("url") or "")
+                if href and href not in seen:
+                    queue.append((href, depth + 1))
+    SANDBOX.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", urlparse(url).netloc + urlparse(url).path).strip("_")
+    output = SANDBOX / f"crawl_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    output.write_text(
+        json.dumps(
+            {
+                "url": url,
+                "crawled_at": datetime.now().isoformat(),
+                "total_pages": len(pages),
+                "pages": pages,
+            },
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "success": True,
+        "url": url,
+        "pages_crawled": len(pages),
+        "saved_to": str(output),
+        "filename": output.name,
+        "preview": [{"url": p.get("url"), "title": (p.get("metadata") or {}).get("title")} for p in pages[:5]],
+    }
 
 
 @register_tool(
     "firecrawl.search",
     category="Web Scraping",
-    description="Search web and automatically scrape results into markdown",
+    description="Search the web and locally scrape result pages into markdown",
     example='{"tool": "firecrawl.search", "args": {"query": "deep research topic", "limit": 5}}',
-    notes="Returns a list of results, each containing the full page content in markdown."
 )
-def search_web(query: str, limit: int = 5):
-    """
-    Search and scrape results
-    
-    Args:
-        query: Search query
-        limit: Number of results
-    
-    Returns:
-        dict: Search results with scraped content
-    """
+def search_web(query: str, limit: int = 5) -> dict:
     try:
-        client = get_firecrawl_client()
-        
-        print(f"[FIRECRAWL] Searching for '{query}' (limit: {limit})...")
-        
-        result = client.search(query, limit=limit)
-        # result is a SearchData object with .data attribute (list of Documents)
-        results = result.data if hasattr(result, 'data') else []
-        
-        print(f"[FIRECRAWL] Found and scraped {len(results)} results")
-        
-        return {
-            "success": True,
-            "query": query,
-            "total_results": len(results),
-            "results": [
-                {
-                    "url": getattr(r, 'url', None) or getattr(r.metadata, 'sourceURL', None) if hasattr(r, 'metadata') else None,
-                    "title": r.metadata.title if hasattr(r, 'metadata') and r.metadata else None,
-                    "description": r.metadata.description if hasattr(r, 'metadata') and r.metadata else None,
-                    "markdown": r.markdown[:500] + "..." if hasattr(r, 'markdown') and r.markdown and len(r.markdown) > 500 else getattr(r, 'markdown', "")
-                }
-                for r in results
-            ]
-        }
+        from mcp_server.connectors.search import search_duckduckgo
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to search for '{query}': {str(e)}",
-            "query": query
-        }
+        return {"status": "error", "error": f"Search connector unavailable: {e}", "query": query}
+
+    search = search_duckduckgo(query=query, max_results=limit)
+    if isinstance(search, dict) and search.get("status") == "error":
+        return search
+    results = search.get("results", []) if isinstance(search, dict) else []
+    enriched = []
+    for result in results[: max(1, int(limit or 5))]:
+        url = str(result.get("url") or "")
+        scraped = _scrape_local(url, formats=["markdown"], timeout=DEFAULT_TIMEOUT) if url else {}
+        enriched.append({
+            "url": url,
+            "title": result.get("title", ""),
+            "description": result.get("snippet", ""),
+            "markdown": str(scraped.get("markdown") or result.get("snippet") or "")[:5000],
+            "metadata": scraped.get("metadata", {}) if isinstance(scraped, dict) else {},
+            "scrape_error": scraped.get("error") if isinstance(scraped, dict) else None,
+        })
+        time.sleep(0.1)
+    return {
+        "success": True,
+        "query": query,
+        "total_results": len(enriched),
+        "results": enriched,
+    }
 
 
 @register_tool(
     "firecrawl.extract",
     category="Web Scraping",
-    description="AI-powered structured data extraction using a JSON schema",
-    example='{"tool": "firecrawl.extract", "args": {"url": "https://products.com", "schema": {"products": [{"name": "string", "price": "number"}]}}}',
-    notes="⚠️ Requires OpenAI API key configured in Firecrawl backend."
+    description="Extract structured JSON from a URL locally using the configured MIRA LLM",
+    example='{"tool": "firecrawl.extract", "args": {"url": "https://products.com", "schema": {"products": [{"name": "string"}]}}}',
+    notes="Runs inside MIRA using the local model; no Firecrawl backend or OpenAI key required.",
 )
-def extract_structured(url: str, schema: dict):
-    """
-    AI-powered structured data extraction
-    
-    Args:
-        url: URL to extract from
-        schema: JSON schema for extraction
-    
-    Returns:
-        dict: Extracted structured data
-    """
+def extract_structured(url: str, schema: dict) -> dict:
+    scraped = _scrape_local(url, formats=["markdown"], timeout=DEFAULT_TIMEOUT)
+    if scraped.get("status") == "error":
+        return scraped
+    markdown = str(scraped.get("markdown") or "")
     try:
-        client = get_firecrawl_client()
-        
-        print(f"[FIRECRAWL] Extracting structured data from {url}...")
-        
-        # Note: This requires OpenAI API key in Firecrawl config
-        result = client.scrape(
-            url,
-            formats=[{"type": "json", "schema": schema}]
-        )
-        
-        extracted_data = result.json if hasattr(result, 'json') else {}
-        
-        print(f"[FIRECRAWL] Extraction complete")
-        
-        return {
-            "success": True,
-            "url": url,
-            "extracted_data": extracted_data,
-            "schema_used": schema
-        }
+        from agent.model_adapter import generate
     except Exception as e:
-        error_msg = str(e)
-        
-        # Helpful error messages
-        if "openai" in error_msg.lower() or "api key" in error_msg.lower():
-            return {
-                "success": False,
-                "error": "AI extraction requires OpenAI API key. Add OPENAI_API_KEY to Firecrawl's .env file.",
-                "url": url
-            }
-        
-        return {
-            "success": False,
-            "error": f"Failed to extract from {url}: {error_msg}",
-            "url": url
-        }
+        return {"status": "error", "error": f"Model adapter unavailable: {e}", "url": url}
+
+    prompt = (
+        "Extract structured data from this page. Return JSON only matching the requested schema as closely as possible.\n"
+        f"URL: {url}\n"
+        f"Schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n\n"
+        f"Page markdown:\n{markdown[:12000]}"
+    )
+    try:
+        raw = generate(prompt, model="local", max_tokens=1800, timeout=180, temperature=0.1)
+    except Exception as e:
+        return {"status": "error", "error": f"Extraction LLM failed: {e}", "url": url}
+    text = str(raw or "").strip()
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        text = match.group(1).strip()
+    start = min([i for i in [text.find("{"), text.find("[")] if i >= 0], default=-1)
+    end = max(text.rfind("}"), text.rfind("]"))
+    extracted: Any = text
+    if start >= 0 and end > start:
+        try:
+            extracted = json.loads(text[start:end + 1])
+        except Exception:
+            extracted = text
+    return {
+        "success": True,
+        "url": url,
+        "extracted_data": extracted,
+        "schema_used": schema,
+        "metadata": scraped.get("metadata", {}),
+    }
 
 
-print("[FIRECRAWL] Connector loaded - 6 tools registered")
-print("[FIRECRAWL] Tools: scrape, crawl, map, search, extract, search_cache")
-print("[FIRECRAWL] Ensure Firecrawl is running at http://localhost:3100")
+print("[FIRECRAWL] Local connector loaded - no Docker/API service required")

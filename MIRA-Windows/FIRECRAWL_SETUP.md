@@ -1,5 +1,11 @@
 # Firecrawl Self-Hosting Setup Guide
 
+> Legacy optional guide: MIRA now includes embedded Firecrawl-compatible
+> `firecrawl.*` tools in `mcp_server/connectors/firecrawl.py`, so Docker and a
+> separate Firecrawl service are not required for normal scraping/research
+> workflows. Use this guide only if you intentionally want to run the upstream
+> Firecrawl stack separately.
+
 ## 🎯 Overview
 
 This guide walks you through setting up **self-hosted Firecrawl** for MIRA. Firecrawl enables powerful web scraping capabilities including:

@@ -18,6 +18,8 @@
       --bg-input: #131615;
       --border: #1f2421;
       --border-bright: #2a3330;
+      --panel-soft: rgba(17, 20, 19, 0.8);
+      --surface-elev: rgba(20, 25, 23, 0.75);
 
       --green: #4ade80;
       --green-dim: #22c55e;
@@ -38,6 +40,10 @@
       --text-muted: #4b5563;
 
       --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --shadow-soft: 0 12px 30px rgba(0, 0, 0, 0.32);
+      --shadow-glow: 0 0 0 1px rgba(74, 222, 128, 0.12), 0 14px 34px rgba(0, 0, 0, 0.38);
 
       /* Legacy aliases kept for JS-driven inline styles */
       --bg-color: var(--bg);
@@ -105,13 +111,30 @@
       font-family: var(--font-mono);
       margin: 0;
       padding: 0;
-      background-color: var(--bg);
+      background:
+        radial-gradient(1200px 700px at 12% -15%, rgba(34, 197, 94, 0.11), transparent 55%),
+        radial-gradient(900px 480px at 100% 0%, rgba(34, 211, 238, 0.08), transparent 52%),
+        linear-gradient(180deg, #0b0e0d 0%, #0d100f 100%);
       color: var(--text);
       height: 100vh;
       height: 100dvh;
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      position: relative;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.12;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.12) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+      background-size: 34px 34px;
+      mask-image: radial-gradient(circle at center, black 30%, transparent 100%);
     }
 
     /* ── SIDEBAR ────────────────────────────────── */
@@ -121,12 +144,14 @@
       top: 0;
       width: 300px;
       height: 100%;
-      background-color: var(--bg-panel);
+      background-color: var(--panel-soft);
       border-right: 1px solid var(--border);
       z-index: 1000;
       transition: left 0.25s cubic-bezier(0.4, 0, 0.2, 1);
       padding: 20px 16px;
       overflow-y: auto;
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow-soft);
     }
 
     .sidebar.open {
@@ -199,15 +224,18 @@
       z-index: 1001;
       border-radius: 4px;
       border: 1px solid var(--border);
-      background: var(--bg-panel);
+      background: var(--surface-elev);
       color: var(--green);
       cursor: pointer;
       font-family: var(--font-mono);
-      transition: border-color 0.15s, color 0.15s;
+      transition: border-color 0.15s, color 0.15s, transform 0.15s, box-shadow 0.2s;
+      backdrop-filter: blur(6px);
     }
 
     .sidebar-toggle:hover {
       border-color: var(--green);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-glow);
     }
 
     .theme-toggle {
@@ -219,16 +247,18 @@
       z-index: 10;
       border-radius: 4px;
       border: 1px solid var(--border);
-      background: var(--bg-panel);
+      background: var(--surface-elev);
       color: var(--text-dim);
       cursor: pointer;
       font-family: var(--font-mono);
-      transition: border-color 0.15s;
+      transition: border-color 0.15s, transform 0.15s;
+      backdrop-filter: blur(6px);
     }
 
     .theme-toggle:hover {
       border-color: var(--green-dim);
       color: var(--green);
+      transform: translateY(-1px);
     }
 
     .model-switcher {
@@ -240,17 +270,20 @@
       gap: 6px;
       padding: 5px 10px;
       background: var(--bg-panel);
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--border);
       font-size: 0.72rem;
       font-family: var(--font-mono);
       z-index: 10;
-      transition: border-color 0.15s;
+      transition: border-color 0.15s, transform 0.15s, box-shadow 0.2s;
       color: var(--text-dim);
+      backdrop-filter: blur(6px);
     }
 
     .model-switcher:hover {
       border-color: var(--green-dim);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-glow);
     }
 
     .model-switcher select {
@@ -284,6 +317,8 @@
       width: 100%;
       padding: 10px 14px 10px;
       gap: 6px;
+      position: relative;
+      z-index: 1;
     }
 
     h1 {
@@ -322,10 +357,12 @@
       flex-direction: column;
       gap: 0;
       /* terminal lines stack tight */
-      background-color: var(--bg);
-      border-radius: 4px;
+      background-color: rgba(10, 13, 12, 0.5);
+      border-radius: var(--radius-md);
       border: 1px solid var(--border);
       scroll-behavior: smooth;
+      backdrop-filter: blur(4px);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
     }
 
     /* ── MESSAGES ──────────────────────────────── */
@@ -333,10 +370,16 @@
       display: flex;
       flex-direction: column;
       gap: 0;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
+      padding: 12px 12px;
+      border-bottom: 1px dashed rgba(75, 85, 99, 0.35);
       animation: termAppear 0.12s ease-out;
       position: relative;
+      border-radius: var(--radius-sm);
+      transition: background-color 0.18s, border-color 0.18s;
+    }
+
+    .message:hover {
+      background: rgba(255, 255, 255, 0.015);
     }
 
     .message:last-child {
@@ -400,6 +443,7 @@
       font-family: var(--font-mono);
       border: none;
       background: transparent !important;
+      letter-spacing: 0.01em;
     }
 
     /* User message text — yellow */
@@ -411,6 +455,10 @@
     /* MIRA message text — green/dim */
     .message.mira .message-content {
       color: var(--text);
+    }
+
+    .message.user .message-content {
+      text-shadow: 0 0 14px rgba(253, 224, 71, 0.08);
     }
 
     /* Code inside messages */
@@ -456,13 +504,14 @@
 
     .stream-step {
       padding: 3px 8px;
-      border-radius: 0;
+      border-radius: 5px;
       font-size: 0.72rem;
       line-height: 1.5;
       border-left: 2px solid var(--border-bright);
-      background: transparent;
+      background: rgba(20, 25, 23, 0.42);
       color: var(--text-muted);
       animation: stepIn 0.1s ease-out;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
     }
 
     @keyframes stepIn {
@@ -628,6 +677,10 @@
       letter-spacing: 0.08em;
       opacity: 0.7;
       line-height: 2;
+      padding: 26px 30px;
+      border: 1px dashed var(--border-bright);
+      border-radius: var(--radius-md);
+      background: rgba(12, 15, 14, 0.45);
     }
 
     .empty-state::before {
@@ -643,23 +696,24 @@
     }
 
     .file-browser-toggle {
-      background: var(--bg-panel);
+      background: var(--surface-elev);
       border: 1px solid var(--border);
       padding: 6px 12px;
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       cursor: pointer;
       font-size: 0.72rem;
       font-family: var(--font-mono);
       color: var(--text-dim);
-      transition: border-color 0.15s, color 0.15s;
+      transition: border-color 0.15s, color 0.15s, transform 0.15s;
       letter-spacing: 0.05em;
+      backdrop-filter: blur(6px);
     }
 
     .file-browser-toggle:hover {
       border-color: var(--green-dim);
       color: var(--green);
       background: var(--bg-panel);
-      transform: none;
+      transform: translateY(-1px);
     }
 
     .file-browser-toggle::before {
@@ -673,12 +727,13 @@
       left: 0;
       right: 0;
       max-height: 280px;
-      background: var(--bg-panel);
+      background: var(--panel-soft);
       border: 1px solid var(--border-bright);
-      border-radius: 4px;
+      border-radius: var(--radius-md);
       box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.6);
       overflow: hidden;
       z-index: 100;
+      backdrop-filter: blur(10px);
     }
 
     .file-browser-content.show {
@@ -726,14 +781,15 @@
       margin-bottom: 4px;
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 3px;
-      transition: border-color 0.15s;
+      border-radius: var(--radius-sm);
+      transition: border-color 0.15s, transform 0.15s, background-color 0.15s;
       flex-wrap: wrap;
     }
 
     .file-item:hover {
       border-color: var(--green-dim);
-      transform: none;
+      transform: translateY(-1px);
+      background: rgba(17, 23, 21, 0.92);
     }
 
     .file-info {
@@ -820,15 +876,17 @@
       align-items: flex-end;
       gap: 6px;
       flex-shrink: 0;
-      background: var(--bg-input);
+      background: linear-gradient(180deg, rgba(21, 27, 25, 0.9) 0%, rgba(18, 23, 21, 0.9) 100%);
       border: 1px solid var(--border);
-      border-radius: 4px;
+      border-radius: var(--radius-md);
       padding: 8px 10px;
-      transition: border-color 0.15s;
+      transition: border-color 0.15s, box-shadow 0.2s;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
     }
 
     .input-container:focus-within {
       border-color: var(--green-dim);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35), 0 0 24px rgba(34, 197, 94, 0.12);
     }
 
     /* terminal prompt prefix */
@@ -871,12 +929,12 @@
     /* ── BUTTONS ──────────────────────────────── */
     button {
       padding: 7px 14px;
-      background-color: var(--bg-panel);
+      background-color: var(--surface-elev);
       color: var(--text-dim);
       border: 1px solid var(--border);
       cursor: pointer;
-      transition: border-color 0.15s, color 0.15s;
-      border-radius: 4px;
+      transition: border-color 0.15s, color 0.15s, transform 0.15s, box-shadow 0.2s;
+      border-radius: var(--radius-sm);
       font-size: 0.78rem;
       font-family: var(--font-mono);
       font-weight: 600;
@@ -889,7 +947,9 @@
     button:hover {
       border-color: var(--green-dim);
       color: var(--green);
-      background: var(--bg-panel);
+      background: rgba(20, 24, 22, 0.95);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
     }
 
     button:active {
@@ -1386,7 +1446,7 @@
       top: 0;
       width: 320px;
       height: 100%;
-      background-color: var(--bg-panel);
+      background-color: var(--panel-soft);
       border-left: 1px solid var(--border);
       z-index: 1000;
       transition: right 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1394,6 +1454,8 @@
       overflow-y: auto;
       display: flex;
       flex-direction: column;
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow-soft);
     }
 
     .tasks-panel.open {
@@ -1437,16 +1499,18 @@
       align-items: flex-start;
       gap: 8px;
       padding: 9px 10px;
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--border);
-      background: var(--bg);
+      background: rgba(14, 18, 17, 0.85);
       margin-bottom: 6px;
       cursor: pointer;
-      transition: border-color 0.15s;
+      transition: border-color 0.15s, transform 0.15s, background-color 0.15s;
     }
 
     .task-item:hover {
       border-color: var(--green-dim);
+      background: rgba(19, 25, 23, 0.95);
+      transform: translateY(-1px);
     }
 
     .task-status-icon {
@@ -1532,13 +1596,13 @@
     .wa-toggle-btn {
       padding: 5px 9px;
       font-size: 0.72rem;
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--border);
-      background: var(--bg-panel);
+      background: var(--surface-elev);
       color: var(--text-dim);
       cursor: pointer;
       font-family: var(--font-mono);
-      transition: border-color 0.15s, color 0.15s;
+      transition: border-color 0.15s, color 0.15s, transform 0.15s;
       min-width: unset;
       min-height: unset;
       line-height: 1.4;
@@ -1548,6 +1612,7 @@
     .wa-toggle-btn.wa-active {
       border-color: #25d366;
       color: #25d366;
+      transform: translateY(-1px);
     }
 
     .wa-dot {
@@ -1802,13 +1867,13 @@
     .tasks-toggle-btn {
       padding: 5px 9px;
       font-size: 0.72rem;
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--border);
-      background: var(--bg-panel);
+      background: var(--surface-elev);
       color: var(--text-dim);
       cursor: pointer;
       font-family: var(--font-mono);
-      transition: border-color 0.15s, color 0.15s;
+      transition: border-color 0.15s, color 0.15s, transform 0.15s;
       min-width: unset;
       min-height: unset;
       line-height: 1.4;
@@ -1817,6 +1882,16 @@
     .tasks-toggle-btn:hover {
       border-color: var(--green-dim);
       color: var(--green);
+      transform: translateY(-1px);
+    }
+
+    button:focus-visible,
+    .file-btn:focus-visible,
+    .wa-input:focus-visible,
+    #input:focus-visible,
+    .model-switcher select:focus-visible {
+      outline: 1px solid rgba(74, 222, 128, 0.7);
+      outline-offset: 1px;
     }
 
     .task-badge {

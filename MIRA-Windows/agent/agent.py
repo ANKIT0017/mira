@@ -55,7 +55,7 @@ PROMPT_TOKEN_SOFT_LIMIT = int(os.getenv("MIRA_PROMPT_TOKEN_SOFT_LIMIT", "2000"))
 CHARS_PER_TOKEN_ESTIMATE = 4
 BUFFER_THRESHOLD_CHARS = 2000
 MAX_BUFFER_CONTEXT_ITEMS = int(os.getenv("MIRA_MAX_BUFFER_CONTEXT_ITEMS", "6"))
-FORCE_BUFFER_PREFIXES = ("search.", "firecrawl.", "think")
+FORCE_BUFFER_PREFIXES = ("search.", "firecrawl.", "research.", "think")
 EMAIL_REGEX = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 
 #  Synthesizer bypass 
@@ -65,6 +65,7 @@ BYPASS_SYNTHESIZER: bool = False
 
 # Tool category keywords used for fallback matching when planner categories are missing.
 CATEGORY_KEYWORDS: dict = {
+    "Research": ["research", "investigate", "source", "sources", "evidence", "fact"],
     "Web Scraping": ["scrape", "crawl", "website", "url", "web"],
     "Web & Search": ["search", "find", "lookup", "internet", "online", "news"],
     "Documents": ["document", "pdf", "markdown", "report", "convert", "excel", "xlsx", "spreadsheet", "table", "formula", "column", "row"],
@@ -384,6 +385,7 @@ _POLICY_BUFFER_SLICE   = ToolPolicy(family="buffer.slice",   empty_is_failure=Tr
 _POLICY_MEMORY_WRITE   = ToolPolicy(family="memory.write",   empty_is_failure=True)
 _POLICY_MEMORY_UPDATE  = ToolPolicy(family="memory.update",  empty_is_failure=True)
 _POLICY_AUTO_QUERY     = ToolPolicy(family="auto.query",     empty_is_failure=True)
+_POLICY_RESEARCH       = ToolPolicy(family="research",       empty_is_failure=True)
 
 
 # Registry: (prefix, policy). More-specific prefixes MUST come before shorter ones.
@@ -400,6 +402,7 @@ _TOOL_POLICY_REGISTRY: tuple = (
     ("calendar.list",      _POLICY_LIST),
     ("contacts.list",      _POLICY_LIST),
     ("search.",            _POLICY_WEB_SEARCH),   # search.duckduckgo, search.news
+    ("research.",          _POLICY_RESEARCH),
     ("pdf.read",           _POLICY_READ),
     ("word.read",          _POLICY_READ),
     ("excel.read",         _POLICY_READ),
@@ -642,8 +645,103 @@ class Agent:
                 "example": None, "notes": None, "has_var_keyword": False, "function": None,
             },
         ]
-        for _t in _buffer_tools:
+        _research_tools = [
+            {
+                "name": "research.plan",
+                "description": "Decide where to look, source types, search queries, and extraction schema for a research task",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                    "max_queries": {"type": "int", "required": False, "default": 5},
+                },
+                "example": '{"tool": "research.plan", "args": {"query": "best fiction and romance books 2026"}}',
+                "notes": "Use first for research tasks when source strategy matters.",
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.search_many",
+                "description": "Run multiple focused searches from a research plan and group the results",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                    "max_results": {"type": "int", "required": False, "default": 5},
+                },
+                "example": '{"tool": "research.search_many", "args": {"query": "best laptops for students 2026"}}',
+                "notes": None,
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.select_sources",
+                "description": "Rank and deduplicate search results into sources worth reading",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                    "max_sources": {"type": "int", "required": False, "default": 5},
+                },
+                "example": '{"tool": "research.select_sources", "args": {"query": "3 Idiots movie summary"}}',
+                "notes": None,
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.read_sources",
+                "description": "Read selected sources using web/firecrawl tools with snippet fallback",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                    "max_sources": {"type": "int", "required": False, "default": 5},
+                },
+                "example": '{"tool": "research.read_sources", "args": {"query": "latest AI regulation"}}',
+                "notes": None,
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.extract_facts",
+                "description": "Extract only intended facts from read research sources and remove noise",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                },
+                "example": '{"tool": "research.extract_facts", "args": {"query": "best books 2026"}}',
+                "notes": None,
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.synthesize",
+                "description": "Write the final answer from extracted research facts only",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                },
+                "example": '{"tool": "research.synthesize", "args": {"query": "compare phones"}}',
+                "notes": None,
+                "has_var_keyword": False,
+                "function": None,
+            },
+            {
+                "name": "research.run",
+                "description": "Full research pipeline: decide where to look, search, read sources, extract facts, and synthesize",
+                "category": "Research",
+                "parameters": {
+                    "query": {"type": "str", "required": True, "default": None},
+                    "max_queries": {"type": "int", "required": False, "default": 5},
+                    "max_sources": {"type": "int", "required": False, "default": 5},
+                },
+                "example": '{"tool": "research.run", "args": {"query": "best fiction and romance books 2026", "max_sources": 5}}',
+                "notes": "Prefer for research/recommendation/summarization tasks instead of raw search snippets.",
+                "has_var_keyword": False,
+                "function": None,
+            },
+        ]
+        for _t in _buffer_tools + _research_tools:
             TOOL_METADATA.setdefault(_t["name"], _t)
+            if _t["name"] not in self.tools:
+                self.tools.append(_t["name"])
+        self.tools = sorted(set(self.tools))
 
     def _build_system_prompt(self):
         """Build tiny fixed system prompt for small local models."""
@@ -871,6 +969,12 @@ class Agent:
     def _should_request_need_input(self, question: str, tool_name: str = "", tool_args: dict | None = None) -> tuple:
         slot = self._classify_need_input_slot(question, tool_name, tool_args)
         q_l = str(question or "").lower()
+        if re.search(r"\b(column headers?|headers?)\b", q_l):
+            headers_list = self._extract_excel_columns() if self._is_advanced_excel_task() else []
+            if headers_list:
+                headers = ", ".join(headers_list)
+                self._working_state.setdefault("slots", {})["column_headers"] = headers
+                return False, "column_headers", "Column headers are already inferable from the Excel request."
         if not slot and re.search(r"\b(name|who|recipient)\b", q_l):
             hint = str((self._working_state or {}).get("slots", {}).get("recipient_name_hint") or "").strip()
             if hint:
@@ -930,6 +1034,19 @@ class Agent:
                 }:
                     txt = self._normalize_delivery_body(txt)
                 slots["message_body"] = txt[:12000]
+
+        if tool_name.startswith("research."):
+            if isinstance(tool_res, dict):
+                answer = str(tool_res.get("answer") or "").strip()
+                if answer:
+                    slots["research_answer"] = answer[:12000]
+                    slots.setdefault("summary", answer[:12000])
+                facts = tool_res.get("facts")
+                if facts:
+                    try:
+                        slots["research_facts"] = json.dumps(facts, ensure_ascii=False, default=str)[:12000]
+                    except Exception:
+                        slots["research_facts"] = str(facts)[:12000]
 
         if tool_name in ("filesystem.write", "filesystem.append"):
             raw_path = str(
@@ -1140,11 +1257,17 @@ class Agent:
                         lines.append("- " + re.sub(r"\s+", " ", str(item)).strip()[:260])
 
             if not lines:
-                for key in ("text", "result", "content", "message", "body", "summary"):
+                for key in ("answer", "text", "result", "content", "message", "body", "summary"):
                     val = data.get(key)
                     if isinstance(val, str) and val.strip():
                         lines.append(val.strip())
                         break
+            if not lines and isinstance(data.get("facts"), list):
+                for item in data.get("facts", [])[:10]:
+                    if isinstance(item, dict):
+                        lines.append("- " + json.dumps(item, ensure_ascii=False, default=str)[:500])
+                    elif str(item).strip():
+                        lines.append("- " + str(item).strip()[:500])
             if not lines:
                 small = {
                     k: v for k, v in data.items()
@@ -1365,6 +1488,453 @@ class Agent:
                 queries.append(q)
         return queries
 
+    def _is_research_task(self, text: str | None = None) -> bool:
+        t = str(text if text is not None else getattr(self, "_current_task_text", "") or "").lower()
+        if not re.search(r"\b(find|search|research|look up|lookup|best|recommend|compare|summari[sz]e|top|latest|review|gather)\b", t):
+            return False
+        return bool(
+            re.search(r"\b(web|internet|online|latest|current|202\d|best|top|recommend|book|movie|product|company|paper|article|news|source|summar|research|study|medical|health|law|legal|information|info|details)\b", t)
+        )
+
+    def _normalize_research_steps(self, steps: list) -> list:
+        """Upgrade raw web-search steps into the reusable research pipeline."""
+        if not steps or not self._is_research_task():
+            return steps
+        pure_research = not any(
+            any(str(step.get("action", "")).strip().lower().startswith(p) for p in _SIDE_EFFECT_PREFIXES)
+            or re.search(r"\b(send|write|create|save|delete|update|append|email|whatsapp|calendar|todo)\b", str(step.get("goal", "")).lower())
+            for step in steps
+        )
+        if pure_research:
+            return [{
+                "action": "research.run",
+                "goal": "Research topic and extract clean facts",
+                "outputs": ["research_answer"],
+                "needed_by": [],
+                "categories": self._normalize_categories(["Research"]),
+            }]
+        out = []
+        for step in steps:
+            s = dict(step)
+            act = str(s.get("action", "")).strip().lower()
+            goal_l = str(s.get("goal", "")).lower()
+            if act in {"search.duckduckgo", "search.news", "firecrawl.search"} or (
+                not act and re.search(r"\b(find|search|research|look up|lookup|gather)\b", goal_l)
+            ):
+                s["action"] = "research.run"
+                s["goal"] = "Research topic and extract clean facts"
+                if not s.get("outputs"):
+                    s["outputs"] = ["research_facts"]
+                s["categories"] = self._normalize_categories(["Research"])
+                s.pop("inputs", None)
+            out.append(s)
+        return out
+
+    def _research_query_from_args(self, args: dict) -> str:
+        query = str(
+            args.get("query")
+            or args.get("topic")
+            or args.get("task")
+            or args.get("question")
+            or ""
+        ).strip()
+        task = str(getattr(self, "_current_task_text", "") or "").strip()
+        if query:
+            query_l = re.sub(r"\s+", " ", query.lower()).strip()
+            task_l = re.sub(r"\s+", " ", task.lower()).strip()
+            omitted_constraints = re.search(
+                r"\b(not opinions?|financials?|technical analysis|investors?|execution|business|fundamental)\b",
+                task_l,
+            ) and not re.search(
+                r"\b(not opinions?|financials?|technical analysis|investors?|execution|business|fundamental)\b",
+                query_l,
+            )
+            if task and len(task) > len(query) + 20 and (query_l in task_l or omitted_constraints):
+                return task
+            return query
+        step = str(getattr(self, "_current_step_desc", "") or "").strip()
+        return step or task
+
+    def _research_plan(self, query: str, max_queries: int = 5) -> dict:
+        q = re.sub(r"\s+", " ", str(query or "")).strip()
+        q_l = q.lower()
+        source_types = ["official or primary sources", "credible reference pages", "recent authoritative articles"]
+        preferred_domains: list[str] = []
+        avoid = ["ads", "thin SEO pages", "forum comments unless user asks for opinions"]
+        schema = ["claim", "item/title", "summary", "source", "url", "date if available"]
+        needs_news = bool(re.search(r"\b(latest|today|current|recent|news|2026|this year)\b", q_l))
+
+        if re.search(r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis|institutional investors?)\b", q_l):
+            source_types = [
+                "company investor relations and annual reports",
+                "SEC filings and earnings releases",
+                "financial statement and ownership data sources",
+                "price/volume technical analysis sources",
+            ]
+            preferred_domains = [
+                "sec.gov",
+                "nasdaq.com",
+                "finance.yahoo.com",
+                "stockanalysis.com",
+                "tradingview.com",
+                "companiesmarketcap.com",
+            ]
+            avoid.extend([
+                "opinion-only stock picks",
+                "sponsored recommendations",
+                "articles without ticker-level financial evidence",
+            ])
+            schema = [
+                "ticker",
+                "company",
+                "business model",
+                "execution evidence",
+                "major investors/ownership",
+                "revenue/profit/cash-flow/debt facts",
+                "technical trend/support/resistance/volume",
+                "risk",
+                "source",
+                "url",
+                "date if available",
+            ]
+        elif re.search(r"\b(book|novel|fiction|romance|author|reading)\b", q_l):
+            source_types = ["publisher/bookseller pages", "book review/editorial lists", "Goodreads/library catalog pages"]
+            preferred_domains = ["goodreads.com", "publishersweekly.com", "bookriot.com", "kirkusreviews.com", "penguinrandomhouse.com"]
+            schema = ["title", "author", "genre/category", "release date/year", "why it matches", "short summary", "source", "url"]
+        elif re.search(r"\b(movie|film|series|episode|plot|cast)\b", q_l):
+            source_types = ["IMDb or TMDb pages", "Wikipedia/reference pages", "critic/review pages"]
+            preferred_domains = ["imdb.com", "wikipedia.org", "rottentomatoes.com", "themoviedb.org"]
+            schema = ["title", "year", "genre", "plot summary", "themes", "source", "url"]
+        elif re.search(r"\b(product|buy|price|laptop|phone|camera|headphone|software)\b", q_l):
+            source_types = ["official product pages", "trusted reviews", "retailer/spec pages"]
+            preferred_domains = ["consumerreports.org", "rtings.com", "wirecutter.com", "tomsguide.com", "pcmag.com"]
+            schema = ["product", "price/spec", "pros", "cons", "best-for", "source", "url"]
+        elif re.search(r"\b(paper|study|research|journal|medical|health|disease|treatment)\b", q_l):
+            source_types = ["peer-reviewed papers", "government/medical institutions", "systematic reviews"]
+            preferred_domains = ["pubmed.ncbi.nlm.nih.gov", "nih.gov", "who.int", "nature.com", "thelancet.com"]
+            schema = ["finding", "population/context", "evidence strength", "date", "source", "url"]
+        elif re.search(r"\b(law|legal|regulation|tax|visa|government|policy)\b", q_l):
+            source_types = ["government pages", "official regulations", "reputable legal explainers"]
+            preferred_domains = ["gov", "usa.gov", "ecfr.gov", "federalregister.gov", "congress.gov"]
+            schema = ["rule/fact", "jurisdiction", "effective date", "official source", "url"]
+        elif re.search(r"\b(company|ceo|founder|funding|revenue|stock|market)\b", q_l):
+            source_types = ["company official pages", "regulatory filings", "reputable business/news sources"]
+            preferred_domains = ["sec.gov", "reuters.com", "bloomberg.com", "crunchbase.com"]
+            schema = ["company/person", "fact", "date", "source", "url"]
+
+        queries = [q]
+        if re.search(r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis)\b", q_l):
+            queries.extend([
+                f"{q} revenue earnings free cash flow debt institutional ownership",
+                f"{q} SEC filings annual report investor presentation",
+                f"{q} technical analysis price trend support resistance volume",
+                f"{q} stockanalysis financials ownership technicals",
+            ])
+        for domain in preferred_domains[:3]:
+            if domain == "gov":
+                queries.append(f"{q} official government")
+            else:
+                queries.append(f"site:{domain} {q}")
+        if needs_news:
+            queries.append(f"{q} latest news")
+        if re.search(r"\b(summary|summarize|summarise|plot|synopsis)\b", q_l):
+            queries.append(f"{q} summary synopsis")
+        if re.search(r"\b(best|top|recommend)\b", q_l):
+            queries.append(f"{q} recommendations list")
+
+        deduped = []
+        seen = set()
+        for item in queries:
+            clean = re.sub(r"\s+", " ", item).strip()
+            key = clean.lower()
+            if clean and key not in seen:
+                seen.add(key)
+                deduped.append(clean)
+            if len(deduped) >= max(1, min(int(max_queries or 5), 8)):
+                break
+
+        return {
+            "query": q,
+            "where_to_look": source_types,
+            "preferred_domains": preferred_domains,
+            "avoid": avoid,
+            "queries": deduped,
+            "extraction_schema": schema,
+            "needs_news": needs_news,
+        }
+
+    def _run_registered_tool(self, tool_name: str, args: dict) -> dict:
+        try:
+            if tool_name not in self.tools:
+                import importlib
+                prefix = tool_name.split(".", 1)[0]
+                module_map = {
+                    "search": "mcp_server.connectors.search",
+                    "web": "mcp_server.connectors.web",
+                    "firecrawl": "mcp_server.connectors.firecrawl",
+                }
+                if prefix in module_map:
+                    importlib.import_module(module_map[prefix])
+                    self.tools = sorted(set(list_tools()) | set(self.tools or []))
+            return execute_tool(tool_name, **(args or {}))
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def _research_search_many(self, plan: dict, max_results: int = 5) -> dict:
+        all_results = []
+        errors = []
+        for q in (plan.get("queries") or [])[:8]:
+            tool_name = "search.news" if plan.get("needs_news") and re.search(r"\b(news|latest|today|current|recent)\b", q, re.IGNORECASE) else "search.duckduckgo"
+            if tool_name not in self.tools:
+                tool_name = "search.duckduckgo"
+            res = self._run_registered_tool(tool_name, {"query": q, "max_results": int(max_results or 5)})
+            if isinstance(res, dict) and res.get("status") == "error":
+                errors.append(f"{tool_name}({q}): {res.get('error', 'unknown error')}")
+                continue
+            payload = res.get("result", res) if isinstance(res, dict) else res
+            results = payload.get("results", []) if isinstance(payload, dict) else []
+            for item in results:
+                if isinstance(item, dict):
+                    enriched = dict(item)
+                    enriched["source_query"] = q
+                    enriched["search_tool"] = tool_name
+                    all_results.append(enriched)
+        return {"query": plan.get("query", ""), "results": all_results, "count": len(all_results), "errors": errors[:5]}
+
+    def _research_select_sources(self, plan: dict, search_payload: dict, max_sources: int = 5) -> list[dict]:
+        preferred = [str(d).lower() for d in plan.get("preferred_domains", [])]
+        query_terms = {
+            w for w in re.findall(r"[a-z0-9]{3,}", str(plan.get("query", "")).lower())
+            if w not in {"the", "and", "for", "with", "best", "top", "latest", "summary"}
+        }
+        scored = []
+        seen_urls = set()
+        seen_hosts = {}
+        for item in search_payload.get("results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("link") or "").strip()
+            title = str(item.get("title") or "").strip()
+            snippet = str(item.get("snippet") or item.get("summary") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url).split("/", 1)[0].lower())
+            text = f"{title} {snippet} {host}".lower()
+            score = 0
+            score += sum(2 for term in query_terms if term in text)
+            score += 6 if any(d in host or (d == "gov" and host.endswith(".gov")) for d in preferred) else 0
+            score += 2 if re.search(r"\b(summary|review|best|top|list|official|plot|release|guide)\b", text) else 0
+            score -= 3 if re.search(r"youtube|facebook|instagram|pinterest|reddit", host) else 0
+            score -= seen_hosts.get(host, 0) * 2
+            seen_hosts[host] = seen_hosts.get(host, 0) + 1
+            scored.append((score, item))
+        selected = [item for _, item in sorted(scored, key=lambda kv: kv[0], reverse=True)[: max(1, min(int(max_sources or 5), 8))]]
+        return selected
+
+    def _research_read_sources(self, selected: list[dict]) -> list[dict]:
+        pages = []
+        for src in selected[:8]:
+            url = str(src.get("url") or src.get("link") or "").strip()
+            title = str(src.get("title") or "").strip()
+            snippet = str(src.get("snippet") or src.get("summary") or "").strip()
+            content = ""
+            reader = ""
+            if url:
+                for tool_name, tool_args in (
+                    ("firecrawl.scrape", {"url": url}),
+                    ("web.read", {"url": url}),
+                ):
+                    res = self._run_registered_tool(tool_name, tool_args)
+                    payload = res.get("result", res) if isinstance(res, dict) else res
+                    if isinstance(payload, dict) and payload.get("status") == "error":
+                        continue
+                    if isinstance(payload, dict):
+                        content = str(
+                            payload.get("content")
+                            or payload.get("markdown")
+                            or payload.get("text")
+                            or payload.get("summary")
+                            or ""
+                        ).strip()
+                        title = str(payload.get("title") or title).strip()
+                    elif isinstance(payload, str):
+                        content = payload.strip()
+                    if content:
+                        reader = tool_name
+                        break
+            if not content:
+                content = snippet
+                reader = "search.snippet"
+            pages.append({
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "content": content[:5000],
+                "reader": reader,
+                "source_query": src.get("source_query", ""),
+            })
+        return pages
+
+    def _extract_json_array(self, text: str) -> list:
+        raw = str(text or "").strip()
+        m = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start >= 0 and end > start:
+            raw = raw[start:end + 1]
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, list) else []
+        except Exception:
+            return []
+
+    def _research_extract_facts(self, query: str, plan: dict, pages: list[dict]) -> list[dict]:
+        if not pages:
+            return []
+        finance_research = bool(re.search(
+            r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis)\b",
+            str(query or "").lower(),
+        ))
+        source_text = []
+        for idx, page in enumerate(pages[:6], start=1):
+            source_text.append(
+                f"SOURCE {idx}\nTitle: {page.get('title','')}\nURL: {page.get('url','')}\n"
+                f"Content:\n{str(page.get('content',''))[:1800]}"
+            )
+        finance_rule = (
+            "For stock research, extract ticker-level evidence only. Each useful object should identify a ticker/company and at least one concrete business, execution, investor/ownership, financial, or technical-analysis fact. "
+            "Reject opinion-only stock picks and sector-only claims unless they connect to a named company.\n"
+            if finance_research else ""
+        )
+        prompt = (
+            "Extract only the facts needed for the user's research request. Remove ads, navigation, duplicate noise, and unrelated items.\n"
+            f"{finance_rule}"
+            f"User request: {query}\n"
+            f"Where to look: {json.dumps(plan.get('where_to_look', []), ensure_ascii=False)}\n"
+            f"Extraction schema: {json.dumps(plan.get('extraction_schema', []), ensure_ascii=False)}\n"
+            "Return JSON only: an array of objects. Each object must include source and url when available.\n\n"
+            + "\n\n".join(source_text)
+        )
+        facts = []
+        try:
+            out = generate(prompt, model=getattr(self, "_exec_model", "local"), max_tokens=1800, timeout=180, temperature=0.1)
+            facts = self._extract_json_array(out)
+        except Exception:
+            facts = []
+        if facts:
+            clean = []
+            seen = set()
+            for item in facts[:30]:
+                if not isinstance(item, dict):
+                    continue
+                key = self._normalize_key(json.dumps(item, sort_keys=True, ensure_ascii=False)[:300])
+                if key and key not in seen:
+                    seen.add(key)
+                    clean.append(item)
+            return clean
+        # Deterministic fallback: keep source-level evidence if LLM extraction fails.
+        for page in pages[:8]:
+            summary = re.sub(r"\s+", " ", str(page.get("content") or page.get("snippet") or "")).strip()[:360]
+            if summary:
+                facts.append({
+                    "claim": summary,
+                    "source": page.get("title", ""),
+                    "url": page.get("url", ""),
+                })
+        return facts
+
+    def _research_synthesize(self, query: str, plan: dict, facts: list[dict]) -> str:
+        if not facts:
+            return "I could not extract reliable facts from the available research sources."
+        finance_research = bool(re.search(
+            r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis)\b",
+            str(query or "").lower(),
+        ))
+        finance_rule = (
+            "For stock-investment research, do not present sectors, themes, or opinion-list mentions as final stock picks. "
+            "Only rank named companies/tickers that have extracted evidence for business/execution, financials, investors/ownership, and technical trend. "
+            "If the facts do not contain enough ticker-level evidence, state that clearly and list what evidence is missing instead of inventing recommendations. "
+            "Avoid financial-advice language; present this as research, not a guarantee.\n"
+            if finance_research else ""
+        )
+        prompt = (
+            "Write the final answer using only the extracted research facts below. "
+            "Be concise, concrete, and do not mention internal buffers or tool steps. "
+            "If the request asks to summarize items, summarize each item separately. "
+            "Include source names/URLs briefly when useful.\n\n"
+            f"{finance_rule}"
+            f"User request: {query}\n"
+            f"Facts:\n{json.dumps(facts[:25], ensure_ascii=False, indent=2)}"
+        )
+        try:
+            ans = generate(prompt, model=getattr(self, "_exec_model", "local"), max_tokens=1800, timeout=180, temperature=0.1)
+            ans = self._sanitize_delivery_message(ans)
+            if ans and len(ans) >= 40:
+                return ans
+        except Exception:
+            pass
+        lines = []
+        for idx, fact in enumerate(facts[:10], start=1):
+            title = fact.get("title") or fact.get("item") or fact.get("claim") or fact.get("summary") or f"Finding {idx}"
+            detail = fact.get("short summary") or fact.get("summary") or fact.get("why it matches") or fact.get("claim") or ""
+            src = fact.get("source") or fact.get("url") or ""
+            lines.append(f"{idx}. {title}: {str(detail)[:240]}" + (f" Source: {src}" if src else ""))
+        return "\n".join(lines)
+
+    def _execute_research_tool(self, tool_name: str, args: dict) -> dict:
+        query = self._research_query_from_args(args or {})
+        if not query:
+            return {"status": "error", "error": "research tool requires query/topic/task."}
+        max_queries = int((args or {}).get("max_queries") or 5)
+        max_sources = int((args or {}).get("max_sources") or 5)
+        plan = self._research_plan(query, max_queries=max_queries)
+        if tool_name == "research.plan":
+            return {"status": "success", **plan}
+        searches = self._research_search_many(plan, max_results=int((args or {}).get("max_results") or 5))
+        if tool_name == "research.search_many":
+            status = "success" if searches.get("count", 0) else "error"
+            if status == "error":
+                return {"status": "error", "error": "Research search returned no results.", "plan": plan, **searches}
+            return {"status": "success", "plan": plan, **searches}
+        selected = self._research_select_sources(plan, searches, max_sources=max_sources)
+        if tool_name == "research.select_sources":
+            if not selected:
+                return {"status": "error", "error": "No useful research sources were found.", "plan": plan, "search": searches}
+            return {"status": "success", "plan": plan, "sources": selected, "source_count": len(selected)}
+        pages = self._research_read_sources(selected)
+        if tool_name == "research.read_sources":
+            if not pages:
+                return {"status": "error", "error": "No research sources could be read.", "plan": plan, "sources": selected}
+            return {"status": "success", "plan": plan, "sources": selected, "pages": pages, "page_count": len(pages)}
+        facts = self._research_extract_facts(query, plan, pages)
+        if tool_name == "research.extract_facts":
+            if not facts:
+                return {"status": "error", "error": "No useful facts could be extracted from research sources.", "plan": plan, "sources": selected}
+            return {"status": "success", "plan": plan, "sources": selected, "facts": facts, "fact_count": len(facts)}
+        if not searches.get("count", 0):
+            return {"status": "error", "error": "Research search returned no results.", "plan": plan, "search": searches}
+        if not selected:
+            return {"status": "error", "error": "No useful research sources were found.", "plan": plan, "search": searches}
+        if not facts:
+            return {"status": "error", "error": "No useful facts could be extracted from research sources.", "plan": plan, "sources": selected}
+        answer = self._research_synthesize(query, plan, facts)
+        return {
+            "status": "success",
+            "query": query,
+            "where_to_look": plan.get("where_to_look", []),
+            "queries": plan.get("queries", []),
+            "sources": [
+                {"title": s.get("title", ""), "url": s.get("url", ""), "source_query": s.get("source_query", "")}
+                for s in selected
+            ],
+            "facts": facts,
+            "answer": answer,
+            "fact_count": len(facts),
+        }
+
     def _parse_needed_by(self, raw: str) -> list[int]:
         """Parse planner dependency targets as one-based step numbers."""
         if not raw:
@@ -1482,13 +2052,21 @@ class Agent:
                         source_step, source_goal, needed_by or [], "recipient_email", emails[0], buffer_id=buffer_id
                     )
                 continue
-            if slot in {"file_path", "filepath", "path"}:
+            if slot in {"file_path", "filepath", "path", "excel_file_path"}:
                 files = self._extract_key_data(payload).get("files", [])
+                if not files and isinstance(tool_res, dict):
+                    path_val = str(tool_res.get("path") or tool_res.get("file_path") or "").strip()
+                    if path_val:
+                        files = [path_val]
                 if files:
-                    slots["file_path"] = files[0]
+                    bare = self._bare_excel_filename(files[0]) if slot == "excel_file_path" else files[0]
+                    slots[slot] = bare
+                    if slot == "excel_file_path":
+                        artifacts["excel_file_path"] = bare
+                    slots.setdefault("file_path", files[0])
                     artifacts["last_file_path"] = files[0]
                     self._route_dependency_output(
-                        source_step, source_goal, needed_by or [], "file_path", files[0], buffer_id=buffer_id
+                        source_step, source_goal, needed_by or [], slot, bare, buffer_id=buffer_id
                     )
                 continue
             if payload:
@@ -2103,6 +2681,7 @@ class Agent:
             "knowledge base": "Knowledge Base",
             "knowledge": "Knowledge Base",
             "buffer": "Buffer",
+            "research": "Research",
             "system": "System",
             "workflows": "Workflows",
             "workflow": "Workflows",
@@ -2129,6 +2708,7 @@ class Agent:
         step_l = (step_desc or "").lower()
 
         rules = [
+            ("Research", r"\b(research|find|search|lookup|look up|best|recommend|summari[sz]e|compare|latest|top)\b", "research.run"),
             ("Web & Search", r"\bnews\b", "search.news"),
             ("Web & Search", r"\b(search|find|lookup|look up)\b", "search.duckduckgo"),
             ("Filesystem", r"\b(write|save|create file)\b", "filesystem.write"),
@@ -2334,16 +2914,6 @@ class Agent:
         """
         if not completed or not all(s.get("status") == "done" for s in completed):
             return ""
-        slots = (self._working_state or {}).get("slots", {})
-        preferred = (
-            "final_summary", "final_answer", "answer", "book_summaries",
-            "summary", "report", "message_body",
-        )
-        for key in preferred:
-            val = str(slots.get(key) or "").strip()
-            if val and len(val) >= 40 and not self._looks_like_raw_retrieval_payload(val):
-                return self._sanitize_delivery_message(val)
-
         last = completed[-1]
         if str(last.get("tool", "")).lower() == "think":
             raw = str(last.get("raw_payload") or "").strip()
@@ -2352,6 +2922,16 @@ class Agent:
                 payload = self._sanitize_delivery_message(payload)
                 if payload and len(payload) >= 40 and not self._looks_like_raw_retrieval_payload(payload):
                     return payload
+        slots = (self._working_state or {}).get("slots", {})
+        preferred = (
+            "final_summary", "final_answer", "research_answer", "answer", "book_summaries",
+            "summary", "report", "message_body",
+        )
+        for key in preferred:
+            val = str(slots.get(key) or "").strip()
+            if val and len(val) >= 40 and not self._looks_like_raw_retrieval_payload(val):
+                return self._sanitize_delivery_message(val)
+
         return ""
 
     def _maybe_stage_workflow_suggestion(
@@ -2690,6 +3270,759 @@ class Agent:
             est += 1  # verify step
 
         return max(1, min(est, 8))
+
+    def _is_advanced_excel_task(self, text: str | None = None) -> bool:
+        """Detect Excel requests that need workbook logic beyond simple row export."""
+        t = str(text if text is not None else getattr(self, "_current_task_text", "") or "").lower()
+        return bool(
+            re.search(r"\b(excel|xlsx|spreadsheet|workbook|sheet)\b", t)
+            and re.search(
+                r"\b(formula|calculate|pivot|chart|dashboard|kpi|highlight|conditional|sort|top\s+\d+|lowest|highest|margin|trend|summary|analysis)\b",
+                t,
+            )
+        )
+
+    def _excel_task_text(self) -> str:
+        """Combine the original Excel request with any user-provided tabular data."""
+        parts = [str(getattr(self, "_current_task_text", "") or "")]
+        for _, ans in sorted((self._input_answers or {}).items()):
+            if isinstance(ans, str) and ans.strip():
+                parts.append(ans)
+        return "\n".join(parts)
+
+    def _extract_excel_output_filename(self, fallback: str = "analysis_final.xlsx") -> str:
+        """Prefer a filename mentioned after 'save/final/as', otherwise last xlsx."""
+        text = self._excel_task_text()
+        for pat in (
+            r"(?:save\s+(?:the\s+)?(?:final\s+)?file\s+as|save\s+as|final\s+file\s+as|output\s+file\s+as)[^\n`]{0,80}`?([A-Za-z0-9_. -]+\.xlsx)`?",
+            r"(?:save|final file|output file)[^\n`]{0,80}`?([A-Za-z0-9_. -]+\.xlsx)`?",
+        ):
+            final_match = re.search(pat, text, re.IGNORECASE)
+            if final_match:
+                return self._bare_excel_filename(final_match.group(1), fallback=fallback)
+        names = re.findall(r"`?([A-Za-z0-9_. -]+\.xlsx)`?", text, flags=re.IGNORECASE)
+        return self._bare_excel_filename(names[-1], fallback=fallback) if names else fallback
+
+    def _extract_excel_columns(self) -> list[str]:
+        """Extract requested columns from bullets or CSV headers."""
+        text = self._excel_task_text()
+        bullet_cols = []
+        in_columns_area = False
+        for line in text.splitlines():
+            l = line.strip()
+            if re.search(r"\bcolumns?\b", l, re.IGNORECASE):
+                in_columns_area = True
+                continue
+            if in_columns_area:
+                m = re.match(r"^\*\s*`?([A-Za-z_][A-Za-z0-9_ ]*)`?\s*$", l)
+                if m:
+                    col = re.sub(r"\s+", "_", m.group(1).strip())
+                    if col not in bullet_cols:
+                        bullet_cols.append(col)
+                    continue
+                if l and not l.startswith("*"):
+                    in_columns_area = False
+        if bullet_cols:
+            return bullet_cols
+        m = re.search(r"([A-Za-z_][A-Za-z0-9_ ]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_ ]*){2,})", text)
+        if not m:
+            return []
+        cols = [re.sub(r"\s+", "_", c.strip()) for c in m.group(1).split(",") if c.strip()]
+        return cols
+
+    def _parse_generic_tabular_records(self) -> list[dict]:
+        """Parse pasted CSV-like data using requested/header columns."""
+        import csv
+        import io
+
+        text = self._excel_task_text()
+        columns = self._extract_excel_columns()
+        if not columns:
+            return []
+        header_pat = r"\s*,\s*".join(re.escape(c).replace("_", r"[_ ]") for c in columns)
+        m = re.search(header_pat, text, flags=re.IGNORECASE)
+        if not m:
+            return []
+        body = text[m.end():].strip()
+        # Common pasted shape: header row followed by rows separated only by spaces.
+        body = re.sub(r"\s+(?=\d+\s*,\s*\d{4}-\d{2}-\d{2}\s*,)", "\n", body)
+        rows = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        if not rows and body:
+            rows = [body]
+        csv_text = ",".join(columns) + "\n" + "\n".join(rows)
+        parsed = []
+        for row in csv.DictReader(io.StringIO(csv_text)):
+            rec = {}
+            for col in columns:
+                val = str(row.get(col, "") or "").strip()
+                if re.fullmatch(r"-?\d+", val):
+                    val = int(val)
+                elif re.fullmatch(r"-?\d+\.\d+", val):
+                    val = float(val)
+                rec[col] = val
+            if any(str(v).strip() for v in rec.values()):
+                parsed.append(rec)
+        return parsed
+
+    def _extract_excel_formulas(self, headers: list[str]) -> list[tuple[str, str]]:
+        """Extract derived-column formulas like Profit = Revenue - Cost."""
+        text = self._excel_task_text()
+        formulas = []
+        seen = set()
+        for lhs, rhs in re.findall(r"(?m)^\s*([A-Za-z][A-Za-z0-9_ ]{1,40})\s*=\s*([A-Za-z0-9_ ().+\-*/%]+)\s*$", text):
+            out_col = re.sub(r"\s+", "_", lhs.strip())
+            expr = rhs.strip()
+            if out_col.lower() in {h.lower() for h in headers}:
+                continue
+            key = out_col.lower()
+            if key not in seen:
+                formulas.append((out_col, expr))
+                seen.add(key)
+        # Also catch "Formula:\n Profit = ..." after indentation was flattened.
+        for lhs, rhs in re.findall(r"Formula:\s*([A-Za-z][A-Za-z0-9_ ]{1,40})\s*=\s*([A-Za-z0-9_ ().+\-*/%]+)", text, re.IGNORECASE):
+            out_col = re.sub(r"\s+", "_", lhs.strip())
+            key = out_col.lower()
+            if key not in seen:
+                formulas.append((out_col, rhs.strip()))
+                seen.add(key)
+        return formulas
+
+    def _formula_to_excel(self, expr: str, header_cols: dict[str, int], row: int) -> str:
+        """Translate a simple field-name expression into an Excel row formula."""
+        formula = str(expr or "")
+        for name, col_idx in sorted(header_cols.items(), key=lambda kv: len(kv[0]), reverse=True):
+            col_letter = self._excel_col_letter(col_idx)
+            variants = {name, name.replace("_", " ")}
+            for var in variants:
+                formula = re.sub(rf"\b{re.escape(var)}\b", f"{col_letter}{row}", formula, flags=re.IGNORECASE)
+        return "=" + formula.replace("%", "/100")
+
+    def _evaluate_excel_expr(self, expr: str, values: dict) -> float | None:
+        """Evaluate simple arithmetic formulas for summaries without relying on Excel."""
+        formula = str(expr or "")
+        for name, val in sorted(values.items(), key=lambda kv: len(str(kv[0])), reverse=True):
+            if isinstance(val, (int, float)):
+                repl = str(float(val))
+            else:
+                try:
+                    repl = str(float(str(val).replace(",", "")))
+                except Exception:
+                    continue
+            for var in {str(name), str(name).replace("_", " ")}:
+                formula = re.sub(rf"\b{re.escape(var)}\b", repl, formula, flags=re.IGNORECASE)
+        formula = formula.replace("%", "/100")
+        if not re.fullmatch(r"[\d\s().+\-*/]+", formula):
+            return None
+        try:
+            val = eval(formula, {"__builtins__": {}}, {})
+            return float(val)
+        except Exception:
+            return None
+
+    def _excel_col_letter(self, idx: int) -> str:
+        letters = ""
+        while idx:
+            idx, rem = divmod(idx - 1, 26)
+            letters = chr(65 + rem) + letters
+        return letters
+
+    def _normalize_key(self, s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+    def _build_generic_excel_workbook(self, records: list[dict], output_path: str | None = None) -> dict:
+        """Generic advanced Excel builder: formulas, summaries, charts, dashboard."""
+        if not records:
+            return {"status": "error", "error": "No parseable tabular records found for the Excel workbook."}
+        try:
+            from openpyxl import Workbook
+            from openpyxl.chart import BarChart, LineChart, Reference
+            from openpyxl.formatting.rule import FormulaRule
+            from openpyxl.styles import Font, PatternFill
+            from openpyxl.worksheet.table import Table, TableStyleInfo
+        except Exception as e:
+            return {"status": "error", "error": f"openpyxl unavailable: {e}"}
+
+        output_name = self._bare_excel_filename(output_path or self._extract_excel_output_filename(), fallback="analysis_final.xlsx")
+        sandbox = (Path(__file__).parent.parent / SANDBOX_DIR).resolve()
+        sandbox.mkdir(parents=True, exist_ok=True)
+        output = sandbox / output_name
+
+        headers = list(records[0].keys())
+        formulas = self._extract_excel_formulas(headers)
+        for out_col, _ in formulas:
+            if out_col not in headers:
+                headers.append(out_col)
+        formula_cols = {out for out, _ in formulas}
+
+        computed_records = []
+        for rec in records:
+            vals = dict(rec)
+            for out_col, expr in formulas:
+                calc = self._evaluate_excel_expr(expr, vals)
+                vals[out_col] = calc if calc is not None else ""
+            computed_records.append(vals)
+
+        text = self._excel_task_text()
+        if re.search(r"\bsort\b", text, re.IGNORECASE) and computed_records:
+            sort_fields = []
+            for field in re.findall(r"(?:highest|lowest)\s+([A-Za-z_ ]+?)\s+first", text, re.IGNORECASE):
+                h = next((x for x in headers if self._normalize_key(x) == self._normalize_key(field)), "")
+                if h:
+                    sort_fields.append((h, "desc" if re.search(rf"highest\s+{re.escape(field)}", text, re.IGNORECASE) else "asc"))
+            for field in re.findall(r"(?:then\s+by|by)\s+([A-Za-z_ ]+?)\s+descending", text, re.IGNORECASE):
+                h = next((x for x in headers if self._normalize_key(x) == self._normalize_key(field)), "")
+                if h and all(existing != h for existing, _ in sort_fields):
+                    sort_fields.append((h, "desc"))
+            if sort_fields:
+                def _sort_val(rec: dict, field: str):
+                    try:
+                        return float(rec.get(field, 0) or 0)
+                    except Exception:
+                        return str(rec.get(field, ""))
+                # Apply stable sorts from last key to first so mixed directions work.
+                for field, direction in reversed(sort_fields[:3]):
+                    computed_records.sort(key=lambda r, f=field: _sort_val(r, f), reverse=(direction == "desc"))
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        ws.append(headers)
+        header_cols = {h: i + 1 for i, h in enumerate(headers)}
+        base_headers = [h for h in records[0].keys()]
+        for r_idx, rec in enumerate(computed_records, start=2):
+            row = []
+            for h in headers:
+                if h in rec and h not in formula_cols:
+                    row.append(rec[h])
+                else:
+                    formula_expr = next((expr for out, expr in formulas if out == h), "")
+                    row.append(self._formula_to_excel(formula_expr, header_cols, r_idx) if formula_expr else "")
+            ws.append(row)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        ws.freeze_panes = "A2"
+        for idx, h in enumerate(headers, start=1):
+            ws.column_dimensions[self._excel_col_letter(idx)].width = max(12, min(24, len(h) + 3))
+        end_row = len(records) + 1
+        ws.add_table(Table(displayName="DataTable", ref=f"A1:{self._excel_col_letter(len(headers))}{end_row}"))
+        ws.tables["DataTable"].tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+
+        # Generic conditional highlighting for "A below X and B greater than Y".
+        conds = []
+        text_words = re.sub(r"[_\s]+", " ", text.lower())
+        for match in headers:
+            field_pat = re.sub(r"[_\s]+", r"\\s+", match.lower())
+            for op, num in re.findall(
+                rf"\b{field_pat}\s+(?:is\s+|are\s+)?(below|less than|greater than|above|under|over)\s+([\d,]+(?:\.\d+)?%?)",
+                text_words,
+                re.IGNORECASE,
+            ):
+                n = num.replace(",", "")
+                if n.endswith("%"):
+                    n = n[:-1]
+                symbol = "<" if op.lower() in {"below", "less than", "under"} else ">"
+                conds.append(f"${self._excel_col_letter(header_cols[match])}2{symbol}{n}")
+        if conds:
+            ws.conditional_formatting.add(
+                f"A2:{self._excel_col_letter(len(headers))}{end_row}",
+                FormulaRule(formula=["AND(" + ",".join(conds[:4]) + ")"], fill=PatternFill("solid", fgColor="FFC7CE")),
+            )
+
+        summary = wb.create_sheet("Summaries")
+        summary_row = 1
+        numeric_headers = [
+            h for h in headers
+            if any(isinstance(r.get(h), (int, float)) for r in computed_records) or h in formula_cols
+        ]
+        group_headers = [h for h in base_headers if h not in numeric_headers and not re.search(r"date|id", h, re.IGNORECASE)]
+
+        summary_blocks = []
+        text_norm = re.sub(r"[_\s]+", " ", text.lower())
+        for metric_h in numeric_headers:
+            metric_pat = re.sub(r"[_\s]+", r"\\s+", metric_h.lower())
+            for group_h in group_headers:
+                group_pat = re.sub(r"[_\s]+", r"\\s+", group_h.lower())
+                if re.search(rf"\btotal\s+{metric_pat}\s+by\s+{group_pat}\b", text_norm, re.IGNORECASE):
+                    summary_blocks.append((group_h, metric_h, "sum"))
+        if not summary_blocks and group_headers and numeric_headers:
+            summary_blocks.append((group_headers[0], numeric_headers[-1], "sum"))
+
+        block_locations = {}
+        for group_h, metric_h, _ in summary_blocks[:4]:
+            totals = {}
+            for rec in computed_records:
+                key = rec.get(group_h, "")
+                val = rec.get(metric_h, 0)
+                try:
+                    totals[key] = totals.get(key, 0) + float(val or 0)
+                except Exception:
+                    pass
+            title = f"Total {metric_h} by {group_h}"
+            summary.cell(summary_row, 1, title).font = Font(bold=True)
+            summary.cell(summary_row + 1, 1, group_h)
+            summary.cell(summary_row + 1, 2, f"Total {metric_h}")
+            start = summary_row + 2
+            for off, (key, val) in enumerate(sorted(totals.items(), key=lambda kv: str(kv[0]))):
+                summary.cell(start + off, 1, key)
+                summary.cell(start + off, 2, val)
+            block_locations[title.lower()] = (summary_row + 1, start + len(totals) - 1)
+            summary_row = start + len(totals) + 2
+
+        if re.search(r"\b(monthly|trend)\b", text, re.IGNORECASE):
+            date_h = next((h for h in headers if re.search(r"date", h, re.IGNORECASE)), "")
+            metric_h = next((h for h in headers if re.search(r"revenue|sales|amount|total", h, re.IGNORECASE)), "")
+            if date_h and metric_h:
+                totals = {}
+                for rec in computed_records:
+                    raw_date = str(rec.get(date_h, "") or "")
+                    m = re.match(r"(\d{4})-(\d{2})", raw_date)
+                    month_key = f"{m.group(1)}-{m.group(2)}" if m else raw_date[:7]
+                    try:
+                        totals[month_key] = totals.get(month_key, 0) + float(rec.get(metric_h, 0) or 0)
+                    except Exception:
+                        pass
+                if totals:
+                    title = f"Monthly {metric_h} Trend"
+                    summary.cell(summary_row, 1, title).font = Font(bold=True)
+                    summary.cell(summary_row + 1, 1, "Month")
+                    summary.cell(summary_row + 1, 2, metric_h)
+                    start = summary_row + 2
+                    for off, (key, val) in enumerate(sorted(totals.items(), key=lambda kv: str(kv[0]))):
+                        summary.cell(start + off, 1, key)
+                        summary.cell(start + off, 2, val)
+                    block_locations[title.lower()] = (summary_row + 1, start + len(totals) - 1)
+                    summary_row = start + len(totals) + 2
+
+        dash = wb.create_sheet("Dashboard")
+        dash["A1"] = "Excel Analysis Dashboard"
+        dash["A1"].font = Font(bold=True, size=16)
+        kpi_row = 3
+        for agg, field in re.findall(r"\b(Total|Average)\s+([A-Za-z_ ]+)", text, re.IGNORECASE):
+            h = next((x for x in headers if self._normalize_key(x) == self._normalize_key(field)), "")
+            if not h:
+                continue
+            vals = []
+            for rec in computed_records:
+                try:
+                    vals.append(float(rec.get(h, 0) or 0))
+                except Exception:
+                    pass
+            value = (sum(vals) / len(vals)) if agg.lower() == "average" and vals else sum(vals)
+            dash.cell(kpi_row, 1, f"{agg.title()} {h}").font = Font(bold=True)
+            dash.cell(kpi_row, 2, value)
+            kpi_row += 1
+
+        # Top-N table: choose Product-like dimension and Units/Sales/Revenue-like metric when available.
+        top_n_match = re.search(r"\btop\s+(\d+)\b", text, re.IGNORECASE)
+        if top_n_match:
+            n = int(top_n_match.group(1))
+            dim = next((h for h in headers if re.search(r"product|item|category", h, re.IGNORECASE)), group_headers[0] if group_headers else "")
+            metric = next((h for h in headers if re.search(r"units|quantity|sold", h, re.IGNORECASE)), numeric_headers[0] if numeric_headers else "")
+            if dim and metric:
+                totals = {}
+                for rec in computed_records:
+                    try:
+                        totals[rec.get(dim, "")] = totals.get(rec.get(dim, ""), 0) + float(rec.get(metric, 0) or 0)
+                    except Exception:
+                        pass
+                row = max(kpi_row + 2, 9)
+                dash.cell(row, 1, f"Top {n} {dim} by {metric}").font = Font(bold=True)
+                dash.cell(row + 1, 1, dim)
+                dash.cell(row + 1, 2, metric)
+                for off, (key, val) in enumerate(sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:n], start=2):
+                    dash.cell(row + off, 1, key)
+                    dash.cell(row + off, 2, val)
+
+        # Charts from summary blocks.
+        chart_anchor_row = 3
+        chart_items = []
+        for item in block_locations.items():
+            if "trend" not in item[0] and "monthly" not in item[0]:
+                chart_items.append(item)
+                break
+        for item in block_locations.items():
+            if "trend" in item[0] or "monthly" in item[0]:
+                chart_items.append(item)
+                break
+        if len(chart_items) < 2:
+            chart_items = list(block_locations.items())[:2]
+        for title, (header_row, last_row) in chart_items[:2]:
+            if last_row < header_row + 1:
+                continue
+            chart = LineChart() if "trend" in title.lower() or "monthly" in title.lower() else BarChart()
+            chart.title = title.title()
+            chart.add_data(Reference(summary, min_col=2, min_row=header_row, max_row=last_row), titles_from_data=True)
+            chart.set_categories(Reference(summary, min_col=1, min_row=header_row + 1, max_row=last_row))
+            dash.add_chart(chart, f"D{chart_anchor_row}")
+            chart_anchor_row += 16
+
+        wb.save(output)
+        return {
+            "status": "success",
+            "path": str(output),
+            "rows": len(records),
+            "columns": len(headers),
+            "sheets": wb.sheetnames,
+            "size_bytes": output.stat().st_size,
+        }
+
+    def _normalize_advanced_excel_steps(self, steps: list) -> list:
+        """Route complex Excel tasks through one deterministic workbook build step."""
+        if not steps or not self._is_advanced_excel_task():
+            return steps
+        out = []
+        create_seen = False
+        for step in steps:
+            act = str(step.get("action", "")).lower()
+            goal_l = str(step.get("goal", "")).lower()
+            if act in {"excel.append"} or re.search(r"\b(pivot|chart|dashboard|sort|top\s+\d+|highlight|formula)\b", goal_l):
+                continue
+            if act == "excel.create" and not create_seen:
+                s = dict(step)
+                s["goal"] = "Create requested Excel workbook and analysis"
+                s["outputs"] = ["excel_file_path"]
+                s.pop("inputs", None)
+                s["categories"] = self._normalize_categories(["Documents"])
+                out.append(s)
+                create_seen = True
+                continue
+            out.append(dict(step))
+        if not create_seen:
+            out.append({
+                "goal": "Create requested Excel workbook and analysis",
+                "categories": self._normalize_categories(["Documents"]),
+                "action": "excel.create",
+                "outputs": ["excel_file_path"],
+            })
+        return out
+
+    def _is_budget_excel_task(self, text: str | None = None) -> bool:
+        """Detect spreadsheet requests that should calculate expenses/savings."""
+        t = str(text if text is not None else getattr(self, "_current_task_text", "") or "").lower()
+        return bool(
+            re.search(r"\b(excel|xlsx|spreadsheet|sheet)\b", t)
+            and re.search(r"\b(savings?|expense|expenditure|spend|budget)\b", t)
+            and re.search(r"\b(income|salary|monthly\s+income)\b", t)
+        )
+
+    def _is_sales_analysis_excel_task(self, text: str | None = None) -> bool:
+        """Detect the richer sales-performance workbook request."""
+        t = str(text if text is not None else getattr(self, "_current_task_text", "") or "").lower()
+        return bool(
+            re.search(r"\b(excel|xlsx|spreadsheet|workbook|sheet)\b", t)
+            and re.search(r"\b(sales|salesperson|revenue|profit[_ ]?margin|pivot|dashboard)\b", t)
+            and re.search(r"\b(region|product|units[_ ]?sold|cost)\b", t)
+        )
+
+    def _sales_data_text(self) -> str:
+        """Return raw user-provided sales data from clarifications or task text."""
+        parts = []
+        for _, ans in sorted((self._input_answers or {}).items()):
+            if isinstance(ans, str) and "Order_ID" in ans and "Revenue" in ans and "Cost" in ans:
+                parts.append(ans)
+        task = str(getattr(self, "_current_task_text", "") or "")
+        if "Order_ID" in task and "Revenue" in task and "Cost" in task:
+            parts.append(task)
+        return "\n".join(parts).strip()
+
+    def _parse_sales_records(self, text: str | None = None) -> list[dict]:
+        """Parse compact CSV-like sales rows pasted by the user."""
+        import csv
+        import io
+
+        raw = str(text if text is not None else self._sales_data_text() or "").strip()
+        if not raw:
+            return []
+        header_match = re.search(
+            r"Order_ID\s*,\s*Date\s*,\s*Salesperson\s*,\s*Region\s*,\s*Product\s*,\s*Units_Sold\s*,\s*Revenue\s*,\s*Cost",
+            raw,
+            re.IGNORECASE,
+        )
+        if not header_match:
+            return []
+        header = "Order_ID,Date,Salesperson,Region,Product,Units_Sold,Revenue,Cost"
+        body = raw[header_match.end():].strip()
+        body = re.sub(r"\s+(?=\d{4}\s*,\s*\d{4}-\d{2}-\d{2}\s*,)", "\n", body)
+        body = re.sub(r"\s+", " ", body).replace("\n ", "\n").strip()
+        lines = [header] + [ln.strip() for ln in body.splitlines() if ln.strip()]
+        if len(lines) <= 1:
+            return []
+        reader = csv.DictReader(io.StringIO("\n".join(lines)))
+        records = []
+        for row in reader:
+            try:
+                rec = {
+                    "Order_ID": str(row.get("Order_ID", "")).strip(),
+                    "Date": str(row.get("Date", "")).strip(),
+                    "Salesperson": str(row.get("Salesperson", "")).strip(),
+                    "Region": str(row.get("Region", "")).strip(),
+                    "Product": str(row.get("Product", "")).strip(),
+                    "Units_Sold": int(float(str(row.get("Units_Sold", "0")).strip() or 0)),
+                    "Revenue": float(str(row.get("Revenue", "0")).strip() or 0),
+                    "Cost": float(str(row.get("Cost", "0")).strip() or 0),
+                }
+            except Exception:
+                continue
+            if rec["Order_ID"] and rec["Date"] and rec["Product"]:
+                records.append(rec)
+        return records
+
+    def _build_sales_analysis_workbook(self, records: list[dict], output_path: str = "sales_analysis_final.xlsx") -> dict:
+        """Create the requested sales analysis workbook with formulas, summaries, charts, and dashboard."""
+        if not records:
+            return {"status": "error", "error": "No parseable sales records found."}
+        try:
+            from openpyxl import Workbook
+            from openpyxl.chart import BarChart, LineChart, Reference
+            from openpyxl.formatting.rule import FormulaRule
+            from openpyxl.styles import Font, PatternFill
+            from openpyxl.worksheet.table import Table, TableStyleInfo
+        except Exception as e:
+            return {"status": "error", "error": f"openpyxl unavailable: {e}"}
+
+        output_name = self._bare_excel_filename(output_path, fallback="sales_analysis_final.xlsx")
+        if output_name.lower() == "sales_data.xlsx":
+            output_name = "sales_analysis_final.xlsx"
+        sandbox = (Path(__file__).parent.parent / SANDBOX_DIR).resolve()
+        sandbox.mkdir(parents=True, exist_ok=True)
+        output = sandbox / output_name
+
+        def profit(rec):
+            return float(rec.get("Revenue", 0) or 0) - float(rec.get("Cost", 0) or 0)
+
+        sorted_records = sorted(
+            records,
+            key=lambda r: (profit(r), int(r.get("Units_Sold", 0) or 0)),
+            reverse=True,
+        )
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sales_Data"
+        headers = [
+            "Order_ID", "Date", "Salesperson", "Region", "Product", "Units_Sold",
+            "Revenue", "Cost", "Profit", "Profit_Margin",
+        ]
+        ws.append(headers)
+        for idx, rec in enumerate(sorted_records, start=2):
+            ws.append([
+                rec["Order_ID"], rec["Date"], rec["Salesperson"], rec["Region"], rec["Product"],
+                rec["Units_Sold"], rec["Revenue"], rec["Cost"], f"=G{idx}-H{idx}", f"=IF(G{idx}=0,0,I{idx}/G{idx}*100)",
+            ])
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        ws.freeze_panes = "A2"
+        for col, width in {"A": 12, "B": 14, "C": 16, "D": 12, "E": 14, "F": 12, "G": 14, "H": 14, "I": 14, "J": 16}.items():
+            ws.column_dimensions[col].width = width
+        end_row = len(sorted_records) + 1
+        ws.conditional_formatting.add(
+            f"A2:J{end_row}",
+            FormulaRule(formula=["AND($J2<10,$G2>50000)"], fill=PatternFill("solid", fgColor="FFC7CE")),
+        )
+        table = Table(displayName="SalesTable", ref=f"A1:J{end_row}")
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+        ws.add_table(table)
+
+        region_summary = {}
+        salesperson_profit = {}
+        product_units = {}
+        monthly_revenue = {}
+        for rec in records:
+            p = profit(rec)
+            region_summary.setdefault(rec["Region"], {"Revenue": 0, "Profit": 0})
+            region_summary[rec["Region"]]["Revenue"] += rec["Revenue"]
+            region_summary[rec["Region"]]["Profit"] += p
+            salesperson_profit[rec["Salesperson"]] = salesperson_profit.get(rec["Salesperson"], 0) + p
+            product_units[rec["Product"]] = product_units.get(rec["Product"], 0) + rec["Units_Sold"]
+            month = str(rec["Date"])[:7]
+            monthly_revenue[month] = monthly_revenue.get(month, 0) + rec["Revenue"]
+
+        piv = wb.create_sheet("Pivot_Summaries")
+        piv.append(["Region", "Total Revenue", "Total Profit"])
+        for region, vals in sorted(region_summary.items()):
+            piv.append([region, vals["Revenue"], vals["Profit"]])
+        sp_start = len(region_summary) + 4
+        piv.cell(sp_start, 1, "Salesperson")
+        piv.cell(sp_start, 2, "Total Profit")
+        for offset, (name, total) in enumerate(sorted(salesperson_profit.items()), start=1):
+            piv.cell(sp_start + offset, 1, name)
+            piv.cell(sp_start + offset, 2, total)
+        month_start = sp_start + len(salesperson_profit) + 4
+        piv.cell(month_start, 1, "Month")
+        piv.cell(month_start, 2, "Total Revenue")
+        for offset, (month, total) in enumerate(sorted(monthly_revenue.items()), start=1):
+            piv.cell(month_start + offset, 1, month)
+            piv.cell(month_start + offset, 2, total)
+        for cell in piv[1]:
+            cell.font = Font(bold=True)
+
+        dash = wb.create_sheet("Dashboard")
+        total_revenue = sum(r["Revenue"] for r in records)
+        total_profit = sum(profit(r) for r in records)
+        avg_margin = (total_profit / total_revenue * 100) if total_revenue else 0
+        lowest_salesperson = min(salesperson_profit.items(), key=lambda x: x[1])
+        top_products = sorted(product_units.items(), key=lambda x: x[1], reverse=True)[:5]
+        dash["A1"] = "Sales Performance Dashboard"
+        dash["A1"].font = Font(bold=True, size=16)
+        kpis = [
+            ("Total Revenue", total_revenue),
+            ("Total Profit", total_profit),
+            ("Average Profit Margin", avg_margin),
+            ("Lowest Performing Salesperson", f"{lowest_salesperson[0]} ({lowest_salesperson[1]:.0f})"),
+        ]
+        for r, (label, value) in enumerate(kpis, start=3):
+            dash.cell(r, 1, label).font = Font(bold=True)
+            dash.cell(r, 2, value)
+        dash["A9"] = "Top 5 Best-Selling Products"
+        dash["A9"].font = Font(bold=True)
+        dash.append([])
+        dash.cell(10, 1, "Product")
+        dash.cell(10, 2, "Units Sold")
+        for idx, (prod, units) in enumerate(top_products, start=11):
+            dash.cell(idx, 1, prod)
+            dash.cell(idx, 2, units)
+
+        bar = BarChart()
+        bar.title = "Revenue by Region"
+        bar.y_axis.title = "Revenue"
+        bar.x_axis.title = "Region"
+        bar.add_data(Reference(piv, min_col=2, min_row=1, max_row=1 + len(region_summary)), titles_from_data=True)
+        bar.set_categories(Reference(piv, min_col=1, min_row=2, max_row=1 + len(region_summary)))
+        dash.add_chart(bar, "D3")
+
+        line = LineChart()
+        line.title = "Monthly Sales Trend"
+        line.y_axis.title = "Revenue"
+        line.x_axis.title = "Month"
+        line.add_data(Reference(piv, min_col=2, min_row=month_start, max_row=month_start + len(monthly_revenue)), titles_from_data=True)
+        line.set_categories(Reference(piv, min_col=1, min_row=month_start + 1, max_row=month_start + len(monthly_revenue)))
+        dash.add_chart(line, "D20")
+
+        wb.save(output)
+        return {
+            "status": "success",
+            "path": str(output),
+            "rows": len(records),
+            "columns": len(headers),
+            "sheets": wb.sheetnames,
+            "size_bytes": output.stat().st_size,
+        }
+
+    def _normalize_sales_analysis_steps(self, steps: list) -> list:
+        """Keep sales analysis plans focused on data acquisition then one workbook build."""
+        if not steps or not self._is_sales_analysis_excel_task():
+            return steps
+        out = []
+        for step in steps:
+            act = str(step.get("action", "")).lower()
+            goal_l = str(step.get("goal", "")).lower()
+            if act in {"excel.append"}:
+                continue
+            if act == "excel.create":
+                s = dict(step)
+                s["goal"] = "Create sales analysis workbook with dashboard"
+                s["outputs"] = ["excel_file_path"]
+                s.pop("inputs", None)
+                s["categories"] = self._normalize_categories(["Documents"])
+                out.append(s)
+                continue
+            if re.search(r"\b(pivot|chart|dashboard|sort|top 5|profit[_ ]?margin)\b", goal_l):
+                continue
+            out.append(dict(step))
+        if not any(str(s.get("action", "")).lower() == "excel.create" for s in out):
+            out.append({
+                "goal": "Create sales analysis workbook with dashboard",
+                "categories": self._normalize_categories(["Documents"]),
+                "action": "excel.create",
+                "outputs": ["excel_file_path"],
+            })
+        return out
+
+    def _extract_income_amount(self, text: str | None = None, default: int = 30000) -> int:
+        """Extract a likely monthly income amount from task text."""
+        raw = str(text if text is not None else getattr(self, "_current_task_text", "") or "")
+        m = re.search(r"(?:income|salary|monthly income|monthly)\D{0,24}(\d[\d,]*)", raw, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(\d[\d,]{3,})\b", raw)
+        if not m:
+            return default
+        try:
+            return int(re.sub(r"[^0-9]", "", m.group(1))) or default
+        except Exception:
+            return default
+
+    def _budget_excel_rows(self, income: int) -> list[dict]:
+        """Build a 12-month savings/expenditure tracker with formulas."""
+        rows = []
+        for month in range(1, 13):
+            row_num = month + 1  # header is row 1 in Excel
+            rows.append({
+                "Month": f"Month {month}",
+                "Income": income,
+                "Rent": 0,
+                "Food": 0,
+                "Transport": 0,
+                "Utilities": 0,
+                "Other Expenses": 0,
+                "Total Expenses": f"=SUM(C{row_num}:G{row_num})",
+                "Savings": f"=B{row_num}-H{row_num}",
+                "Savings Rate": f"=IF(B{row_num}=0,0,I{row_num}/B{row_num})",
+            })
+        rows.append({
+            "Month": "Total",
+            "Income": "=SUM(B2:B13)",
+            "Rent": "=SUM(C2:C13)",
+            "Food": "=SUM(D2:D13)",
+            "Transport": "=SUM(E2:E13)",
+            "Utilities": "=SUM(F2:F13)",
+            "Other Expenses": "=SUM(G2:G13)",
+            "Total Expenses": "=SUM(H2:H13)",
+            "Savings": "=SUM(I2:I13)",
+            "Savings Rate": "=IF(B14=0,0,I14/B14)",
+        })
+        return rows
+
+    def _bare_excel_filename(self, value: str, fallback: str = "savings_expenditure_tracker.xlsx") -> str:
+        """Return a bare xlsx filename accepted by the Excel tools."""
+        s = str(value or "").strip().strip('"').strip("'")
+        if not s:
+            return fallback
+        s = re.split(r"[\\/]+", s)[-1]
+        if not s.lower().endswith(".xlsx"):
+            s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or fallback
+            if not s.lower().endswith(".xlsx"):
+                s += ".xlsx"
+        return s
+
+    def _normalize_excel_budget_steps(self, steps: list) -> list:
+        """Collapse budget spreadsheet plans into create + verify, no header prompts."""
+        if not steps or not self._is_budget_excel_task():
+            return steps
+        out = []
+        created = False
+        for step in steps:
+            act = str(step.get("action", "")).lower()
+            goal_l = str(step.get("goal", "")).lower()
+            if act == "excel.create" and not created:
+                s = dict(step)
+                s["goal"] = "Create savings and expenditure tracker workbook"
+                s["outputs"] = ["excel_file_path"]
+                s.pop("inputs", None)
+                out.append(s)
+                created = True
+                continue
+            if act == "excel.append" and re.search(r"\b(headers?|columns?|structure)\b", goal_l):
+                continue
+            out.append(dict(step))
+        if not created:
+            out.insert(0, {
+                "goal": "Create savings and expenditure tracker workbook",
+                "categories": self._normalize_categories(["Documents"]),
+                "action": "excel.create",
+                "outputs": ["excel_file_path"],
+            })
+        return out
 
     def _parse_plan(self, text: str) -> list:
         """Extract numbered steps, optional ACTION/slots, and normalized categories."""
@@ -4202,6 +5535,7 @@ class Agent:
             f"- Produce at least {_min_plan_steps} steps for this task unless CHAT applies.\n"
             "- OUTPUT names are pure signal slots, e.g. recipient_contact, search_results, message_body, file_path.\n"
             "- NEEDED_BY must list only future step numbers that require this output; do not route context to unrelated steps.\n"
+            "- For pure research/recommendation/latest/summary-from-web tasks, use exactly one research.run step with the full user request as query; it first decides where to look, then searches, reads sources, extracts facts, and removes noise.\n"
             "- For web research that must summarize each book/article/item, do not summarize from generic search snippets only; add a step to scrape/extract the best result page or otherwise identify concrete titles first.\n"
             "- For multi-topic or multi-item search, search once using the item/topic slot as INPUTS, then add a think step to extract only the intended facts and remove noise before later steps.\n"
             "- For send/share/email/whatsapp: add content-preparation only when content must be generated; for literal text like 'hi', put message=\"hi\" in INPUTS.\n"
@@ -4281,6 +5615,8 @@ class Agent:
             if len(_split_steps) >= 2:
                 print(f"[AGENT] Plan auto-split: 1 -> {len(_split_steps)} steps")
                 steps = _split_steps
+        steps = self._normalize_research_steps(steps)
+        steps = self._normalize_advanced_excel_steps(steps)
         if not _workflow_steps_preloaded:
             steps = self._ensure_send_content_prereqs(steps)
             steps = self._normalize_email_draft_send_flow(steps)
@@ -4367,7 +5703,12 @@ class Agent:
             _latest_user_input = None   # latest explicit user clarification for replanning
             _step_success_calls = 0     # valid successful tool executions in this step
             _step_had_error = False     # any tool/runtime error happened in this step
-            _step_allows_toolless_done = bool(step_item.get("allow_toolless_done")) or bool(step_item.get("is_verify"))
+            _step_allows_toolless_done = (
+                bool(step_item.get("allow_toolless_done"))
+                or bool(step_item.get("is_verify"))
+                or str(step_action).lower().startswith("chat")
+                or bool(re.search(r"\b(obtain|request|collect|get)\b.{0,40}\b(input|data|clarification)\b", step_desc, re.IGNORECASE))
+            )
             _step_raw_payload = ""      # full payload for downstream handoff (not compressed digest)
 
             #  Quantified step tracking 
@@ -4422,6 +5763,109 @@ class Agent:
                     "step": i + 1,
                 }
                 continue
+
+            # Complex Excel tasks are safer to execute deterministically once
+            # raw tabular data is available. This avoids asking the small model
+            # to serialize large row arrays, formulas, charts, pivots, and
+            # dashboard instructions into a single fragile tool call.
+            if step_action == "excel.create" and self._is_advanced_excel_task():
+                _records = self._parse_generic_tabular_records()
+                if _records:
+                    tool_name = "excel.create"
+                    tool_args = {"output_path": self._extract_excel_output_filename()}
+                    _step_tool = tool_name
+                    yield {"type": "tool_call", "tool": tool_name, "args": tool_args, "step": i + 1}
+                    print(f"[STREAM][TOOL CALL] {tool_name}")
+                    print(f"[STREAM][TOOL ARGS] {json.dumps(tool_args, indent=2, default=str)}")
+                    try:
+                        result = await asyncio.to_thread(
+                            self._build_generic_excel_workbook,
+                            _records,
+                            tool_args["output_path"],
+                        )
+                    except Exception as e:
+                        result = {"status": "error", "error": f"Internal crash: {str(e)}"}
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        observation = f"Error: {result.get('error', 'unknown error')}"
+                        _step_had_error = True
+                        last_error = result.get("error", "unknown error")
+                        _step_calls.append({
+                            "tool": tool_name,
+                            "status": "error",
+                            "summary": str(last_error)[:180],
+                            "args": json.dumps(tool_args, default=str)[:140],
+                        })
+                        self._context_compiler.tool_records.add(
+                            tool_name=tool_name, args=tool_args, status="error",
+                            result_digest=str(last_error)[:220], raw_result=observation,
+                            step_idx=i, attempt=0,
+                        )
+                        self._context_compiler.metrics.record_tool_call(tool_name, success=False)
+                        print(f"[STREAM][TOOL RESULT ] {observation}")
+                        yield {"type": "tool_result", "tool": tool_name, "result": observation, "status": "error", "step": i + 1}
+                        step_status = "failed"
+                        step_result = observation
+                        self._context_compiler.metrics.end_step(i, success=False)
+                        completed.append({
+                            "step": step_desc,
+                            "status": step_status,
+                            "result": step_result,
+                            "tool": tool_name,
+                            "calls": _step_calls,
+                            "artifacts": _step_artifacts,
+                            "categories": step_categories,
+                            "raw_payload": json.dumps(result, default=str),
+                        })
+                        continue
+
+                    tool_res = result.get("result", result) if isinstance(result, dict) else result
+                    self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
+                    raw_obs = json.dumps(tool_res, indent=2, default=str)
+                    _step_raw_payload = raw_obs[:12000]
+                    print(f"[STREAM][TOOL RESULT ] ({len(raw_obs)} chars):")
+                    print(raw_obs[:2000] + ("\n...[truncated]" if len(raw_obs) > 2000 else ""))
+                    yield {"type": "tool_result", "tool": tool_name, "result": raw_obs, "status": "ok", "step": i + 1}
+                    step_result = self._compress_obs(raw_obs, tool_name)
+                    self._store_declared_outputs(
+                        step_outputs or ["excel_file_path"],
+                        tool_name,
+                        tool_res,
+                        raw_obs,
+                        step_result,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
+                    _step_success_calls += 1
+                    step_status = "done"
+                    _step_calls.append({
+                        "tool": tool_name,
+                        "status": "ok",
+                        "summary": step_result[:180],
+                        "args": json.dumps(tool_args, default=str)[:140],
+                    })
+                    _step_actions.append(f"{tool_name} -> {step_result[:120]}")
+                    self._merge_artifacts(_step_artifacts, self._extract_key_data(raw_obs + "\n" + step_result))
+                    self._context_compiler.tool_records.add(
+                        tool_name=tool_name, args=tool_args, status="ok",
+                        result_digest=step_result[:220], raw_result=raw_obs,
+                        step_idx=i, attempt=0,
+                        artifacts=dict(_step_artifacts),
+                    )
+                    self._context_compiler.metrics.record_tool_call(tool_name, success=True)
+                    print(f"[STREAM][CONTEXTNEXT] {step_result}")
+                    completed.append({
+                        "step": step_desc,
+                        "status": step_status,
+                        "result": step_result,
+                        "tool": tool_name,
+                        "calls": _step_calls,
+                        "artifacts": _step_artifacts,
+                        "categories": step_categories,
+                        "raw_payload": _step_raw_payload,
+                    })
+                    self._context_compiler.metrics.end_step(i, success=True)
+                    continue
 
             for attempt in range(MAX_RETRIES_PER_STEP):
                 done_block = ""
@@ -5862,7 +7306,7 @@ class Agent:
         #   "Use ONLY: filesystem.*, todo.*"   self._allowed_tools = {"filesystem", "todo"}
         #   "Do NOT use: web/email"            self._denied_tools  = {"web", "email"}
         # Buffer/reasoning tools are always permitted regardless of constraints.
-        _GATE_BUILTINS = ("buffer.", "memory.", "reasoning.", "think")
+        _GATE_BUILTINS = ("buffer.", "memory.", "reasoning.", "research.", "think")
         _allowed_tools = getattr(self, '_allowed_tools', set())
         _denied_tools  = getattr(self, '_denied_tools',  set())
         if not any(tool_name.startswith(b) for b in _GATE_BUILTINS):
@@ -5926,6 +7370,10 @@ class Agent:
                             "if this step is complete."
                         )
                     }
+
+        # --- RESEARCH TOOLS (handled internally as an orchestrated pipeline) ---
+        if tool_name.startswith("research."):
+            return self._execute_research_tool(tool_name, args or {})
 
         # --- BUFFER TOOLS (handled internally, no registered tool needed) ---
         if tool_name == "buffer.search":
@@ -6447,6 +7895,44 @@ class Agent:
             if "html"    in args and "html_content" not in args: args["html_content"] = args.pop("html")
             if "content" in args and "html_content" not in args: args["html_content"] = args.pop("content")
             if "output"  in args and "output_path" not in args: args["output_path"] = args.pop("output")
+
+        if tool_name == "excel.create":
+            if self._is_advanced_excel_task():
+                records = self._parse_generic_tabular_records()
+                if not records and isinstance(args.get("data"), list):
+                    records = [dict(item) for item in (args.get("data") or []) if isinstance(item, dict)]
+                if records:
+                    out_name = self._bare_excel_filename(
+                        str(args.get("output_path") or args.get("file_path") or ""),
+                        fallback=self._extract_excel_output_filename(),
+                    )
+                    print(f"[AGENT] excel.create using generic advanced workbook builder rows={len(records)}")
+                    return self._build_generic_excel_workbook(records, output_path=out_name)
+                return {
+                    "status": "error",
+                    "error": "Advanced Excel task requires parseable tabular rows before workbook generation.",
+                }
+            if args.get("output_path"):
+                args["output_path"] = self._bare_excel_filename(str(args.get("output_path")))
+
+        if tool_name == "excel.append":
+            if not str(args.get("file_path") or "").strip():
+                _path_hint = str(
+                    _slots.get("excel_file_path")
+                    or _slots.get("file_path")
+                    or _artifacts.get("excel_file_path")
+                    or _artifacts.get("last_file_path")
+                    or ""
+                )
+                if _path_hint:
+                    args["file_path"] = self._bare_excel_filename(_path_hint)
+            elif args.get("file_path"):
+                args["file_path"] = self._bare_excel_filename(str(args.get("file_path")))
+
+        if tool_name == "filesystem.list":
+            path_arg = str(args.get("path", "") or "").strip().replace("\\", "/")
+            if path_arg.upper().strip("/") == "SANDBOX":
+                args["path"] = "."
 
         # contacts.search/get pre-flight: recover missing query/name from task/slot hints.
         if tool_name in ("contacts.search", "contacts.get"):

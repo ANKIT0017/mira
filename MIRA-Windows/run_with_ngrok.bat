@@ -82,19 +82,10 @@ if "%LLAMA_SKIP%"=="1" (
 )
 echo.
 
-REM ── [2/7] Firecrawl ───────────────────────────────────────────────────────
-echo [2/7] Starting Firecrawl Docker container...
-cd /d "%~dp0..\firecrawl"
-docker-compose up -d
-if %ERRORLEVEL% NEQ 0 (
-    echo  [WARNING] Firecrawl Docker failed to start!
-    echo  Make sure Docker Desktop is running.
-    echo  Press any key to continue anyway...
-    pause >nul
-)
-cd /d "%~dp0"
-echo        Firecrawl started.
-timeout /t 4 /nobreak >nul
+REM ── [2/7] Firecrawl-compatible scraping ───────────────────────────────────
+echo [2/7] Firecrawl-compatible scraping is embedded in MIRA.
+echo        No Docker container or separate Firecrawl server is required.
+timeout /t 1 /nobreak >nul
 echo.
 
 REM ── [3/7] WhatsApp Bridge ─────────────────────────────────────────────────

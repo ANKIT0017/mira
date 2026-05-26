@@ -11,5 +11,3 @@ If I want to remember something, I write it here.
 When I make a mistake, document it so future me does not repeat it.
 Text over memory state.
 -only ask for input from user when i can't find info using my tools tools. like contact of a person i will first search in contacts database if not found then ask user.
-- Identify career choices for BSc Hons Comp Science, consider govt, private, and other options
-- [career_refinement] Refining career options for BSc Hons Comp Science
