@@ -1133,21 +1133,25 @@
     .voice-divider { display: none; }
 
     #voicePanel {
-      --voice-fluid-x: 42vw;
-      --voice-fluid-y: 43vh;
-      --voice-fluid-size: min(32vw, 340px);
+      --voice-fluid-x: 45%;
+      --voice-fluid-y: 50%;
+      --voice-fluid-size: min(12vw, 132px);
       --branch-progress: 0;
-      --voice-glow: rgba(95, 226, 255, 0.42);
+      --voice-active-x: var(--voice-fluid-x);
+      --voice-active-y: var(--voice-fluid-y);
+      --voice-fluid-scale: 1;
+      --voice-fluid-opacity: 1;
+      --voice-glow: rgba(74, 222, 128, 0.36);
       position: fixed;
       inset: 0;
       z-index: 500;
       display: grid;
       grid-template-rows: 76px 1fr 150px;
       background:
-        radial-gradient(circle at 50% 18%, rgba(81, 92, 255, 0.16), transparent 34%),
-        radial-gradient(circle at 35% 54%, rgba(24, 224, 255, 0.15), transparent 38%),
-        linear-gradient(135deg, #030511 0%, #07101f 48%, #02040a 100%);
-      color: #eefaff;
+        radial-gradient(circle at 45% 48%, rgba(34, 197, 94, 0.10), transparent 30%),
+        radial-gradient(circle at 66% 45%, rgba(34, 211, 238, 0.08), transparent 32%),
+        linear-gradient(135deg, #080c0b 0%, #0c1115 50%, #070a09 100%);
+      color: #eafff3;
       opacity: 0;
       pointer-events: none;
       overflow: hidden;
@@ -1166,9 +1170,9 @@
       position: absolute;
       inset: 0;
       background:
-        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.014) 1px, transparent 1px);
-      background-size: 46px 46px;
+        linear-gradient(rgba(255,255,255,0.026) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+      background-size: 38px 38px;
       mask-image: radial-gradient(circle at center, black 0%, transparent 74%);
       pointer-events: none;
     }
@@ -1178,11 +1182,10 @@
       position: absolute;
       inset: -15%;
       background:
-        radial-gradient(circle at 42% 44%, rgba(255,255,255,0.10), transparent 13%),
-        radial-gradient(circle at 56% 41%, rgba(76, 208, 255, 0.11), transparent 18%),
-        radial-gradient(circle at 48% 56%, rgba(127, 94, 255, 0.12), transparent 20%);
-      filter: blur(70px);
-      opacity: 0.62;
+        radial-gradient(circle at 42% 44%, rgba(74,222,128,0.10), transparent 14%),
+        radial-gradient(circle at 56% 41%, rgba(34,211,238,0.08), transparent 20%);
+      filter: blur(62px);
+      opacity: 0.52;
       animation: voiceAtmosphere 13s ease-in-out infinite alternate;
       pointer-events: none;
     }
@@ -1203,7 +1206,7 @@
       font-size: 0.68rem;
       letter-spacing: 0.14em;
       text-transform: uppercase;
-      color: rgba(223, 247, 255, 0.62);
+      color: rgba(180, 220, 200, 0.62);
     }
 
     .voice-indicators {
@@ -1223,8 +1226,8 @@
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: rgba(114, 232, 255, 0.8);
-      box-shadow: 0 0 14px rgba(114, 232, 255, 0.7);
+      background: rgba(74, 222, 128, 0.9);
+      box-shadow: 0 0 14px rgba(74, 222, 128, 0.72);
     }
 
     .voice-close {
@@ -1256,7 +1259,30 @@
       transform: translate(-50%, -50%);
       display: grid;
       place-items: center;
-      transition: transform 0.75s cubic-bezier(0.2, 0.8, 0.2, 1);
+      opacity: var(--voice-fluid-opacity);
+      transition:
+        left 0.85s cubic-bezier(0.2, 0.85, 0.2, 1),
+        top 0.85s cubic-bezier(0.2, 0.85, 0.2, 1),
+        width 0.55s ease,
+        opacity 0.45s ease,
+        transform 0.75s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    .voice-fluid-cluster::after {
+      content: "";
+      position: absolute;
+      left: 58%;
+      top: 50%;
+      width: min(18vw, 180px);
+      height: 18px;
+      border-radius: 999px;
+      transform: translateY(-50%) scaleX(0);
+      transform-origin: left center;
+      opacity: 0;
+      background: linear-gradient(90deg, rgba(232,253,255,0.96), rgba(104,232,255,0.62), transparent);
+      filter: blur(4px) drop-shadow(0 0 18px rgba(74,222,128,0.58));
+      pointer-events: none;
+      transition: transform 0.45s cubic-bezier(0.2, 0.9, 0.2, 1), opacity 0.35s ease;
     }
 
     .voice-fluid {
@@ -1265,15 +1291,15 @@
       height: 100%;
       border-radius: 46% 54% 50% 50% / 50% 45% 55% 50%;
       background:
-        radial-gradient(circle at 36% 28%, rgba(255,255,255,0.96) 0 4%, rgba(212,250,255,0.72) 8%, transparent 22%),
-        radial-gradient(circle at 62% 70%, rgba(134,104,255,0.74), transparent 35%),
-        radial-gradient(circle at 32% 64%, rgba(33,218,255,0.84), transparent 42%),
-        linear-gradient(135deg, rgba(30, 225, 255, 0.92), rgba(70, 91, 255, 0.78) 48%, rgba(168, 86, 255, 0.68));
+        radial-gradient(circle at 35% 28%, rgba(255,255,255,0.90) 0 4%, rgba(205,255,226,0.62) 8%, transparent 22%),
+        radial-gradient(circle at 60% 68%, rgba(74,222,128,0.76), transparent 38%),
+        radial-gradient(circle at 30% 62%, rgba(34,211,238,0.72), transparent 40%),
+        linear-gradient(135deg, rgba(34,197,94,0.92), rgba(30,200,120,0.78) 44%, rgba(20,180,190,0.62));
       box-shadow:
-        0 0 42px rgba(78, 222, 255, 0.42),
-        0 0 120px rgba(91, 92, 255, 0.28),
+        0 0 30px rgba(74,222,128,0.38),
+        0 0 82px rgba(34,197,94,0.22),
         inset 18px 22px 42px rgba(255,255,255,0.22),
-        inset -34px -38px 64px rgba(20, 16, 95, 0.34);
+        inset -30px -34px 58px rgba(0,80,40,0.28);
       filter: saturate(1.25);
       animation: fluidBreath 5.4s ease-in-out infinite, fluidShape 8.5s ease-in-out infinite;
       cursor: pointer;
@@ -1293,7 +1319,7 @@
 
     .voice-fluid::after {
       inset: -18%;
-      border-color: rgba(78, 222, 255, 0.20);
+      border-color: rgba(74,222,128,0.18);
       filter: blur(9px);
       opacity: 0.7;
       animation-duration: 6.2s;
@@ -1303,7 +1329,7 @@
       position: absolute;
       inset: 26%;
       border-radius: 50%;
-      background: radial-gradient(circle, rgba(255,255,255,0.62), rgba(87,224,255,0.22) 42%, transparent 72%);
+      background: radial-gradient(circle, rgba(255,255,255,0.58), rgba(100,255,200,0.18) 45%, transparent 74%);
       filter: blur(3px);
       opacity: 0.56;
       animation: coreDrift 5s ease-in-out infinite;
@@ -1320,13 +1346,13 @@
       position: absolute;
       inset: 19%;
       border-radius: 44% 56% 52% 48% / 49% 45% 55% 51%;
-      border: 1px solid rgba(114, 232, 255, 0.0);
+      border: 1px solid rgba(74, 222, 128, 0.0);
       opacity: 0;
       transform: scale(0.75);
     }
 
     body.voice-state-listening .voice-audio-ripples span {
-      border-color: rgba(127, 236, 255, 0.28);
+      border-color: rgba(74,222,128,0.30);
       animation: audioRipple 1.15s ease-out infinite;
     }
 
@@ -1334,12 +1360,12 @@
     body.voice-state-listening .voice-audio-ripples span:nth-child(3) { animation-delay: 0.50s; }
 
     body.voice-state-listening .voice-fluid {
-      animation: fluidVoice 0.66s ease-in-out infinite alternate, fluidShape 3.4s ease-in-out infinite;
+        animation: fluidVoice 0.66s ease-in-out infinite alternate, fluidShape 3.4s ease-in-out infinite;
       box-shadow:
-        0 0 68px rgba(91, 235, 255, 0.62),
-        0 0 150px rgba(101, 98, 255, 0.34),
+        0 0 58px rgba(74,222,128,0.52),
+        0 0 120px rgba(34,197,94,0.26),
         inset 18px 22px 44px rgba(255,255,255,0.26),
-        inset -34px -38px 70px rgba(20, 16, 95, 0.38);
+        inset -30px -34px 62px rgba(0,80,40,0.34);
     }
 
     body.voice-state-understanding .voice-fluid-cluster {
@@ -1354,11 +1380,30 @@
     body.voice-state-working .voice-fluid-cluster,
     body.voice-state-approval .voice-fluid-cluster,
     body.voice-state-error .voice-fluid-cluster {
-      transform: translate(-50%, -50%) scale(0.82);
+      left: var(--voice-active-x);
+      top: var(--voice-active-y);
+      width: calc(var(--voice-fluid-size) * 0.58);
+      transform: translate(-50%, -50%) scale(var(--voice-fluid-scale));
+      opacity: var(--voice-fluid-opacity);
+    }
+
+    body.voice-state-working .voice-fluid-cluster::after,
+    body.voice-state-approval .voice-fluid-cluster::after,
+    body.voice-state-error .voice-fluid-cluster::after {
+      opacity: 0.72;
+      transform: translateY(-50%) scaleX(1);
+      animation: fluidEmission 1.05s ease-in-out infinite;
     }
 
     body.voice-state-completed .voice-fluid-cluster {
+      left: var(--voice-fluid-x);
+      top: var(--voice-fluid-y);
       transform: translate(-50%, -50%) scale(1);
+      opacity: 1;
+    }
+
+    body.voice-state-completed .voice-fluid {
+      animation: fluidReform 1.35s cubic-bezier(0.2, 0.9, 0.2, 1), fluidShape 6.4s ease-in-out infinite 1.1s;
     }
 
     @keyframes fluidBreath {
@@ -1390,6 +1435,17 @@
     @keyframes fluidCompress {
       from { transform: scale(0.94); }
       to { transform: scale(1.02); }
+    }
+
+    @keyframes fluidEmission {
+      0%,100% { filter: blur(5px) drop-shadow(0 0 14px rgba(74,222,128,0.45)); opacity: 0.58; }
+      50% { filter: blur(3px) drop-shadow(0 0 26px rgba(175,255,210,0.82)); opacity: 1; }
+    }
+
+    @keyframes fluidReform {
+      0% { transform: scale(0.46); opacity: 0.42; filter: saturate(1.8) brightness(1.28); }
+      55% { transform: scale(1.1); opacity: 1; filter: saturate(1.55) brightness(1.12); }
+      100% { transform: scale(1); opacity: 1; filter: saturate(1.25) brightness(1); }
     }
 
     @keyframes audioRipple {
@@ -1427,15 +1483,15 @@
     }
 
     .voice-branch-halo {
-      stroke: rgba(109, 235, 255, 0.22);
-      stroke-width: 30;
-      filter: blur(10px);
+      stroke: rgba(74,222,128,0.18);
+      stroke-width: 22;
+      filter: blur(6px);
     }
 
     .voice-branch-core {
       stroke: url(#voiceBranchGradient);
-      stroke-width: 13;
-      filter: drop-shadow(0 0 18px rgba(91, 235, 255, 0.5));
+      stroke-width: 8;
+      filter: drop-shadow(0 0 18px rgba(74,222,128,0.52));
     }
 
     body.voice-state-completed .voice-branch-halo,
@@ -1445,13 +1501,94 @@
       transition-delay: 0.45s;
     }
 
+    .voice-fluid-stream {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    .voice-stream-particle {
+      position: absolute;
+      left: var(--px);
+      top: var(--py);
+      width: var(--ps, 24px);
+      height: var(--ps, 24px);
+      border-radius: 46% 54% 50% 50% / 50% 45% 55% 50%;
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.2);
+      background:
+        radial-gradient(circle at 34% 26%, rgba(255,255,255,0.86) 0 7%, transparent 24%),
+        radial-gradient(circle at 68% 68%, rgba(74,222,128,0.72), transparent 42%),
+        radial-gradient(circle at 25% 70%, rgba(34,211,238,0.66), transparent 44%),
+        linear-gradient(135deg, rgba(74,222,128,0.94), rgba(34,197,94,0.72));
+      box-shadow:
+        0 0 18px rgba(74,222,128,0.54),
+        0 0 42px rgba(34,197,94,0.22),
+        inset 6px 8px 18px rgba(255,255,255,0.20),
+        inset -10px -13px 24px rgba(0,80,40,0.28);
+      filter: saturate(1.24);
+      transition:
+        opacity 0.35s ease,
+        transform 0.65s cubic-bezier(0.16, 0.9, 0.22, 1),
+        width 0.45s ease,
+        height 0.45s ease;
+      animation: streamParticleMorph 5s ease-in-out infinite;
+    }
+
+    .voice-stream-particle.visible {
+      opacity: 0.64;
+      transform: translate(-50%, -50%) scale(0.42);
+    }
+
+    .voice-stream-particle.active {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(0.68);
+      animation: streamParticleMorph 3.2s ease-in-out infinite, streamParticlePulse 1.15s ease-in-out infinite;
+    }
+
+    .voice-stream-particle.completed {
+      opacity: 0.36;
+      transform: translate(-50%, -50%) scale(0.30);
+    }
+
+    .voice-stream-particle.error {
+      background:
+        radial-gradient(circle at 34% 26%, rgba(255,255,255,0.82) 0 7%, transparent 24%),
+        linear-gradient(135deg, rgba(255,130,160,0.95), rgba(34,197,94,0.72));
+      box-shadow: 0 0 24px rgba(255,92,130,0.58), 0 0 48px rgba(34,197,94,0.26);
+    }
+
+    .voice-fluid-stream.reforming .voice-stream-particle.visible,
+    .voice-fluid-stream.reforming .voice-stream-particle.completed,
+    .voice-fluid-stream.reforming .voice-stream-particle.active {
+      opacity: 0;
+      left: var(--voice-fluid-x);
+      top: var(--voice-fluid-y);
+      transform: translate(-50%, -50%) scale(0.08);
+      transition:
+        left 1.05s cubic-bezier(0.2, 0.8, 0.2, 1),
+        top 1.05s cubic-bezier(0.2, 0.8, 0.2, 1),
+        opacity 0.95s ease,
+        transform 1.15s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    @keyframes streamParticleMorph {
+      0%,100% { border-radius: 46% 54% 50% 50% / 50% 45% 55% 50%; }
+      40% { border-radius: 56% 44% 45% 55% / 43% 57% 44% 56%; }
+      75% { border-radius: 43% 57% 58% 42% / 58% 42% 57% 43%; }
+    }
+
+    @keyframes streamParticlePulse {
+      0%,100% { filter: saturate(1.25) brightness(1); }
+      50% { filter: saturate(1.65) brightness(1.18); }
+    }
+
     .voice-steps {
       position: absolute;
-      left: calc(var(--voice-fluid-x) + 11vw);
-      top: calc(var(--voice-fluid-y) - 8vh);
-      width: min(42vw, 560px);
-      height: 260px;
+      inset: 0;
       pointer-events: none;
+      z-index: 3;
     }
 
     .voice-step-node {
@@ -1474,19 +1611,19 @@
       height: 13px;
       border-radius: 50%;
       background: rgba(194, 246, 255, 0.28);
-      border: 1px solid rgba(209, 250, 255, 0.38);
-      box-shadow: 0 0 20px rgba(111, 232, 255, 0.2);
+      border: 1px solid rgba(74,222,128,0.38);
+      box-shadow: 0 0 20px rgba(74,222,128,0.2);
     }
 
     .voice-step-node.completed::before {
-      background: rgba(153, 246, 255, 0.9);
+      background: rgba(74,222,128,0.88);
       transform: scale(0.72);
-      box-shadow: 0 0 20px rgba(116, 238, 255, 0.48);
+      box-shadow: 0 0 20px rgba(74,222,128,0.48);
     }
 
     .voice-step-node.active::before {
-      background: #f5fdff;
-      box-shadow: 0 0 22px rgba(255,255,255,0.78), 0 0 44px rgba(86,225,255,0.56);
+      background: #dfffe9;
+      box-shadow: 0 0 22px rgba(220,255,232,0.78), 0 0 44px rgba(74,222,128,0.56);
       animation: activeNodePulse 1.05s ease-in-out infinite;
     }
 
@@ -1498,17 +1635,17 @@
 
     .voice-step-node.approval::before {
       background: #ffffff;
-      box-shadow: 0 0 24px rgba(155, 137, 255, 0.75), 0 0 48px rgba(74,222,255,0.44);
+      box-shadow: 0 0 24px rgba(74,222,128,0.72), 0 0 48px rgba(34,211,238,0.34);
     }
 
     .voice-step-label {
       min-width: 150px;
       padding: 7px 10px;
       border-radius: 8px;
-      border: 1px solid rgba(174, 231, 255, 0.16);
-      background: rgba(5, 14, 30, 0.48);
+      border: 1px solid rgba(74,222,128,0.18);
+      background: rgba(5, 14, 20, 0.56);
       backdrop-filter: blur(16px);
-      color: rgba(238, 250, 255, 0.86);
+      color: rgba(220,245,230,0.86);
       font-size: 0.72rem;
       line-height: 1.35;
       box-shadow: 0 12px 40px rgba(0,0,0,0.16);
@@ -1596,13 +1733,13 @@
       font-size: 0.88rem;
       letter-spacing: 0.18em;
       text-transform: uppercase;
-      color: rgba(241, 252, 255, 0.88);
+      color: rgba(200,240,220,0.88);
       font-family: var(--font-mono);
     }
 
     #voiceSubstate {
       max-width: 560px;
-      color: rgba(215, 238, 246, 0.58);
+      color: rgba(150,190,170,0.58);
       font-size: 0.78rem;
       line-height: 1.5;
       min-height: 1.5em;
@@ -1615,8 +1752,8 @@
       width: min(760px, calc(100vw - 48px));
       margin: 0 auto 18px;
       padding: 14px 22px;
-      border-top: 1px solid rgba(192, 242, 255, 0.14);
-      color: rgba(234, 250, 255, 0.74);
+      border-top: 1px solid rgba(74,222,128,0.14);
+      color: rgba(220,245,230,0.74);
       text-align: center;
       font-size: 0.92rem;
       line-height: 1.55;
@@ -1638,17 +1775,17 @@
     }
 
     #voiceInputBtn.voice-mode-active {
-      border-color: rgba(110, 231, 255, 0.9);
-      color: #dffbff;
-      background: rgba(100, 219, 255, 0.12);
-      box-shadow: 0 0 18px rgba(101, 232, 255, 0.22);
+      border-color: rgba(74,222,128,0.9);
+      color: #dcffe8;
+      background: rgba(74,222,128,0.12);
+      box-shadow: 0 0 18px rgba(74,222,128,0.22);
     }
 
     @media (max-width: 760px) {
       #voicePanel {
-        --voice-fluid-x: 50vw;
-        --voice-fluid-y: 36vh;
-        --voice-fluid-size: min(58vw, 260px);
+        --voice-fluid-x: 50%;
+        --voice-fluid-y: 36%;
+        --voice-fluid-size: min(34vw, 150px);
       }
 
       .voice-topbar {
@@ -1658,13 +1795,6 @@
       .voice-indicators {
         gap: 10px;
         font-size: 0.58rem;
-      }
-
-      .voice-steps {
-        left: 50vw;
-        top: 52vh;
-        width: 86vw;
-        height: 230px;
       }
 
       .voice-step-label {
@@ -2199,14 +2329,16 @@
       <svg class="voice-branch-svg" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true">
         <defs>
           <linearGradient id="voiceBranchGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stop-color="#e9fdff" stop-opacity="0.92" />
-            <stop offset="42%" stop-color="#5ee7ff" stop-opacity="0.95" />
-            <stop offset="100%" stop-color="#8a6dff" stop-opacity="0.88" />
+            <stop offset="0%" stop-color="#e9fff1" stop-opacity="0.94" />
+            <stop offset="42%" stop-color="#4ade80" stop-opacity="0.95" />
+            <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.86" />
           </linearGradient>
         </defs>
-        <path class="voice-branch-halo" pathLength="1" d="M 420 245 C 510 214, 570 142, 650 170 S 742 288, 828 245 S 902 183, 952 220" />
-        <path class="voice-branch-core" pathLength="1" d="M 420 245 C 510 214, 570 142, 650 170 S 742 288, 828 245 S 902 183, 952 220" />
+        <path class="voice-branch-halo" pathLength="1" d="M 80 278 C 238 248, 330 184, 468 196 S 650 322, 790 258 S 920 184, 986 220" />
+        <path class="voice-branch-core" pathLength="1" d="M 80 278 C 238 248, 330 184, 468 196 S 650 322, 790 258 S 920 184, 986 220" />
       </svg>
+
+      <div class="voice-fluid-stream" id="voiceFluidStream"></div>
 
       <div class="voice-fluid-cluster">
         <div class="voice-audio-ripples"><span></span><span></span><span></span></div>
@@ -2443,12 +2575,20 @@
     let voiceLiveStepLabels = [];
     let voiceLastTranscript = '';
     const voiceStepPositions = [
-      { left: '8%', top: '58%' },
-      { left: '28%', top: '26%' },
-      { left: '48%', top: '44%' },
-      { left: '67%', top: '66%' },
+      { left: '58%', top: '18%' },
+      { left: '72%', top: '30%' },
       { left: '82%', top: '48%' },
-      { left: '96%', top: '32%' }
+      { left: '76%', top: '64%' },
+      { left: '61%', top: '76%' },
+      { left: '91%', top: '40%' }
+    ];
+    const voiceFluidPathPositions = [
+      { left: '24%', top: '55%' },
+      { left: '38%', top: '42%' },
+      { left: '50%', top: '39%' },
+      { left: '61%', top: '46%' },
+      { left: '70%', top: '50%' },
+      { left: '82%', top: '44%' }
     ];
     const voiceStateClasses = [
       'voice-state-idle',
@@ -2683,6 +2823,66 @@
           <div class="voice-step-label">${label}</div>
         </div>`;
       }).join('');
+      renderVoiceFluidParticles(sourceLabels.length);
+      updateVoiceStepNodes(voiceCurrentState, activeVoiceStepIndex());
+    }
+
+    function renderVoiceFluidParticles(count) {
+      const stream = document.getElementById('voiceFluidStream');
+      if (!stream) return;
+      const existing = stream.querySelectorAll('.voice-stream-particle').length;
+      if (existing === count) return;
+      stream.innerHTML = Array.from({ length: count }).map((_, idx) => {
+        const pos = voiceStepPositions[idx] || { left: `${Math.min(94, 50 + idx * 8)}%`, top: `${idx % 2 ? 34 : 54}%` };
+        const size = Math.max(14, 26 - idx * 1.5);
+        return `<span class="voice-stream-particle" data-step="${idx}" style="--px:${pos.left};--py:${pos.top};--ps:${size}px"></span>`;
+      }).join('');
+    }
+
+    function activeVoiceStepIndex() {
+      const active = document.querySelector('.voice-step-node.active');
+      if (active) return Number(active.dataset.step);
+      const visible = Array.from(document.querySelectorAll('.voice-step-node.visible'));
+      if (visible.length) return Number(visible[visible.length - 1].dataset.step);
+      return undefined;
+    }
+
+    function updateVoiceFluidStream(state, stepIndex) {
+      const panel = document.getElementById('voicePanel');
+      const stream = document.getElementById('voiceFluidStream');
+      if (!panel || !stream) return;
+
+      const idx = typeof stepIndex === 'number' ? stepIndex : activeVoiceStepIndex();
+      const pos = typeof idx === 'number'
+        ? (voiceFluidPathPositions[idx] || voiceFluidPathPositions[voiceFluidPathPositions.length - 1])
+        : null;
+
+      if (pos && (state === 'working' || state === 'approval' || state === 'error')) {
+        panel.style.setProperty('--voice-active-x', pos.left);
+        panel.style.setProperty('--voice-active-y', pos.top);
+        panel.style.setProperty('--voice-fluid-scale', String(Math.max(0.78, 1 - idx * 0.035)));
+        panel.style.setProperty('--voice-fluid-opacity', state === 'error' ? '0.74' : '0.86');
+      } else {
+        panel.style.setProperty('--voice-active-x', 'var(--voice-fluid-x)');
+        panel.style.setProperty('--voice-active-y', 'var(--voice-fluid-y)');
+        panel.style.setProperty('--voice-fluid-scale', '1');
+        panel.style.setProperty('--voice-fluid-opacity', '1');
+      }
+
+      stream.classList.toggle('reforming', state === 'completed');
+      stream.querySelectorAll('.voice-stream-particle').forEach(p => {
+        const pIdx = Number(p.dataset.step);
+        p.classList.remove('visible', 'active', 'completed', 'error');
+        if (typeof idx !== 'number' || state === 'idle' || state === 'listening' || state === 'understanding') return;
+        if (state === 'completed') {
+          p.classList.add('visible', 'completed');
+          return;
+        }
+        if (pIdx <= idx) p.classList.add('visible');
+        if (pIdx < idx) p.classList.add('completed');
+        if (pIdx === idx) p.classList.add('active');
+        if (state === 'error' && pIdx === idx) p.classList.add('error');
+      });
     }
 
     function eventToVoiceState(eventName) {
@@ -2739,13 +2939,17 @@
       }
 
       updateVoiceStepNodes(state, payload.stepIndex);
+      updateVoiceFluidStream(state, payload.stepIndex);
       window.dispatchEvent(new CustomEvent('voice-ui-state', { detail: { state, payload } }));
     }
 
     function branchProgressForState(state, stepIndex) {
       if (state === 'idle' || state === 'listening' || state === 'understanding') return 0;
       if (state === 'completed') return 1;
-      if (typeof stepIndex === 'number') return Math.min(1, 0.16 + (stepIndex * 0.15));
+      if (typeof stepIndex === 'number') {
+        const total = Math.max(voiceLiveStepLabels.length || 0, stepIndex + 1, 5);
+        return Math.min(1, (stepIndex + 1) / total);
+      }
       if (state === 'approval') return 0.62;
       if (state === 'error') return 0.82;
       return 0.34;
@@ -2763,12 +2967,18 @@
         if (state === 'error' && idx === stepIndex) node.classList.add('error');
         if (state === 'completed') node.classList.add('visible', 'completed');
       });
+      updateVoiceFluidStream(state, stepIndex);
     }
 
     function resetVoiceLiveSteps() {
       voiceLiveStepLabels = [];
       const host = document.getElementById('voiceSteps');
       if (host) host.innerHTML = '';
+      const stream = document.getElementById('voiceFluidStream');
+      if (stream) {
+        stream.classList.remove('reforming');
+        stream.innerHTML = '';
+      }
     }
 
     function ensureVoiceLiveStep(index, label) {

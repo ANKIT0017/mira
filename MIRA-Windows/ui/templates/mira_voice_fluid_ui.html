@@ -1,0 +1,404 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:transparent}
+:root{
+  --fluid-base:#1a1a2e;
+  --stream-color:#4ade80;
+  --stream-glow:rgba(74,222,128,0.3);
+  --step-done:#22c55e;
+  --step-active:#4ade80;
+  --step-pending:#374151;
+  --branch-color:#22d3ee;
+}
+#wrapper{
+  font-family:var(--font-mono,'JetBrains Mono',monospace);
+  background:linear-gradient(135deg,#0b0e0d 0%,#0d1117 50%,#0b0e0d 100%);
+  border-radius:16px;
+  padding:32px 24px 24px;
+  min-height:520px;
+  position:relative;
+  overflow:hidden;
+}
+#wrapper::before{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(rgba(255,255,255,0.025) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(255,255,255,0.018) 1px,transparent 1px);
+  background-size:38px 38px;
+  mask-image:radial-gradient(circle at center,black 30%,transparent 80%);
+  pointer-events:none;
+}
+.label{font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:rgba(180,220,200,0.55);margin-bottom:16px;text-align:center}
+.stage{position:relative;height:340px;width:100%}
+
+.fluid-wrap{
+  position:absolute;
+  left:50%;top:50%;
+  transform:translate(-50%,-50%);
+  width:120px;height:120px;
+  display:flex;align-items:center;justify-content:center;
+  transition:left 0.8s cubic-bezier(0.4,0,0.2,1),top 0.8s cubic-bezier(0.4,0,0.2,1),width 0.5s,height 0.5s;
+  z-index:10;
+}
+.fluid{
+  width:100%;height:100%;
+  border-radius:46% 54% 50% 50% / 50% 45% 55% 50%;
+  background:radial-gradient(circle at 35% 28%,rgba(255,255,255,0.85) 0 3%,rgba(180,250,220,0.6) 7%,transparent 20%),
+    radial-gradient(circle at 60% 68%,rgba(74,222,128,0.7),transparent 38%),
+    radial-gradient(circle at 30% 62%,rgba(34,211,238,0.75),transparent 40%),
+    linear-gradient(135deg,rgba(30,200,120,0.9),rgba(34,197,94,0.7) 40%,rgba(20,180,200,0.6));
+  box-shadow:0 0 30px rgba(74,222,128,0.35),0 0 80px rgba(34,197,94,0.18),inset 12px 14px 28px rgba(255,255,255,0.2),inset -20px -24px 40px rgba(0,80,40,0.25);
+  animation:breathe 4s ease-in-out infinite,morph 7s ease-in-out infinite;
+  position:relative;
+  cursor:pointer;
+  transition:opacity 0.4s,transform 0.4s;
+}
+.fluid::after{
+  content:"";position:absolute;inset:-16%;
+  border-radius:inherit;
+  border:1px solid rgba(74,222,128,0.18);
+  filter:blur(6px);opacity:0.6;
+  animation:outerRing 5s ease-in-out infinite;
+}
+.fluid-inner{
+  position:absolute;inset:26%;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,0.55),rgba(100,255,200,0.15) 45%,transparent 75%);
+  filter:blur(2px);opacity:0.5;
+  animation:coreDrift 4.5s ease-in-out infinite;
+  pointer-events:none;
+}
+.ripple-wrap{position:absolute;inset:-22%;pointer-events:none}
+.ripple-wrap span{
+  position:absolute;inset:18%;
+  border-radius:44% 56% 52% 48% / 48% 44% 56% 52%;
+  border:1px solid rgba(74,222,128,0);opacity:0;transform:scale(0.76);
+}
+
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}
+@keyframes morph{
+  0%,100%{border-radius:46% 54% 50% 50% / 50% 45% 55% 50%}
+  35%{border-radius:52% 48% 44% 56% / 44% 56% 44% 56%}
+  70%{border-radius:44% 56% 57% 43% / 57% 43% 57% 43%}
+}
+@keyframes outerRing{0%,100%{transform:rotate(0) scale(1)}50%{transform:rotate(8deg) scale(1.06)}}
+@keyframes coreDrift{0%,100%{transform:translate(-4%,3%) scale(1)}50%{transform:translate(4%,-2%) scale(1.1)}}
+@keyframes rippleOut{
+  0%{opacity:0;transform:scale(0.76)}
+  20%{opacity:0.7}
+  100%{opacity:0;transform:scale(1.55)}
+}
+@keyframes listening{from{transform:scale(0.98) skewX(-1deg);border-radius:42% 58% 55% 45% / 48% 46% 54% 52%}to{transform:scale(1.08) skewX(1deg);border-radius:57% 43% 44% 56% / 41% 59% 42% 58%}}
+@keyframes compress{from{transform:scale(0.93)}to{transform:scale(1.02)}}
+@keyframes streamFlow{
+  0%{stroke-dashoffset:1}
+  100%{stroke-dashoffset:0}
+}
+@keyframes nodeAppear{from{opacity:0;transform:scale(0.6)}to{opacity:1;transform:scale(1)}}
+@keyframes nodePulse{0%,100%{r:5}50%{r:7}}
+@keyframes mergeBack{
+  0%{opacity:1}
+  100%{opacity:0;transform:scale(0)}
+}
+
+.stream-svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;opacity:0;transition:opacity 0.5s}
+.stream-svg.show{opacity:1}
+
+.step-nodes{position:absolute;inset:0;pointer-events:none}
+.step-node{
+  position:absolute;
+  display:flex;align-items:center;gap:8px;
+  opacity:0;
+  transform:scale(0.7);
+  transition:opacity 0.4s,transform 0.4s;
+}
+.step-node.visible{opacity:1;transform:scale(1)}
+.step-dot{
+  width:10px;height:10px;border-radius:50%;flex-shrink:0;
+  background:var(--step-pending);border:1px solid rgba(255,255,255,0.15);
+  transition:background 0.3s,box-shadow 0.3s;
+}
+.step-node.done .step-dot{background:var(--step-done);box-shadow:0 0 8px rgba(34,197,94,0.5)}
+.step-node.active .step-dot{background:var(--step-active);box-shadow:0 0 14px rgba(74,222,128,0.7);animation:nodePulse2 1s ease-in-out infinite}
+@keyframes nodePulse2{0%,100%{box-shadow:0 0 8px rgba(74,222,128,0.5)}50%{box-shadow:0 0 20px rgba(74,222,128,0.9)}}
+.step-label{
+  background:rgba(5,14,20,0.7);backdrop-filter:blur(8px);
+  border:1px solid rgba(74,222,128,0.18);border-radius:6px;
+  padding:4px 8px;font-size:11px;color:rgba(220,245,230,0.85);
+  white-space:nowrap;line-height:1.3;
+  transition:border-color 0.3s;
+}
+.step-node.active .step-label{border-color:rgba(74,222,128,0.5)}
+.step-node.done .step-label{opacity:0.55}
+
+.state-label{
+  text-align:center;margin-top:12px;
+  font-size:13px;letter-spacing:0.12em;text-transform:uppercase;
+  color:rgba(200,240,220,0.8);
+  min-height:20px;transition:opacity 0.3s;
+}
+.state-sub{
+  text-align:center;margin-top:4px;
+  font-size:11px;color:rgba(150,190,170,0.55);
+  min-height:16px;
+}
+
+.controls{display:flex;gap:8px;justify-content:center;margin-top:16px;flex-wrap:wrap}
+.ctrl-btn{
+  padding:6px 14px;font-size:11px;font-family:inherit;letter-spacing:0.08em;text-transform:uppercase;
+  background:rgba(20,30,25,0.8);border:1px solid rgba(74,222,128,0.25);
+  border-radius:6px;color:rgba(180,240,210,0.75);cursor:pointer;
+  transition:border-color 0.2s,color 0.2s,transform 0.15s;
+}
+.ctrl-btn:hover{border-color:rgba(74,222,128,0.7);color:#4ade80;transform:translateY(-1px)}
+.ctrl-btn.active-btn{border-color:#4ade80;color:#4ade80;background:rgba(74,222,128,0.1)}
+</style>
+
+<div id="wrapper">
+  <div class="label">Mira voice fluid — interaction states</div>
+  <div class="stage" id="stage">
+
+    <svg class="stream-svg" id="streamSvg" viewBox="0 0 600 340" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="sg" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="rgba(255,255,255,0.9)"/>
+          <stop offset="40%" stop-color="#4ade80" stop-opacity="0.95"/>
+          <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.8"/>
+        </linearGradient>
+      </defs>
+      <path id="streamHalo" fill="none" stroke="rgba(74,222,128,0.15)" stroke-width="22" stroke-linecap="round"
+        d="M 90 170 C 170 140, 220 100, 290 120 S 380 190, 450 155 S 520 110, 570 140" pathLength="1"
+        stroke-dasharray="1" stroke-dashoffset="1"/>
+      <path id="streamCore" fill="none" stroke="url(#sg)" stroke-width="8" stroke-linecap="round"
+        d="M 90 170 C 170 140, 220 100, 290 120 S 380 190, 450 155 S 520 110, 570 140" pathLength="1"
+        stroke-dasharray="1" stroke-dashoffset="1"/>
+    </svg>
+
+    <div class="step-nodes" id="stepNodes"></div>
+
+    <div class="fluid-wrap" id="fluidWrap">
+      <div class="ripple-wrap" id="rippleWrap">
+        <span id="r1"></span><span id="r2"></span><span id="r3"></span>
+      </div>
+      <div class="fluid" id="fluid">
+        <div class="fluid-inner"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="state-label" id="stateLabel">Idle</div>
+  <div class="state-sub" id="stateSub">Tap a state below to preview</div>
+
+  <div class="controls">
+    <button class="ctrl-btn" onclick="setState('idle')">Idle</button>
+    <button class="ctrl-btn" onclick="setState('listening')">Listening</button>
+    <button class="ctrl-btn" onclick="setState('processing')">Processing</button>
+    <button class="ctrl-btn" onclick="setState('working',0)">Task step 1</button>
+    <button class="ctrl-btn" onclick="setState('working',1)">Task step 2</button>
+    <button class="ctrl-btn" onclick="setState('working',2)">Task step 3</button>
+    <button class="ctrl-btn" onclick="setState('working',3)">Task step 4</button>
+    <button class="ctrl-btn" onclick="setState('working',4)">Task step 5</button>
+    <button class="ctrl-btn" onclick="setState('done')">Done</button>
+    <button class="ctrl-btn" id="demoBtn" onclick="runDemo()">Run full demo</button>
+  </div>
+</div>
+
+<script>
+const STEPS=[
+  {label:'Searching for AI finance article',x:'58%',y:'15%'},
+  {label:'Summarizing content',x:'72%',y:'28%'},
+  {label:'Creating calendar event',x:'80%',y:'46%'},
+  {label:'Finding contact details',x:'74%',y:'64%'},
+  {label:'Drafting email',x:'60%',y:'76%'},
+];
+
+const fluid=document.getElementById('fluid');
+const fluidWrap=document.getElementById('fluidWrap');
+const stateLabel=document.getElementById('stateLabel');
+const stateSub=document.getElementById('stateSub');
+const streamSvg=document.getElementById('streamSvg');
+const streamCore=document.getElementById('streamCore');
+const streamHalo=document.getElementById('streamHalo');
+const stepNodes=document.getElementById('stepNodes');
+const ripples=[document.getElementById('r1'),document.getElementById('r2'),document.getElementById('r3')];
+
+let currentState='idle';
+let currentStep=-1;
+let rippleTimers=[];
+let demoTimer=null;
+
+function buildStepNodes(){
+  stepNodes.innerHTML='';
+  STEPS.forEach((s,i)=>{
+    const d=document.createElement('div');
+    d.className='step-node';
+    d.id='sn'+i;
+    d.style.left=s.x;
+    d.style.top=s.y;
+    d.innerHTML=`<div class="step-dot"></div><div class="step-label">${s.label}</div>`;
+    stepNodes.appendChild(d);
+  });
+}
+buildStepNodes();
+
+function clearRipples(){
+  rippleTimers.forEach(t=>clearTimeout(t));
+  rippleTimers=[];
+  ripples.forEach(r=>{r.style.animation='none'});
+}
+function startRipples(){
+  clearRipples();
+  function fireRipple(el,delay){
+    const t=setTimeout(()=>{
+      el.style.animation='none';
+      void el.offsetWidth;
+      el.style.borderColor='rgba(74,222,128,0.35)';
+      el.style.animation='rippleOut 1.2s ease-out infinite';
+      el.style.animationDelay=delay+'ms';
+    },10);
+    rippleTimers.push(t);
+  }
+  fireRipple(ripples[0],0);
+  fireRipple(ripples[1],280);
+  fireRipple(ripples[2],560);
+}
+
+function setStreamProgress(progress){
+  const clamped=Math.max(0,Math.min(1,progress));
+  streamCore.style.transition='stroke-dashoffset 0.9s cubic-bezier(0.25,0.9,0.2,1)';
+  streamHalo.style.transition='stroke-dashoffset 0.9s cubic-bezier(0.25,0.9,0.2,1)';
+  streamCore.style.strokeDashoffset=String(1-clamped);
+  streamHalo.style.strokeDashoffset=String(1-clamped);
+}
+
+function updateStepNodes(activeIdx){
+  STEPS.forEach((_,i)=>{
+    const n=document.getElementById('sn'+i);
+    n.classList.remove('visible','active','done');
+    if(i<activeIdx){n.classList.add('visible','done')}
+    else if(i===activeIdx){n.classList.add('visible','active')}
+  });
+}
+
+function setState(state,stepIdx){
+  currentState=state;
+  currentStep=stepIdx!==undefined?stepIdx:-1;
+
+  fluid.style.animation='breathe 4s ease-in-out infinite,morph 7s ease-in-out infinite';
+  fluidWrap.style.left='50%';
+  fluidWrap.style.top='50%';
+  fluidWrap.style.width='120px';
+  fluidWrap.style.height='120px';
+  clearRipples();
+  ripples.forEach(r=>{r.style.animation='none';r.style.borderColor='rgba(74,222,128,0)'});
+  streamSvg.classList.remove('show');
+  STEPS.forEach((_,i)=>document.getElementById('sn'+i).classList.remove('visible','active','done'));
+
+  if(state==='idle'){
+    stateLabel.textContent='Idle';
+    stateSub.textContent='The fluid is whole and at rest';
+    setStreamProgress(0);
+  }
+  else if(state==='listening'){
+    stateLabel.textContent='Listening...';
+    stateSub.textContent='Voice ripples absorbed into the fluid';
+    fluid.style.animation='listening 0.6s ease-in-out infinite alternate,morph 3s ease-in-out infinite';
+    startRipples();
+    setStreamProgress(0);
+  }
+  else if(state==='processing'){
+    stateLabel.textContent='Processing...';
+    stateSub.textContent='Intent compressing — fluid contracts';
+    fluid.style.animation='compress 1s ease-in-out infinite alternate,morph 4s ease-in-out infinite';
+    fluidWrap.style.width='90px';
+    fluidWrap.style.height='90px';
+    setStreamProgress(0);
+  }
+  else if(state==='working'){
+    const si=stepIdx||0;
+    const totalSteps=STEPS.length;
+    const progress=(si+1)/totalSteps;
+    const lerpX=15+progress*52;
+    fluidWrap.style.left=lerpX+'%';
+    fluidWrap.style.top='50%';
+    const sz=Math.max(56,90-si*7);
+    fluidWrap.style.width=sz+'px';
+    fluidWrap.style.height=sz+'px';
+    fluid.style.animation='breathe '+(2.5+si*0.3)+'s ease-in-out infinite,morph '+(5+si)+'s ease-in-out infinite';
+    streamSvg.classList.add('show');
+    setStreamProgress(progress);
+    updateStepNodes(si);
+    const labels=['Searching web...','Summarizing article...','Scheduling calendar event...','Looking up contact...','Drafting email...'];
+    stateLabel.textContent='Working — step '+(si+1)+' of '+totalSteps;
+    stateSub.textContent=labels[si]||'Running task...';
+  }
+  else if(state==='done'){
+    stateLabel.textContent='Done';
+    stateSub.textContent='Stream returns — fluid becomes whole again';
+    fluidWrap.style.left='50%';
+    fluidWrap.style.top='50%';
+    fluidWrap.style.width='130px';
+    fluidWrap.style.height='130px';
+    fluid.style.animation='breathe 3.5s ease-in-out infinite,morph 6s ease-in-out infinite';
+    streamSvg.classList.add('show');
+    setStreamProgress(1);
+    STEPS.forEach((_,i)=>{
+      const n=document.getElementById('sn'+i);
+      n.classList.add('visible','done');
+      n.classList.remove('active');
+    });
+    setTimeout(()=>{
+      streamSvg.classList.remove('show');
+      STEPS.forEach((_,i)=>{
+        const n=document.getElementById('sn'+i);
+        n.style.transition='opacity 0.6s,transform 0.6s';
+        n.classList.remove('visible','done');
+      });
+      setStreamProgress(0);
+    },1800);
+  }
+}
+
+let demoRunning=false;
+let demoTimers=[];
+function runDemo(){
+  if(demoRunning){
+    demoRunning=false;
+    demoTimers.forEach(t=>clearTimeout(t));
+    demoTimers=[];
+    document.getElementById('demoBtn').classList.remove('active-btn');
+    document.getElementById('demoBtn').textContent='Run full demo';
+    setState('idle');
+    return;
+  }
+  demoRunning=true;
+  document.getElementById('demoBtn').classList.add('active-btn');
+  document.getElementById('demoBtn').textContent='Stop demo';
+
+  const seq=[
+    [0,     ()=>setState('idle')],
+    [600,   ()=>setState('listening')],
+    [2400,  ()=>setState('processing')],
+    [3800,  ()=>setState('working',0)],
+    [5200,  ()=>setState('working',1)],
+    [6600,  ()=>setState('working',2)],
+    [8000,  ()=>setState('working',3)],
+    [9400,  ()=>setState('working',4)],
+    [10800, ()=>setState('done')],
+    [13000, ()=>{
+      demoRunning=false;
+      document.getElementById('demoBtn').classList.remove('active-btn');
+      document.getElementById('demoBtn').textContent='Run full demo';
+    }]
+  ];
+  seq.forEach(([delay,fn])=>{
+    const t=setTimeout(fn,delay);
+    demoTimers.push(t);
+  });
+}
+
+const style=document.createElement('style');
+style.textContent=`@keyframes rippleOut{0%{opacity:0;transform:scale(0.76)}20%{opacity:0.75}100%{opacity:0;transform:scale(1.55)}}`;
+document.head.appendChild(style);
+
+setState('idle');
+</script>

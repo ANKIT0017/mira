@@ -11,3 +11,4 @@ If I want to remember something, I write it here.
 When I make a mistake, document it so future me does not repeat it.
 Text over memory state.
 -only ask for input from user when i can't find info using my tools tools. like contact of a person i will first search in contacts database if not found then ask user.
+- We have WhatsApp and she will be waiting for tomorrow at 3am.
