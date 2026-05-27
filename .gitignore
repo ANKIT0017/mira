@@ -1,6 +1,8 @@
 
 openclaw-docker/
 openclaw-main/
+firecrawl/
+MIRA-Android/
 
 # OS/editor
 .DS_Store
@@ -29,6 +31,11 @@ AION-Windows/.env
 AION-Windows/venv/
 AION-Windows/mcp_server/db.sqlite
 AION-Windows/whatsapp_bridge/auth_whatsapp/
+MIRA-Windows/venv/
+MIRA-Windows/*.db
+MIRA-Windows/SANDBOX/
+MIRA-Windows/whatsapp_bridge/auth_whatsapp/
+MIRA-Windows/SANDBOX/voice_uploads/
 MIRA-Windows/*.dll
 
 # ── Large model files (never commit — download separately) ────────────────
