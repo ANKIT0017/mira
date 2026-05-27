@@ -1,21 +1,38 @@
 # MIRA Windows
 
+**Version:** v0.2
+
 MIRA Windows is the main project in this repository: a Windows-first personal AI assistant that can talk, listen, research, use local tools, create files, automate WhatsApp, manage tasks, and run multi-step workflows from one desktop UI.
 
 It is not a demo chatbot. MIRA is a local agent runtime with a real tool layer, a live browser interface, optional voice mode, document generation, web research, memory, contacts, calendar, todo, email, WhatsApp, scheduler, and local/cloud model routing.
 
 ![MIRA walkthrough](./MIRA-Windows/assets/mira2.gif)
 
+## v0.2 Latest Updates
+
+MIRA v0.2 is focused on reliability: better research, stronger voice input, safer tool execution, more complete file generation, and improved context handoff between steps.
+
+- Research now keeps search queries scoped to the actual research question instead of mixing in unrelated workflow instructions.
+- Research falls back from blocked news search to regular web search, and can run targeted follow-up searches when the first pass does not gather enough evidence.
+- Verified research tasks are more evidence-aware: MIRA should separate facts from opinions and call out missing support instead of inventing confidence.
+- Voice input now uses a stronger local STT path with `faster-whisper`, adaptive endpoint detection, browser recording, and fallback support.
+- Tool usage is more resilient across model output styles, including nested `args`, inline key-value calls, generated file paths, media sends, and contact/todo workflows.
+- File generation is more reliable for code, PDFs, documents, CSV, JSON, HTML, and other generated artifacts before they are sent or reused.
+- Context management now carries raw tool outputs, artifact paths, buffers, and slot values more carefully into later steps and final synthesis.
+- Todo and contact flows are smarter: due dates like "tomorrow" are inferred, business-day spreading is supported, and explicit confirmation lookups are not skipped.
+- WhatsApp media sending now prefers the real generated artifact path and validates document delivery more carefully.
+- The repository direction now treats `MIRA-Windows/` as the main supported project.
+
 ## What MIRA Does
 
 - Turns natural language into multi-step tool workflows.
-- Streams live plan, tool execution, task state, errors, approvals, and final output.
-- Creates and sends files such as PDFs, Markdown, text, code, CSV, and Excel workbooks.
+- Streams live plan, tool execution, task state, errors, approvals, failures, and final output.
+- Creates and sends files such as PDFs, Markdown, text, code, CSV, JSON, HTML, and Excel workbooks.
 - Sends WhatsApp messages and media through the local WhatsApp bridge.
-- Performs web research with source extraction and claim-aware synthesis.
+- Performs web research with source extraction, adequacy checks, and claim-aware synthesis.
 - Runs local models through llama.cpp/Ollama-style adapters and can route to cloud providers when configured.
 - Supports voice input/output with local `faster-whisper` STT and Piper/Windows TTS paths.
-- Includes a premium fluid voice UI that visualizes listening, thinking, tool progress, approvals, failures, and completion.
+- Includes a fluid voice UI that visualizes listening, thinking, tool progress, approvals, failures, and completion.
 
 ## Project Layout
 
@@ -57,7 +74,7 @@ Then open the local UI shown by the startup script.
 
 ## Voice Mode
 
-MIRA now uses a stronger local STT path:
+MIRA v0.2 uses a stronger local STT path:
 
 - Preferred backend: `faster-whisper`
 - Default model: `base.en`
@@ -73,21 +90,18 @@ $env:MIRA_STT_MODEL="small.en"  # better accuracy, slower
 $env:MIRA_STT_MODEL="tiny.en"   # faster, weaker
 ```
 
-## WhatsApp Automation
+Run voice mode:
 
-MIRA can resolve contacts, create files, and send messages or media through the WhatsApp bridge.
+```powershell
+cd MIRA-Windows
+.\venv\Scripts\python.exe -m voice.voice_agent --stt-model base.en
+```
 
-Example workflows:
+Use `small.en` when accuracy matters more than speed.
 
-- “Write Bellman-Ford in C++ and send the file to Ankit on WhatsApp.”
-- “Find the best books to read this month and send a PDF summary.”
-- “Research verified India sector growth and send Ankit a PDF report.”
+## Research And Reasoning
 
-The agent validates media delivery paths before sending and prefers generated document artifacts such as PDFs over stale text files.
-
-## Research And Tools
-
-MIRA’s agent runtime is built around explicit tool execution. For research-heavy tasks, it searches, reads sources, extracts facts, checks whether evidence is adequate for the user’s request, and performs targeted follow-up research when the first pass is too thin.
+MIRA's research runtime is designed to gather enough information before answering. It searches, reads sources, extracts facts, checks whether the evidence is adequate for the user's request, and performs targeted follow-up research when the first pass is too thin.
 
 For verified investment-style research, MIRA looks for:
 
@@ -99,6 +113,42 @@ For verified investment-style research, MIRA looks for:
 - multiple independent or primary sources
 
 If evidence is insufficient, MIRA should say what is missing instead of inventing confidence.
+
+## Tool Execution
+
+MIRA v0.2 improves how the agent handles tool calls from local models:
+
+- accepts strict JSON, nested `args`, and inline key-value tool calls
+- preserves generated artifact paths across later steps
+- avoids redundant but required confirmation skips
+- validates file/media paths before sending
+- infers due dates such as "tomorrow"
+- spreads todo due dates over business days when requested
+- routes school/homework/general factual questions to direct reasoning instead of unnecessary knowledge-base or web tools
+
+## File Generation
+
+MIRA can generate and reuse files across workflows:
+
+- source code files such as `.cpp`, `.py`, `.js`, `.html`, `.css`, and `.json`
+- PDFs and Markdown reports
+- CSV files and Excel workbooks
+- text notes and generated content
+- WhatsApp document attachments
+
+Generated outputs are saved under `MIRA-Windows/SANDBOX/` unless a connector explicitly returns a different safe artifact path.
+
+## WhatsApp Automation
+
+MIRA can resolve contacts, create files, and send messages or media through the WhatsApp bridge.
+
+Example workflows:
+
+- "Write Bellman-Ford in C++ and send the file to Ankit on WhatsApp."
+- "Find the best books to read this month and send a PDF summary."
+- "Research verified India sector growth and send Ankit a PDF report."
+
+The agent validates media delivery paths before sending and prefers generated document artifacts such as PDFs over stale text files.
 
 ## Local Data And Privacy
 
@@ -127,15 +177,6 @@ Run the UI:
 cd MIRA-Windows
 .\venv\Scripts\python.exe ui\app.py
 ```
-
-Run voice mode:
-
-```powershell
-cd MIRA-Windows
-.\venv\Scripts\python.exe -m voice.voice_agent --stt-model base.en
-```
-
-Use `small.en` when accuracy matters more than speed.
 
 ## Documentation
 

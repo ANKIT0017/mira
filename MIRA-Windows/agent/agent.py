@@ -5,7 +5,7 @@ import hashlib
 import dataclasses
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from .model_adapter import (
     generate,
@@ -1123,6 +1123,9 @@ class Agent:
             if to_val:
                 slots["recipient_phone_or_jid"] = self._extract_phone_like(to_val) or to_val
 
+        if tool_name == "todo.add":
+            artifacts["todo_add_count"] = int(artifacts.get("todo_add_count", 0) or 0) + 1
+
         if tool_name == "email.create_draft" and isinstance(tool_res, dict):
             _draft_id = tool_res.get("draft_id") or tool_res.get("id") or tool_res.get("message_id")
             if _draft_id:
@@ -1583,6 +1586,21 @@ class Agent:
             "categories": self._normalize_categories(["Reasoning"]),
         }]
 
+    def _clean_research_query(self, query: str) -> str:
+        q = re.sub(r"\s+", " ", str(query or "")).strip()
+        q = re.sub(r"^(?:search|find|look up|lookup|research)\s+(?:for\s+)?", "", q, flags=re.IGNORECASE).strip()
+        # Multi-action requests often contain delivery or task-management clauses.
+        # Keep the research topic scoped so search engines do not receive the whole workflow.
+        parts = re.split(
+            r"\b(?:and\s+then\s+|then\s+|and\s+)?(?:create|add|make|save|send|share|email|whatsapp|message|draft|write\s+to)\b",
+            q,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )
+        if parts:
+            q = parts[0].strip()
+        return q.strip(" ,.;:-")
+
     def _research_query_from_args(self, args: dict) -> str:
         query = str(
             args.get("query")
@@ -1593,6 +1611,7 @@ class Agent:
         ).strip()
         task = str(getattr(self, "_current_task_text", "") or "").strip()
         if query:
+            query = self._clean_research_query(query)
             query_l = re.sub(r"\s+", " ", query.lower()).strip()
             task_l = re.sub(r"\s+", " ", task.lower()).strip()
             omitted_constraints = re.search(
@@ -1602,11 +1621,15 @@ class Agent:
                 r"\b(not opinions?|financials?|technical analysis|investors?|execution|business|fundamental)\b",
                 query_l,
             )
-            if task and len(task) > len(query) + 20 and (query_l in task_l or omitted_constraints):
+            is_financial_research = re.search(
+                r"\b(stock|stocks|share|shares|invest|investment|sector|sectors|ticker|equity)\b",
+                task_l,
+            )
+            if task and omitted_constraints and is_financial_research:
                 return task
             return query
         step = str(getattr(self, "_current_step_desc", "") or "").strip()
-        return step or task
+        return self._clean_research_query(step or task)
 
     def _research_plan(self, query: str, max_queries: int = 5) -> dict:
         q = re.sub(r"\s+", " ", str(query or "")).strip()
@@ -1615,7 +1638,7 @@ class Agent:
         preferred_domains: list[str] = []
         avoid = ["ads", "thin SEO pages", "forum comments unless user asks for opinions"]
         schema = ["claim", "item/title", "summary", "source", "url", "date if available"]
-        needs_news = bool(re.search(r"\b(latest|today|current|recent|news|2026|this year)\b", q_l))
+        needs_news = bool(re.search(r"\b(latest|today|recent|news|this week|this month)\b", q_l))
 
         if re.search(r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis|institutional investors?)\b", q_l):
             source_types = [
@@ -1658,10 +1681,10 @@ class Agent:
             source_types = ["IMDb or TMDb pages", "Wikipedia/reference pages", "critic/review pages"]
             preferred_domains = ["imdb.com", "wikipedia.org", "rottentomatoes.com", "themoviedb.org"]
             schema = ["title", "year", "genre", "plot summary", "themes", "source", "url"]
-        elif re.search(r"\b(product|buy|price|laptop|phone|camera|headphone|software)\b", q_l):
+        elif re.search(r"\b(product|buy|price|laptop|phone|camera|headphone|software|tool|tools|app|apps|saas|productivity)\b", q_l):
             source_types = ["official product pages", "trusted reviews", "retailer/spec pages"]
-            preferred_domains = ["consumerreports.org", "rtings.com", "wirecutter.com", "tomsguide.com", "pcmag.com"]
-            schema = ["product", "price/spec", "pros", "cons", "best-for", "source", "url"]
+            preferred_domains = ["g2.com", "capterra.com", "pcmag.com", "zapier.com", "forbes.com"]
+            schema = ["tool", "category", "small-business usefulness", "pros", "cons", "pricing if available", "source", "url"]
         elif re.search(r"\b(paper|study|research|journal|medical|health|disease|treatment)\b", q_l):
             source_types = ["peer-reviewed papers", "government/medical institutions", "systematic reviews"]
             preferred_domains = ["pubmed.ncbi.nlm.nih.gov", "nih.gov", "who.int", "nature.com", "thelancet.com"]
@@ -1737,15 +1760,26 @@ class Agent:
         all_results = []
         errors = []
         for q in (plan.get("queries") or [])[:8]:
-            tool_name = "search.news" if plan.get("needs_news") and re.search(r"\b(news|latest|today|current|recent)\b", q, re.IGNORECASE) else "search.duckduckgo"
+            prefer_news = bool(plan.get("needs_news") and re.search(r"\b(news|latest|today|recent)\b", q, re.IGNORECASE))
+            tool_name = "search.news" if prefer_news else "search.duckduckgo"
             if tool_name not in self.tools:
                 tool_name = "search.duckduckgo"
             res = self._run_registered_tool(tool_name, {"query": q, "max_results": int(max_results or 5)})
+            if isinstance(res, dict) and res.get("status") == "error" and tool_name == "search.news":
+                errors.append(f"{tool_name}({q}): {res.get('error', 'unknown error')}")
+                tool_name = "search.duckduckgo"
+                res = self._run_registered_tool(tool_name, {"query": q, "max_results": int(max_results or 5)})
             if isinstance(res, dict) and res.get("status") == "error":
                 errors.append(f"{tool_name}({q}): {res.get('error', 'unknown error')}")
                 continue
             payload = res.get("result", res) if isinstance(res, dict) else res
             results = payload.get("results", []) if isinstance(payload, dict) else []
+            if not results and prefer_news and tool_name != "search.duckduckgo":
+                fallback = self._run_registered_tool("search.duckduckgo", {"query": q, "max_results": int(max_results or 5)})
+                if not (isinstance(fallback, dict) and fallback.get("status") == "error"):
+                    tool_name = "search.duckduckgo"
+                    payload = fallback.get("result", fallback) if isinstance(fallback, dict) else fallback
+                    results = payload.get("results", []) if isinstance(payload, dict) else []
             for item in results:
                 if isinstance(item, dict):
                     enriched = dict(item)
@@ -1753,6 +1787,32 @@ class Agent:
                     enriched["search_tool"] = tool_name
                     all_results.append(enriched)
         return {"query": plan.get("query", ""), "results": all_results, "count": len(all_results), "errors": errors[:5]}
+
+    def _nth_business_day_from_tomorrow(self, index: int) -> str:
+        day = datetime.now().date()
+        remaining = max(0, int(index or 0)) + 1
+        while remaining > 0:
+            day = day + timedelta(days=1)
+            if day.weekday() < 5:
+                remaining -= 1
+        return day.isoformat()
+
+    def _infer_todo_due_date(self, args: dict) -> str:
+        text = " ".join(
+            str(x or "")
+            for x in (
+                getattr(self, "_current_task_text", ""),
+                getattr(self, "_current_step_desc", ""),
+                args.get("title"),
+                args.get("description"),
+            )
+        ).lower()
+        if re.search(r"\btomorrow\b", text):
+            return (datetime.now().date() + timedelta(days=1)).isoformat()
+        if re.search(r"\bnext\s+(?:\d+|one|two|three|four|five|six|seven)?\s*business\s+days?\b", text):
+            artifacts = (self._working_state or {}).setdefault("artifacts", {})
+            return self._nth_business_day_from_tomorrow(int(artifacts.get("todo_add_count", 0) or 0))
+        return ""
 
     def _research_select_sources(self, plan: dict, search_payload: dict, max_sources: int = 5) -> list[dict]:
         preferred = [str(d).lower() for d in plan.get("preferred_domains", [])]
@@ -4878,11 +4938,14 @@ class Agent:
         for s in steps:
             act = str(s.get("action", "")).lower()
             goal_l = str(s.get("goal", "")).lower()
+            is_explicit_confirmation = bool(
+                re.search(r"\b(confirm|verify|check|search\s+again|exists?|existence|found)\b", goal_l)
+            )
             is_contact_lookup = bool(
-                act.startswith("contacts.")
+                act in ("contacts.get", "contacts.search", "contacts.list")
                 or re.search(r"\b(lookup|find|search|get)\b.{0,32}\b(contact|recipient|email|phone)\b", goal_l)
             )
-            if is_contact_lookup and resolved_lookup:
+            if is_contact_lookup and resolved_lookup and not is_explicit_confirmation:
                 continue
             out.append(dict(s))
             if is_contact_lookup:
@@ -6391,7 +6454,15 @@ class Agent:
                 str(c.get("tool", "")).startswith("contacts.") and c.get("status") == "done"
                 for c in completed
             )
-            if step_action.startswith("contacts.") and _recipient_known and _prior_contact_ok:
+            _confirmation_lookup = bool(
+                step_action in ("contacts.get", "contacts.search", "contacts.list")
+                and re.search(
+                    r"\b(confirm|verify|check|search\s+again|again|exists?|existence|found)\b",
+                    str(step_desc or ""),
+                    re.IGNORECASE,
+                )
+            )
+            if step_action in ("contacts.get", "contacts.search") and _recipient_known and _prior_contact_ok and not _confirmation_lookup:
                 step_status = "done"
                 step_result = "Recipient already resolved from earlier contact lookup; skipping duplicate step."
                 _step_tool = step_action or "contacts.search"
@@ -9241,6 +9312,11 @@ class Agent:
                 "count": len(merged_results[:18]),
                 "errors": errors[:5],
             }
+
+        if tool_name == "todo.add" and not str(args.get("due_date") or "").strip():
+            inferred_due = self._infer_todo_due_date(args)
+            if inferred_due:
+                args["due_date"] = inferred_due
 
         raw = execute_tool(tool_name, **args)
         try:
