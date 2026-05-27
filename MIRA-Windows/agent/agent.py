@@ -242,6 +242,13 @@ def _fb_list_parent(tn, args, err):
     parent = str(Path(str(path)).parent) if ("/" in str(path) or "\\" in str(path)) else "SANDBOX"
     return ("filesystem.list", {"path": parent})
 
+def _fb_research_from_query(tn, args, err):
+    """knowledge.search fallback: try the web/research pipeline before asking."""
+    q = str(args.get("query") or args.get("topic") or args.get("source") or "").strip()
+    if not q:
+        return None
+    return ("research.run", {"query": q, "max_sources": 5})
+
 def _ni_search(tn, args, err):
     """filesystem.search: file not found in SANDBOX."""
     q = args.get("query", "")
@@ -330,7 +337,10 @@ _POLICY_TODO_SEARCH = ToolPolicy(
 _POLICY_KNOWLEDGE_SEARCH = ToolPolicy(
     family="knowledge_search",
     empty_is_failure=True,
-    fallback_sequence=(("need_input", _ni_knowledge_search),),
+    fallback_sequence=(
+        ("tool", _fb_research_from_query),
+        ("need_input", _ni_knowledge_search),
+    ),
     need_input_question=_ni_knowledge_search,
 )
 
@@ -737,7 +747,24 @@ class Agent:
                 "function": None,
             },
         ]
-        for _t in _buffer_tools + _research_tools:
+        _reasoning_tools = [
+            {
+                "name": "think",
+                "description": "Reason over data or answer directly using the LLM",
+                "category": "Reasoning",
+                "parameters": {
+                    "prompt": {"type": "str", "required": True, "default": None},
+                    "file": {"type": "str", "required": False, "default": None},
+                    "model": {"type": "str", "required": False, "default": None},
+                    "max_tokens": {"type": "int", "required": False, "default": 1024},
+                },
+                "example": '{"tool": "think", "args": {"prompt": "Answer concisely:"}}',
+                "notes": "Use for general factual questions, homework, calculations, and synthesis from known context.",
+                "has_var_keyword": False,
+                "function": None,
+            },
+        ]
+        for _t in _buffer_tools + _research_tools + _reasoning_tools:
             TOOL_METADATA.setdefault(_t["name"], _t)
             if _t["name"] not in self.tools:
                 self.tools.append(_t["name"])
@@ -1049,18 +1076,27 @@ class Agent:
                         slots["research_facts"] = str(facts)[:12000]
 
         if tool_name in ("filesystem.write", "filesystem.append"):
-            raw_path = str(
-                tool_args.get("path")
-                or tool_args.get("file_path")
-                or tool_args.get("filename")
-                or ""
-            ).strip()
-            if raw_path:
-                norm = raw_path.replace("\\", "/")
-                if not norm.lower().startswith("sandbox/"):
-                    norm = f"SANDBOX/{Path(norm).name}"
+            norm = self._extract_file_path_from_tool_result(tool_res)
+            if not norm:
+                norm = self._normalize_sandbox_file_ref(
+                    tool_args.get("path")
+                    or tool_args.get("file_path")
+                    or tool_args.get("filename")
+                    or ""
+                )
+            if norm:
                 artifacts["last_file_path"] = norm
                 slots["file_path"] = norm
+
+        if tool_name in ("pdf.create", "word.create", "convert.markdown_to_pdf", "convert.html_to_pdf"):
+            norm = self._extract_file_path_from_tool_result(tool_res)
+            if norm:
+                artifacts["last_file_path"] = norm
+                artifacts["document_file_path"] = norm
+                slots["file_path"] = norm
+                if norm.lower().endswith(".pdf"):
+                    artifacts["pdf_file_path"] = norm
+                    slots["pdf_file_path"] = norm
 
         if tool_name == "excel.create":
             artifacts.setdefault("excel_created", False)
@@ -1216,6 +1252,11 @@ class Agent:
             data = None
 
         if isinstance(data, dict):
+            if tool_l.startswith("research."):
+                answer = str(data.get("answer") or "").strip()
+                if answer:
+                    return answer[:max_chars]
+
             contact = data.get("contact")
             contacts = data.get("contacts")
             if isinstance(contact, dict):
@@ -1498,7 +1539,7 @@ class Agent:
 
     def _normalize_research_steps(self, steps: list) -> list:
         """Upgrade raw web-search steps into the reusable research pipeline."""
-        if not steps or not self._is_research_task():
+        if not steps or self._is_homework_answer_task() or not self._is_research_task():
             return steps
         pure_research = not any(
             any(str(step.get("action", "")).strip().lower().startswith(p) for p in _SIDE_EFFECT_PREFIXES)
@@ -1529,6 +1570,18 @@ class Agent:
                 s.pop("inputs", None)
             out.append(s)
         return out
+
+    def _normalize_homework_steps(self, steps: list) -> list:
+        """Route school-style factual/calculation prompts through one reasoning step."""
+        if not steps or not self._is_homework_answer_task():
+            return steps
+        return [{
+            "action": "think",
+            "goal": "Answer questions and calculate result",
+            "outputs": ["final_answer"],
+            "needed_by": [],
+            "categories": self._normalize_categories(["Reasoning"]),
+        }]
 
     def _research_query_from_args(self, args: dict) -> str:
         query = str(
@@ -1884,6 +1937,74 @@ class Agent:
             lines.append(f"{idx}. {title}: {str(detail)[:240]}" + (f" Source: {src}" if src else ""))
         return "\n".join(lines)
 
+    def _research_adequacy_gaps(self, query: str, facts: list[dict]) -> list[str]:
+        """Return missing evidence areas that should trigger follow-up research."""
+        q_l = str(query or "").lower()
+        hay = json.dumps(facts or [], ensure_ascii=False, default=str).lower()
+        gaps: list[str] = []
+        unique_sources = {
+            str(f.get("url") or f.get("source") or "").strip().lower()
+            for f in (facts or [])
+            if isinstance(f, dict) and str(f.get("url") or f.get("source") or "").strip()
+        }
+        wants_verified = bool(re.search(r"\b(confirm|verified|facts?|claim|claims?|not opinions?|source|sources|evidence)\b", q_l))
+        wants_investment = bool(re.search(r"\b(stock|stocks|share|shares|ticker|invest|investment|equity)\b", q_l))
+        wants_sector = bool(re.search(r"\bsector|sectors|industry|industries\b", q_l))
+        if wants_verified and len(unique_sources) < 2:
+            gaps.append("multiple independent or primary sources")
+        if wants_sector and not re.search(
+            r"\b(manufacturing|services|construction|infrastructure|banking|financial|it|technology|"
+            r"pharma|healthcare|energy|power|capital goods|automobile|auto|telecom|cement|defence|"
+            r"consumer|fmcg|real estate|sectoral|gva)\b",
+            hay,
+        ):
+            gaps.append("sector-level growth evidence")
+        if wants_investment and not re.search(r"\b(ticker|nse|bse|listed|company|companies|stock|share)\b", hay):
+            gaps.append("named listed companies or tickers")
+        if wants_investment and re.search(r"\bfinancials?|investors?|ownership|technical analysis|technical\b", q_l):
+            if not re.search(r"\b(revenue|profit|earnings|cash flow|debt|margin|roe|roce|eps)\b", hay):
+                gaps.append("company financial facts")
+            if not re.search(r"\b(promoter|institutional|mutual fund|fii|dii|ownership|shareholding|investor)\b", hay):
+                gaps.append("investor or ownership facts")
+            if not re.search(r"\b(price|trend|support|resistance|volume|moving average|rsi|technical)\b", hay):
+                gaps.append("technical trend facts")
+        if wants_investment and len(facts or []) < 6:
+            gaps.append("enough extracted facts for comparison")
+        return list(dict.fromkeys(gaps))
+
+    def _research_followup_queries(self, query: str, gaps: list[str]) -> list[str]:
+        """Build targeted follow-up queries for missing research evidence."""
+        q = re.sub(r"\s+", " ", str(query or "")).strip()
+        q_l = q.lower()
+        out: list[str] = []
+        if "sector-level growth evidence" in gaps:
+            out.append(f"{q} India latest quarter sectoral GVA growth official RBI MOSPI")
+        if "named listed companies or tickers" in gaps:
+            out.append(f"{q} Indian listed companies NSE BSE tickers by growth sectors")
+        if any(g in gaps for g in ("company financial facts", "investor or ownership facts", "technical trend facts")):
+            out.append(f"{q} company financials shareholding technical trend NSE BSE")
+        if "multiple independent or primary sources" in gaps:
+            out.append(f"{q} Reuters RBI MOSPI NSE official data")
+        if not out and re.search(r"\b(stock|stocks|invest|investment|sector|sectors)\b", q_l):
+            out.append(f"{q} verified facts sources")
+        return list(dict.fromkeys(out))[:3]
+
+    def _dedupe_research_facts(self, facts: list[dict]) -> list[dict]:
+        seen = set()
+        out = []
+        for fact in facts or []:
+            if not isinstance(fact, dict):
+                continue
+            key = (
+                str(fact.get("url") or "").strip().lower(),
+                str(fact.get("claim") or fact.get("summary") or fact.get("ticker") or fact.get("company") or "").strip().lower()[:220],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(fact)
+        return out
+
     def _execute_research_tool(self, tool_name: str, args: dict) -> dict:
         query = self._research_query_from_args(args or {})
         if not query:
@@ -1910,10 +2031,38 @@ class Agent:
                 return {"status": "error", "error": "No research sources could be read.", "plan": plan, "sources": selected}
             return {"status": "success", "plan": plan, "sources": selected, "pages": pages, "page_count": len(pages)}
         facts = self._research_extract_facts(query, plan, pages)
+        adequacy_gaps = self._research_adequacy_gaps(query, facts)
+        followup_queries = self._research_followup_queries(query, adequacy_gaps)
+        extra_sources = []
+        if tool_name in ("research.run", "research.extract_facts") and followup_queries:
+            for followup_query in followup_queries:
+                if not adequacy_gaps:
+                    break
+                fplan = self._research_plan(followup_query, max_queries=max_queries)
+                fsearches = self._research_search_many(fplan, max_results=int((args or {}).get("max_results") or 5))
+                fselected = self._research_select_sources(fplan, fsearches, max_sources=max(3, min(max_sources, 6)))
+                fpages = self._research_read_sources(fselected)
+                ffacts = self._research_extract_facts(query, fplan, fpages)
+                if ffacts:
+                    facts = self._dedupe_research_facts([*facts, *ffacts])
+                    selected = [*selected, *fselected]
+                    extra_sources.extend(fselected)
+                    adequacy_gaps = self._research_adequacy_gaps(query, facts)
         if tool_name == "research.extract_facts":
             if not facts:
                 return {"status": "error", "error": "No useful facts could be extracted from research sources.", "plan": plan, "sources": selected}
-            return {"status": "success", "plan": plan, "sources": selected, "facts": facts, "fact_count": len(facts)}
+            return {
+                "status": "success",
+                "plan": plan,
+                "sources": selected,
+                "facts": facts,
+                "fact_count": len(facts),
+                "adequacy_gaps": adequacy_gaps,
+                "followup_sources": [
+                    {"title": s.get("title", ""), "url": s.get("url", ""), "source_query": s.get("source_query", "")}
+                    for s in extra_sources
+                ],
+            }
         if not searches.get("count", 0):
             return {"status": "error", "error": "Research search returned no results.", "plan": plan, "search": searches}
         if not selected:
@@ -1933,6 +2082,11 @@ class Agent:
             "facts": facts,
             "answer": answer,
             "fact_count": len(facts),
+            "adequacy_gaps": adequacy_gaps,
+            "followup_sources": [
+                {"title": s.get("title", ""), "url": s.get("url", ""), "source_query": s.get("source_query", "")}
+                for s in extra_sources
+            ],
         }
 
     def _parse_needed_by(self, raw: str) -> list[int]:
@@ -2054,21 +2208,58 @@ class Agent:
                 continue
             if slot in {"file_path", "filepath", "path", "excel_file_path"}:
                 files = self._extract_key_data(payload).get("files", [])
-                if not files and isinstance(tool_res, dict):
-                    path_val = str(tool_res.get("path") or tool_res.get("file_path") or "").strip()
-                    if path_val:
-                        files = [path_val]
+                path_val = self._extract_file_path_from_tool_result(tool_res, raw_obs)
+                if path_val and path_val not in files:
+                    files.insert(0, path_val)
                 if files:
+                    files[0] = self._normalize_sandbox_file_ref(files[0]) or files[0]
                     bare = self._bare_excel_filename(files[0]) if slot == "excel_file_path" else files[0]
                     slots[slot] = bare
                     if slot == "excel_file_path":
                         artifacts["excel_file_path"] = bare
-                    slots.setdefault("file_path", files[0])
+                    if tool_name in ("filesystem.write", "filesystem.append", "pdf.create", "word.create", "convert.markdown_to_pdf", "convert.html_to_pdf"):
+                        slots["file_path"] = files[0]
+                    else:
+                        slots.setdefault("file_path", files[0])
                     artifacts["last_file_path"] = files[0]
                     self._route_dependency_output(
                         source_step, source_goal, needed_by or [], slot, bare, buffer_id=buffer_id
                     )
                 continue
+            file_artifact_path = self._extract_file_path_from_tool_result(tool_res, raw_obs)
+            if file_artifact_path and re.search(r"(?:^|_)(?:pdf|docx?|document|file|attachment|report|output)(?:_|$)", slot):
+                slots[slot] = file_artifact_path
+                slots["file_path"] = file_artifact_path
+                artifacts["last_file_path"] = file_artifact_path
+                artifacts["document_file_path"] = file_artifact_path
+                if file_artifact_path.lower().endswith(".pdf"):
+                    slots["pdf_file_path"] = file_artifact_path
+                    artifacts["pdf_file_path"] = file_artifact_path
+                self._route_dependency_output(
+                    source_step, source_goal, needed_by or [], slot, file_artifact_path, buffer_id=buffer_id
+                )
+                continue
+            if tool_name.startswith("research.") and slot in {
+                "research_answer", "final_answer", "answer", "summary", "recommendations"
+            }:
+                answer = ""
+                if isinstance(tool_res, dict):
+                    answer = str(tool_res.get("answer") or "").strip()
+                if not answer:
+                    try:
+                        parsed = json.loads(payload)
+                        if isinstance(parsed, dict):
+                            answer = str(parsed.get("answer") or "").strip()
+                    except Exception:
+                        answer = ""
+                if answer:
+                    slots[slot] = answer[:12000]
+                    if slot != "research_answer":
+                        slots.setdefault("research_answer", answer[:12000])
+                    self._route_dependency_output(
+                        source_step, source_goal, needed_by or [], slot, answer, buffer_id=buffer_id
+                    )
+                    continue
             if payload:
                 signal = self._payload_to_signal(payload, tool_name=tool_name, slot=slot)
                 if slot in {"message_body", "summary", "recommendations", "content"}:
@@ -2128,6 +2319,27 @@ class Agent:
             return True
         if low.count('"url"') >= 2 or low.count("http") >= 2:
             return True
+        return False
+
+    def _looks_like_incomplete_code(self, text: str) -> bool:
+        """Detect code fragments that should not be written as final source files."""
+        s = str(text or "").strip()
+        if not s:
+            return True
+        low = s.lower()
+        if "...[truncated" in low or "[signal truncated]" in low:
+            return True
+        if "```" in s and s.count("```") % 2 == 1:
+            return True
+        if re.search(r"@\s*param\b|/\*\*|\bfunction\b.*\Z", s, re.IGNORECASE) and "main(" not in low:
+            return True
+        # A rough but useful guard for C/C++/Java-style source fragments.
+        opens = s.count("{")
+        closes = s.count("}")
+        if opens > closes:
+            return True
+        if re.search(r"\.(?:c|cc|cpp|cxx|h|hpp)\b", str(getattr(self, "_current_task_text", "") or ""), re.IGNORECASE):
+            return "main(" not in low and len(s) < 1500
         return False
 
     def _build_delivery_message_from_slots(self) -> str:
@@ -2711,6 +2923,8 @@ class Agent:
             ("Research", r"\b(research|find|search|lookup|look up|best|recommend|summari[sz]e|compare|latest|top)\b", "research.run"),
             ("Web & Search", r"\bnews\b", "search.news"),
             ("Web & Search", r"\b(search|find|lookup|look up)\b", "search.duckduckgo"),
+            ("Knowledge Base", r"\b(remember|ingest|store|save|add)\b", "knowledge.ingest"),
+            ("Knowledge Base", r"\b(search|find|lookup|look up|get|retrieve|list|notes?|documents?)\b", "knowledge.search"),
             ("Filesystem", r"\b(write|save|create file)\b", "filesystem.write"),
             ("Filesystem", r"\b(read|open|view)\b", "filesystem.read"),
             ("Filesystem", r"\b(list|show files|directory)\b", "filesystem.list"),
@@ -2829,6 +3043,37 @@ class Agent:
                 return s
         return s
 
+    def _parse_inline_args_string(self, raw: str) -> dict:
+        """Parse strings like 'to=123, url=SANDBOX/a.cpp, type=document'."""
+        s = str(raw or "").strip().strip('"').strip("'").strip()
+        if not s:
+            return {}
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                pass
+        out: dict = {}
+        for part in re.split(r"\s*[,|]\s*(?=[A-Za-z_][\w.-]*\s*=)", s):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            key = k.strip()
+            if key:
+                val = str(v or "").strip().strip('"').strip("'")
+                # Delivery/path fields must stay strings. Phone numbers and
+                # local paths can be damaged if coerced to int/float.
+                if key.lower() in {
+                    "to", "phone", "number", "jid", "recipient", "url",
+                    "path", "file", "file_path", "media_path", "type",
+                    "caption", "filename",
+                }:
+                    out[key] = val
+                else:
+                    out[key] = self._coerce_kv_value(v)
+        return out
+
     def _extract_tool_kv_call(self, text: str):
         """
         Parse simplified ACT protocol:
@@ -2887,10 +3132,58 @@ class Agent:
             return False
         if not all(s.get("status") == "done" for s in completed):
             return False
+        retrieval_roots = ("search.", "firecrawl.", "web.")
+        if any(str(s.get("tool", "")).startswith(retrieval_roots) for s in completed):
+            return False
         if len(completed) == 1:
             return True
         action_roots = ("calendar.", "email.", "todo.", "contacts.", "whatsapp.")
         return all(str(s.get("tool", "")).startswith(action_roots) for s in completed)
+
+    def _render_synthesis_tool_outputs(
+        self,
+        completed: list,
+        max_total_chars: int = 9000,
+        max_each_chars: int = 2500,
+    ) -> str:
+        """
+        Render ordered tool outputs for the final synthesizer.
+
+        The step result is often a compact digest for routing. Final answers need
+        the actual tool evidence, so prefer raw_payload and fall back to result.
+        """
+        if not completed:
+            return ""
+        lines: list[str] = []
+        used = 0
+        for idx, step in enumerate(completed, start=1):
+            tool = str(step.get("tool") or "unknown").strip()
+            status = str(step.get("status") or "").strip()
+            goal = str(step.get("step") or "").strip()
+            payload = str(step.get("raw_payload") or "").strip()
+            if not payload:
+                payload = str(step.get("result") or "").strip()
+            if not payload:
+                continue
+
+            payload = payload.replace("\r\n", "\n").replace("\r", "\n").strip()
+            if len(payload) > max_each_chars:
+                payload = payload[:max_each_chars].rstrip() + "\n...[tool output truncated]"
+            block = (
+                f"Tool output {idx}:\n"
+                f"- status: {status or 'unknown'}\n"
+                f"- tool: {tool}\n"
+                f"- step: {goal[:220]}\n"
+                f"{payload}\n"
+            )
+            if used + len(block) > max_total_chars:
+                remaining = max_total_chars - used
+                if remaining > 500:
+                    lines.append(block[:remaining].rstrip() + "\n...[remaining tool outputs truncated]")
+                break
+            lines.append(block)
+            used += len(block)
+        return "\n".join(lines).strip()
 
     def _render_simple_completion(self, completed: list) -> str:
         """
@@ -2900,6 +3193,16 @@ class Agent:
             return "Done."
         if len(completed) == 1:
             s = completed[0]
+            if str(s.get("tool", "")).startswith("research."):
+                raw = str(s.get("raw_payload") or "").strip()
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                        answer = str(parsed.get("answer") or "").strip() if isinstance(parsed, dict) else ""
+                        if answer:
+                            return self._sanitize_delivery_message(answer)
+                    except Exception:
+                        pass
             return f"Done. {str(s.get('result', '')).strip()[:280]}".strip()
         lines = ["Done. Completed steps:"]
         for idx, s in enumerate(completed[:6], start=1):
@@ -3246,6 +3549,8 @@ class Agent:
         t = (user_text or "").lower()
         if not t.strip():
             return 1
+        if self._is_homework_answer_task(user_text):
+            return 1
 
         has_lookup = bool(re.search(r"\b(find|search|lookup|look up|research|get)\b", t))
         has_generation = bool(
@@ -3270,6 +3575,36 @@ class Agent:
             est += 1  # verify step
 
         return max(1, min(est, 8))
+
+    def _is_homework_answer_task(self, text: str | None = None) -> bool:
+        """Detect school-style factual/math prompts that should be answered directly."""
+        t = str(text if text is not None else getattr(self, "_current_task_text", "") or "").lower()
+        if not t.strip():
+            return False
+
+        # Requests that explicitly need tools or side effects are not direct Q&A.
+        tool_or_action = bool(re.search(
+            r"\b(search|research|latest|news|source|sources|cite|citation|"
+            r"send|email|whatsapp|message|create\s+(?:file|pdf|excel|sheet|document)|"
+            r"save\s+(?:file|as)|open|read\s+(?:file|pdf|document)|upload|download)\b",
+            t,
+        ))
+        if tool_or_action:
+            return False
+
+        questionish = bool(re.search(
+            r"\b(question\s*(?:number|no\.?)|q\s*\d+|define|what\s+is|what\s+are|"
+            r"explain|formula|derive|calculate|find\s+the\s+(?:value|amount|charge|current|time)|"
+            r"solve|unit\s+of|write\s+down)\b",
+            t,
+        ))
+        education_terms = bool(re.search(
+            r"\b(electric|current|charge|circuit|ammeter|voltage|resistance|ampere|"
+            r"coulomb|second|minute|physics|chemistry|math|mathematics|science)\b",
+            t,
+        ))
+        has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", t))
+        return questionish and (education_terms or has_numbers or "question" in t)
 
     def _is_advanced_excel_task(self, text: str | None = None) -> bool:
         """Detect Excel requests that need workbook logic beyond simple row export."""
@@ -3995,6 +4330,101 @@ class Agent:
                 s += ".xlsx"
         return s
 
+    def _extract_requested_output_filename(self, fallback: str = "generated_output.txt") -> str:
+        """Extract a user/planner-mentioned output filename and keep it SANDBOX-relative."""
+        text = " ".join(
+            str(x or "")
+            for x in (
+                getattr(self, "_current_step_desc", ""),
+                getattr(self, "_current_task_text", ""),
+            )
+        )
+        matches = re.findall(
+            r"`?([A-Za-z0-9_. -]+\.(?:cpp|cc|cxx|c|h|hpp|py|java|js|ts|html|css|txt|md|json|csv|pdf|docx|xlsx))`?",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if matches:
+            name = matches[0].strip()
+            # Regex may include prose before the filename, e.g.
+            # "Save ... named bellman_ford.cpp"; keep the actual token.
+            spaced = [p for p in re.split(r"\s+", name) if "." in p]
+            if spaced:
+                name = spaced[-1]
+        else:
+            low = text.lower()
+            ext = self._infer_generated_file_extension(low, fallback=fallback)
+            subject = self._infer_generated_file_subject(text)
+            name = f"{subject}.{ext}" if subject else fallback
+        name = re.split(r"[\\/]+", name)[-1]
+        name = re.sub(r"[^A-Za-z0-9_. -]+", "_", name).strip(" ._") or fallback
+        return f"SANDBOX/{name}"
+
+    def _infer_generated_file_extension(self, text: str, fallback: str = "generated_output.txt") -> str:
+        """Infer a reasonable extension for generated file tasks."""
+        low = str(text or "").lower()
+        checks = [
+            (r"\b(c\+\+|cpp|cxx)\b", "cpp"),
+            (r"\bpython|\.py\b", "py"),
+            (r"\btypescript|\.ts\b", "ts"),
+            (r"\bjavascript|\.js\b", "js"),
+            (r"\bjava\b", "java"),
+            (r"\bhtml\b", "html"),
+            (r"\bcss\b", "css"),
+            (r"\bjson\b", "json"),
+            (r"\bcsv\b", "csv"),
+            (r"\bmarkdown|\.md\b", "md"),
+            (r"\btext file|\.txt\b", "txt"),
+            (r"\bc program\b|\bin c\b|\bc code\b", "c"),
+        ]
+        for pattern, ext in checks:
+            if re.search(pattern, low):
+                return ext
+        m = re.search(r"\.([A-Za-z0-9]{1,8})$", str(fallback or ""))
+        return (m.group(1).lower() if m else "txt")
+
+    def _infer_generated_file_subject(self, text: str) -> str:
+        """Build a generic filename stem from the requested artifact subject."""
+        raw = str(text or "").strip()
+        if not raw:
+            return "generated_output"
+        cleaned = re.split(
+            r"\b(?:and\s+)?(?:send|share|forward|whatsapp|email|mail)\b",
+            raw,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        m = re.search(
+            r"\b(?:write|generate|create|make|build|draft)\b\s+(.+?)(?:\s+\bin\b\s+\w[\w+#.+-]*|\s+as\s+(?:a\s+)?file|\s+file\b|$)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        subject = m.group(1) if m else cleaned
+        subject = re.sub(
+            r"\b(?:complete|full|source|code|program|implementation|algorithm|algo|file|for|the|a|an|in|using|"
+            r"cpp|c\+\+|python|java|javascript|typescript|html|css|json|csv|markdown|text|pdf|docx|xlsx)\b",
+            " ",
+            subject,
+            flags=re.IGNORECASE,
+        )
+        words = re.findall(r"[A-Za-z0-9]+", subject.lower())
+        if not words:
+            return "generated_output"
+        return "_".join(words[:6])[:80].strip("_") or "generated_output"
+
+    def _clean_generated_source_text(self, content: str) -> str:
+        """Strip prose/markdown framing from generated source code when possible."""
+        s = str(content or "").strip()
+        if not s:
+            return ""
+        m = re.search(r"```(?:[A-Za-z0-9_+-]+)?\s*(.*?)```", s, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        first_code = re.search(r"(?m)^\s*(#include\b|using\s+namespace\b|import\b|package\b|public\s+class\b|def\s+\w+|int\s+main\s*\()", s)
+        if first_code:
+            s = s[first_code.start():].strip()
+        return s
+
     def _normalize_excel_budget_steps(self, steps: list) -> list:
         """Collapse budget spreadsheet plans into create + verify, no header prompts."""
         if not steps or not self._is_budget_excel_task():
@@ -4033,14 +4463,15 @@ class Agent:
             if not m:
                 continue
 
-            body = m.group(2).strip()
+            body = m.group(2).strip().strip("*_` ").strip()
             if not body:
                 continue
 
-            parts = [p.strip() for p in body.split("|") if p and p.strip()]
+            parts = [p.strip().strip("*_` ").strip() for p in body.split("|") if p and p.strip()]
             kv = {}
             free_parts = []
             for part in parts:
+                part = part.strip().strip("*_` ").strip()
                 mk = re.match(
                     r'^(action|goal|purpose|output|outputs|input|inputs|needed[_\s-]*by|used[_\s-]*by|categories?)\s*:\s*(.+)$',
                     part,
@@ -4048,11 +4479,11 @@ class Agent:
                 )
                 if mk:
                     key = re.sub(r"[\s-]+", "_", mk.group(1).lower())
-                    kv[key] = mk.group(2).strip()
+                    kv[key] = mk.group(2).strip().strip("*_` ").strip()
                 else:
                     free_parts.append(part)
 
-            action = (kv.get("action") or "").strip()
+            action = (kv.get("action") or "").strip().strip("*_` ").strip()
             goal = (kv.get("goal") or kv.get("purpose") or (free_parts[0] if free_parts else "")).strip()
             goal = self._sanitize_plan_goal(goal)
             if not goal and action:
@@ -4874,6 +5305,11 @@ class Agent:
             # Fallback to one tool per category at most, to keep context small.
             fallback = []
             for cat in sorted(cats):
+                if cat.strip().lower() == "knowledge base" and "knowledge.search" in self.tools:
+                    fallback.append("knowledge.search")
+                    if len(fallback) >= 2:
+                        break
+                    continue
                 cat_tools = [
                     name for name, meta in TOOL_METADATA.items()
                     if str(meta.get("category", "")).strip().lower() == cat.strip().lower()
@@ -4915,7 +5351,7 @@ class Agent:
             r'(?:[A-Za-z]:\\(?:[^\s"\'<>|*?\\]+\\)*)?SANDBOX[/\\]([\w./\\_-]+)',
             text, re.IGNORECASE
         ):
-            sub = m.group(1).replace('\\', '/')
+            sub = m.group(1).replace('\\', '/').lstrip('/')
             fp = f"SANDBOX/{sub}"
             if fp not in data["files"]:
                 data["files"].append(fp)
@@ -4924,6 +5360,45 @@ class Agent:
             if ph not in data["phones"]:
                 data["phones"].append(ph)
         return data
+
+    def _normalize_sandbox_file_ref(self, value: str) -> str:
+        """Return a stable SANDBOX-relative file reference when possible."""
+        s = str(value or "").strip().strip('"').strip("'")
+        if not s:
+            return ""
+        norm = s.replace("\\", "/")
+        m = re.search(r"(?i)(?:^|/)SANDBOX/(.+)$", norm)
+        if m:
+            return f"SANDBOX/{m.group(1).lstrip('/')}"
+        if re.search(r"\.[A-Za-z0-9]{1,8}$", norm):
+            return f"SANDBOX/{Path(norm).name}"
+        return ""
+
+    def _extract_file_path_from_tool_result(self, tool_res, raw_obs: str = "") -> str:
+        """Extract a generated file path from direct or nested tool results."""
+        candidates = []
+        if isinstance(tool_res, dict):
+            candidates.extend([
+                tool_res.get("path"),
+                tool_res.get("file_path"),
+                tool_res.get("output_path"),
+                tool_res.get("url"),
+            ])
+            nested = tool_res.get("result")
+            if isinstance(nested, dict):
+                candidates.extend([
+                    nested.get("path"),
+                    nested.get("file_path"),
+                    nested.get("output_path"),
+                    nested.get("url"),
+                ])
+        if raw_obs:
+            candidates.extend(self._extract_key_data(raw_obs).get("files", []))
+        for val in candidates:
+            fp = self._normalize_sandbox_file_ref(str(val or ""))
+            if fp:
+                return fp
+        return ""
 
     def _merge_artifacts(self, artifacts: dict, extracted: dict):
         """Merge extracted key-data into mutable per-step artifact map."""
@@ -5535,6 +6010,8 @@ class Agent:
             f"- Produce at least {_min_plan_steps} steps for this task unless CHAT applies.\n"
             "- OUTPUT names are pure signal slots, e.g. recipient_contact, search_results, message_body, file_path.\n"
             "- NEEDED_BY must list only future step numbers that require this output; do not route context to unrelated steps.\n"
+            "- For school/homework/general factual questions or calculations, do not use Knowledge Base or web tools unless the user asks to search/cite sources; use CHAT or one think step.\n"
+            "- Knowledge Base is only for searching/ingesting the user's indexed local documents, not for answering from general knowledge.\n"
             "- For pure research/recommendation/latest/summary-from-web tasks, use exactly one research.run step with the full user request as query; it first decides where to look, then searches, reads sources, extracts facts, and removes noise.\n"
             "- For web research that must summarize each book/article/item, do not summarize from generic search snippets only; add a step to scrape/extract the best result page or otherwise identify concrete titles first.\n"
             "- For multi-topic or multi-item search, search once using the item/topic slot as INPUTS, then add a think step to extract only the intended facts and remove noise before later steps.\n"
@@ -5615,6 +6092,7 @@ class Agent:
             if len(_split_steps) >= 2:
                 print(f"[AGENT] Plan auto-split: 1 -> {len(_split_steps)} steps")
                 steps = _split_steps
+        steps = self._normalize_homework_steps(steps)
         steps = self._normalize_research_steps(steps)
         steps = self._normalize_advanced_excel_steps(steps)
         if not _workflow_steps_preloaded:
@@ -5731,6 +6209,179 @@ class Agent:
 
             # Start step tracking BEFORE the retry loop (once per logical step)
             self._context_compiler.metrics.start_step(i, "act")
+
+            # Deterministic generated-file write. Small models often read a buffer
+            # correctly, then loop or write only the visible slice. If the plan says
+            # to save generated content to a file and the content slot/buffer exists,
+            # perform the write directly.
+            if step_action in ("filesystem.write", "filesystem.append"):
+                _slots_for_write = (self._working_state or {}).get("slots", {})
+                _artifacts_for_write = (self._working_state or {}).get("artifacts", {})
+                _existing_artifact_path = ""
+                for _slot_name in step_inputs:
+                    _key = str(_slot_name or "").strip().lower()
+                    _val = str(_slots_for_write.get(_key) or "").strip()
+                    if (
+                        re.search(r"(?:^|_)(?:pdf|docx?|document|file|attachment|report|output)(?:_|$)", _key)
+                        or self._normalize_sandbox_file_ref(_val)
+                    ):
+                        _existing_artifact_path = self._normalize_sandbox_file_ref(_val)
+                        if _existing_artifact_path:
+                            break
+                if not _existing_artifact_path:
+                    _existing_artifact_path = str(
+                        _artifacts_for_write.get("pdf_file_path")
+                        or _artifacts_for_write.get("document_file_path")
+                        or ""
+                    ).strip()
+                if _existing_artifact_path:
+                    _existing_artifact_path = self._normalize_sandbox_file_ref(_existing_artifact_path) or _existing_artifact_path
+                    _slots_for_write["file_path"] = _existing_artifact_path
+                    _artifacts_for_write["last_file_path"] = _existing_artifact_path
+                    if _existing_artifact_path.lower().endswith(".pdf"):
+                        _slots_for_write["pdf_file_path"] = _existing_artifact_path
+                        _artifacts_for_write["pdf_file_path"] = _existing_artifact_path
+                    step_result = f"path: {_existing_artifact_path}"
+                    _step_raw_payload = json.dumps({"path": _existing_artifact_path}, default=str)
+                    self._store_declared_outputs(
+                        step_outputs or ["file_path"],
+                        step_action,
+                        {"path": _existing_artifact_path},
+                        _step_raw_payload,
+                        step_result,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
+                    step_status = "done"
+                    _step_tool = step_action
+                    _step_calls.append({
+                        "tool": step_action,
+                        "status": "ok",
+                        "summary": step_result[:180],
+                        "args": json.dumps({"path": _existing_artifact_path}, default=str)[:140],
+                    })
+                    _step_actions.append(f"{step_action} -> existing artifact {step_result[:80]}")
+                    self._merge_artifacts(_step_artifacts, {"files": [_existing_artifact_path], "buffers": [], "phones": []})
+                    self._context_compiler.metrics.end_step(i, success=True)
+                    completed.append({
+                        "step": step_desc,
+                        "status": step_status,
+                        "result": step_result,
+                        "tool": step_action,
+                        "calls": _step_calls,
+                        "artifacts": _step_artifacts,
+                        "categories": step_categories,
+                        "raw_payload": _step_raw_payload,
+                    })
+                    yield {"type": "tool_result", "tool": step_action, "result": _step_raw_payload, "status": "ok", "step": i + 1}
+                    continue
+                _content = ""
+                for _slot_name in [*step_inputs, "cpp_code_content", "code_content", "code_text", "content"]:
+                    _key = str(_slot_name or "").strip().lower()
+                    _val = _slots_for_write.get(_key)
+                    _val_s = str(_val or "").strip()
+                    if (
+                        isinstance(_val, str)
+                        and _val_s
+                        and "recipient" not in _key
+                        and "file" not in _key
+                        and not self._normalize_sandbox_file_ref(_val_s)
+                        and _val_s.lower() not in ("ok", "no result", "none", "null")
+                        and not re.fullmatch(r"\{\s*\"?status\"?\s*:\s*\"?ok\"?\s*\}", _val_s, re.IGNORECASE)
+                    ):
+                        _content = _val.strip()
+                        break
+                if not _content:
+                    for _bid in sorted(self.buffer.keys(), reverse=True):
+                        _buf = self.buffer.get(_bid)
+                        if isinstance(_buf, dict):
+                            _val = str(_buf.get("data") or "").strip()
+                            if _val:
+                                _content = _val
+                                break
+                if _content:
+                    _content = self._clean_generated_source_text(_content)
+                    _path = self._extract_requested_output_filename(fallback="generated_output.txt")
+                    tool_name = "filesystem.write"
+                    tool_args = {"path": _path, "content": _content}
+                    _step_tool = tool_name
+                    yield {"type": "tool_call", "tool": tool_name, "args": tool_args, "step": i + 1}
+                    print(f"[STREAM][TOOL CALL] {tool_name}")
+                    print(f"[STREAM][TOOL ARGS] {json.dumps(tool_args, indent=2, default=str)[:2000]}")
+                    try:
+                        result = await asyncio.to_thread(self._safe_execute, tool_name, tool_args)
+                    except Exception as e:
+                        result = {"status": "error", "error": f"Internal crash: {str(e)}"}
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        observation = f"Error: {result.get('error', 'unknown error')}"
+                        _step_had_error = True
+                        last_error = result.get("error", "unknown error")
+                        step_result = observation
+                        step_status = "failed"
+                        yield {"type": "tool_result", "tool": tool_name, "result": observation, "status": "error", "step": i + 1}
+                        self._context_compiler.metrics.record_tool_call(tool_name, success=False)
+                        self._context_compiler.metrics.end_step(i, success=False)
+                        completed.append({
+                            "step": step_desc,
+                            "status": step_status,
+                            "result": step_result,
+                            "tool": tool_name,
+                            "calls": _step_calls,
+                            "artifacts": _step_artifacts,
+                            "categories": step_categories,
+                            "raw_payload": json.dumps(result, default=str),
+                        })
+                        continue
+
+                    tool_res = result.get("result", result) if isinstance(result, dict) else result
+                    self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
+                    raw_obs = json.dumps(tool_res, indent=2, default=str)
+                    _step_raw_payload = raw_obs[:12000]
+                    step_result = self._compress_obs(raw_obs, tool_name)
+                    self._store_declared_outputs(
+                        step_outputs or ["file_path"],
+                        tool_name,
+                        tool_res,
+                        raw_obs,
+                        step_result,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
+                    _step_success_calls += 1
+                    step_status = "done"
+                    _step_calls.append({
+                        "tool": tool_name,
+                        "status": "ok",
+                        "summary": step_result[:180],
+                        "args": json.dumps(tool_args, default=str)[:140],
+                    })
+                    _step_actions.append(f"{tool_name} -> {step_result[:120]}")
+                    self._merge_artifacts(_step_artifacts, self._extract_key_data(raw_obs + "\n" + step_result))
+                    self._context_compiler.tool_records.add(
+                        tool_name=tool_name, args=tool_args, status="ok",
+                        result_digest=step_result[:220], raw_result=raw_obs,
+                        step_idx=i, attempt=0,
+                        artifacts=dict(_step_artifacts),
+                    )
+                    self._context_compiler.metrics.record_tool_call(tool_name, success=True)
+                    print(f"[STREAM][TOOL RESULT ] ({len(raw_obs)} chars):")
+                    print(raw_obs[:2000] + ("\n...[truncated]" if len(raw_obs) > 2000 else ""))
+                    print(f"[STREAM][CONTEXTNEXT] {step_result}")
+                    yield {"type": "tool_result", "tool": tool_name, "result": raw_obs, "status": "ok", "step": i + 1}
+                    completed.append({
+                        "step": step_desc,
+                        "status": step_status,
+                        "result": step_result,
+                        "tool": tool_name,
+                        "calls": _step_calls,
+                        "artifacts": _step_artifacts,
+                        "categories": step_categories,
+                        "raw_payload": _step_raw_payload,
+                    })
+                    self._context_compiler.metrics.end_step(i, success=True)
+                    continue
 
             # Duplicate contact-lookup short-circuit: if recipient is already resolved,
             # skip repeated lookup/get steps instead of re-querying the same contact.
@@ -6773,6 +7424,7 @@ class Agent:
                                 )
                                 self._update_working_state_from_tool_result(_fb_tn, _fb_ta, _fb_tr)
                                 _fb_obs = json.dumps(_fb_tr, indent=2, default=str)
+                                _fb_raw_for_synthesis = _fb_obs[:12000]
                                 _recent_tool_outputs.append({
                                     "tool": _fb_tn,
                                     "status": "ok",
@@ -6802,6 +7454,7 @@ class Agent:
                                 step_status = "done"
                                 _step_success_calls += 1
                                 _step_tool  = _fb_tn
+                                _step_raw_payload = _fb_raw_for_synthesis
                                 _fb_handled = True
                                 yield {"type": "tool_result", "tool": _fb_tn,
                                        "result": _fb_obs, "status": "ok", "step": i + 1}
@@ -7091,7 +7744,13 @@ class Agent:
                 _sent_document_ok = any(
                     r.args.get("type") == "document"
                     and any(
-                        ext in str(r.args.get("media_path", "") or r.args.get("path", "")).lower()
+                        ext in str(
+                            r.args.get("url", "")
+                            or r.args.get("file_path", "")
+                            or r.args.get("media_path", "")
+                            or r.args.get("path", "")
+                            or r.args.get("file", "")
+                        ).lower()
                         for ext in (".pdf", ".doc", ".docx", ".xlsx", ".csv")
                     )
                     for r in _media_records
@@ -7107,7 +7766,13 @@ class Agent:
                     # send_media was called but with wrong type (e.g. type=image)
                     _actual_types = [r.args.get("type", "unknown") for r in _media_records]
                     _actual_paths = [
-                        str(r.args.get("media_path", "") or r.args.get("path", ""))[:60]
+                        str(
+                            r.args.get("url", "")
+                            or r.args.get("file_path", "")
+                            or r.args.get("media_path", "")
+                            or r.args.get("path", "")
+                            or r.args.get("file", "")
+                        )[:60]
                         for r in _media_records
                     ]
                     _postcond_warning = (
@@ -7204,6 +7869,7 @@ class Agent:
             _compacted_trajectory = self._context_compiler.compact_trajectory(completed)
             # Also include structured tool call log from ToolRecordStore
             _tool_call_log = self._context_compiler.tool_records.render_compact_summary()
+            _tool_outputs = self._render_synthesis_tool_outputs(completed)
 
             # Build a step summary that distinguishes  success from  failure
             done_lines = "\n".join(
@@ -7231,7 +7897,11 @@ class Agent:
                 profile_context=_profile_context_exec_cached,
                 memory_context=_memory_context_exec_cached,
                 history_text=history_text,
-                done_block=f"Execution results:\n{done_lines}\n\n{_compacted_trajectory}{_tool_call_log}",
+                done_block=(
+                    f"Execution results:\n{done_lines}\n\n"
+                    f"Tool outputs available for the final answer:\n{_tool_outputs or '(none)'}\n\n"
+                    f"{_compacted_trajectory}{_tool_call_log}"
+                ),
                 task_contract="",
                 working_state="",
             )
@@ -7249,6 +7919,10 @@ class Agent:
                     "1. Only claim an action succeeded if the step summary shows [ok]. A step marked [FAILED] did NOT succeed.\n"
                     "2. If a write/send step is [FAILED], say so clearly and do NOT invent success.\n"
                     "3. Base your answer solely on the execution results above, not on the original plan.\n"
+                    "4. Answer the user's actual request directly, using the tool outputs as evidence.\n"
+                    "5. Do not echo internal digests such as 'Done', 'Top results', JSON keys, tool names, buffers, or planning text unless the user asked for logs.\n"
+                    "6. For search/retrieval results, synthesize the relevant facts into a clear user-facing answer. Include brief source names only when useful.\n"
+                    "7. If the tool output is insufficient, say what is missing and give the best supported answer without inventing facts.\n"
                     "MIRA: FINAL ANSWER:"
                 ),
             )
@@ -7260,6 +7934,10 @@ class Agent:
                 "1. Only claim an action succeeded if the step summary shows [ok]. A step marked [FAILED] did NOT succeed.\n"
                 "2. If a write/send step is [FAILED], say so clearly and do NOT invent success.\n"
                 "3. Base your answer solely on the execution results above, not on the original plan.\n"
+                "4. Answer the user's actual request directly, using the tool outputs as evidence.\n"
+                "5. Do not echo internal digests such as 'Done', 'Top results', JSON keys, tool names, buffers, or planning text unless the user asked for logs.\n"
+                "6. For search/retrieval results, synthesize the relevant facts into a clear user-facing answer. Include brief source names only when useful.\n"
+                "7. If the tool output is insufficient, say what is missing and give the best supported answer without inventing facts.\n"
                 "MIRA: FINAL ANSWER:"
             )
             _synth_flat, _synth_msgs = self._context_compiler.prepare_for_generation(
@@ -7373,6 +8051,25 @@ class Agent:
 
         # --- RESEARCH TOOLS (handled internally as an orchestrated pipeline) ---
         if tool_name.startswith("research."):
+            _task_text = str(getattr(self, "_current_task_text", "") or "").strip()
+            _query = str(args.get("query") or "").strip()
+            _task_l = _task_text.lower()
+            _query_l = _query.lower()
+            if _task_text and tool_name in ("research.run", "research.extract_facts"):
+                _is_verified_investment = bool(
+                    re.search(r"\b(stock|stocks|share|shares|invest|investment|sector|sectors)\b", _task_l)
+                    and re.search(r"\b(confirm|verified|facts?|claim|claims?|not opinions?|source|sources)\b", _task_l)
+                )
+                _query_missing_core = bool(
+                    ("stock" in _task_l and "stock" not in _query_l and "share" not in _query_l)
+                    or ("india" in _task_l and "india" not in _query_l)
+                    or ("sector" in _task_l and "sector" not in _query_l)
+                )
+                if _is_verified_investment and (_query_missing_core or len(_query_l.split()) < 8):
+                    args["query"] = _task_text
+                if _is_verified_investment:
+                    args["max_sources"] = max(int(args.get("max_sources") or 0), 8)
+                    args["max_queries"] = max(int(args.get("max_queries") or 0), 5)
             return self._execute_research_tool(tool_name, args or {})
 
         # --- BUFFER TOOLS (handled internally, no registered tool needed) ---
@@ -7830,14 +8527,80 @@ class Agent:
         _slots = (self._working_state or {}).get("slots", {})
         _artifacts = (self._working_state or {}).get("artifacts", {})
         literal_args = getattr(self, "_current_step_literal_args", {}) or {}
+        if isinstance(args, dict) and isinstance(args.get("args"), dict):
+            nested_args = dict(args.get("args") or {})
+            for k, v in args.items():
+                if k != "args":
+                    nested_args.setdefault(k, v)
+            args = nested_args
+            print(f"[AGENT] Unwrapped nested args for {tool_name}")
+        elif isinstance(args, dict) and isinstance(args.get("args"), str):
+            parsed_args = self._parse_inline_args_string(args.get("args", ""))
+            if parsed_args:
+                for k, v in args.items():
+                    if k != "args":
+                        parsed_args.setdefault(k, v)
+                args = parsed_args
+                print(f"[AGENT] Parsed inline args string for {tool_name}")
 
         # think: inject buffer content and/or inline context into the prompt
         # before dispatching to the reasoning connector (which has no buffer access).
         if tool_name == "think":
-            _base_prompt = args.get("prompt", "")
+            _base_prompt = args.get("prompt", "") or literal_args.get("prompt", "")
             if not str(_base_prompt or "").strip():
                 _base_prompt = str(getattr(self, "_current_step_desc", "") or "Prepare concise useful output.").strip()
                 args["prompt"] = _base_prompt
+            if self._is_homework_answer_task():
+                _task_text = str(getattr(self, "_current_task_text", "") or "").strip()
+                if _task_text and _task_text.lower() not in str(_base_prompt).lower():
+                    _base_prompt = (
+                        "Answer the user's school questions clearly and show any calculation steps.\n\n"
+                        f"User questions:\n{_task_text}"
+                    )
+                    args["prompt"] = _base_prompt
+            _wants_code_output = bool(
+                re.search(r"\b(code|cpp|c\+\+|c program|algorithm|source)\b", str(getattr(self, "_current_task_text", "") or ""), re.IGNORECASE)
+                or any(
+                    re.search(r"\b(code|cpp|source)\b", str(x or ""), re.IGNORECASE)
+                    for x in getattr(self, "_current_step_outputs", []) or []
+                )
+            )
+            if _wants_code_output:
+                if "complete source code" not in str(_base_prompt).lower():
+                    _base_prompt = (
+                        str(_base_prompt or "").strip()
+                        + "\n\nCODE OUTPUT CONTRACT:\n"
+                        "- Return complete, compilable source code.\n"
+                        "- Do not include markdown fences or explanatory prose.\n"
+                        "- Include all required includes, data structures, functions, and a usable main function.\n"
+                        "- Do not truncate the code."
+                    ).strip()
+                    args["prompt"] = _base_prompt
+                args["max_tokens"] = max(int(args.get("max_tokens") or 0), 4096)
+            _task_text_for_think = str(getattr(self, "_current_task_text", "") or "").strip()
+            _task_l_for_think = _task_text_for_think.lower()
+            _wants_markdown_report = bool(
+                re.search(r"\b(pdf|report|document|recommendation|recommendations|stocks?|investment)\b", _task_l_for_think)
+                and any(
+                    re.search(r"\b(sector|stock|invest|recommend|confirm|analysis|report|pdf)\b", str(x or ""), re.IGNORECASE)
+                    for x in [getattr(self, "_current_step_desc", ""), *getattr(self, "_current_step_outputs", [])]
+                )
+            )
+            if _wants_markdown_report and not _wants_code_output:
+                if "markdown report contract" not in str(_base_prompt).lower():
+                    _base_prompt = (
+                        str(_base_prompt or "").strip()
+                        + "\n\nMARKDOWN REPORT CONTRACT:\n"
+                        f"- User request: {_task_text_for_think}\n"
+                        "- Produce complete Markdown suitable for direct PDF conversion.\n"
+                        "- Preserve the user's requested decision criteria.\n"
+                        "- Separate confirmed facts from inferred implications.\n"
+                        "- Do not treat opinions, predictions, or unsourced claims as confirmed facts.\n"
+                        "- If evidence is insufficient for specific recommendations, state what is missing instead of inventing.\n"
+                        "- Include concise source names or URLs for each important claim when available."
+                    ).strip()
+                    args["prompt"] = _base_prompt
+                args["max_tokens"] = max(int(args.get("max_tokens") or 0), 3072)
             if "message_body" in {
                 str(x or "").strip().lower()
                 for x in getattr(self, "_current_step_outputs", []) or []
@@ -7928,6 +8691,15 @@ class Agent:
                     args["file_path"] = self._bare_excel_filename(_path_hint)
             elif args.get("file_path"):
                 args["file_path"] = self._bare_excel_filename(str(args.get("file_path")))
+
+        if tool_name == "knowledge.ingest":
+            if str(args.get("content") or "").strip() and str(args.get("source") or "").strip().lower() != "text":
+                src = str(args.get("source") or "").strip()
+                looks_like_path = bool(
+                    re.search(r"(^SANDBOX[\\/]|[\\/]|\.txt$|\.md$|\.csv$|\.pdf$|\.docx?$|\.xlsx?$)", src, re.IGNORECASE)
+                )
+                if src and not looks_like_path:
+                    args["source"] = "text"
 
         if tool_name == "filesystem.list":
             path_arg = str(args.get("path", "") or "").strip().replace("\\", "/")
@@ -8059,68 +8831,185 @@ class Agent:
             if "text" in args and "data" not in args:
                 args["data"] = args.get("text")
             _data = args.get("data")
-            if _data is None or (isinstance(_data, str) and not _data.strip()):
-                _candidate = ""
-                for _k in self._content_slot_candidates(("message_body", "cpp_code", "code_text", "content")):
-                    _v = _slots.get(_k)
-                    if isinstance(_v, str) and _v.strip():
-                        _candidate = _v.strip()
-                        break
-                if not _candidate:
-                    _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
-                    if _fallback and _fallback.lower() not in ("ok", "no result", "none", "null"):
-                        _candidate = _fallback
-                if _candidate:
-                    args["data"] = _candidate[:60000]
-                    print("[AGENT] filesystem.write auto-filled data from slots/handoff payload")
+            _candidate = ""
+            for _k in self._content_slot_candidates(("message_body", "cpp_code", "code_text", "content")):
+                _v = _slots.get(_k)
+                if isinstance(_v, str) and _v.strip():
+                    _candidate = _v.strip()
+                    break
+            if not _candidate:
+                _fallback = str(getattr(self, "_handoff_payload", "") or "").strip()
+                if _fallback and _fallback.lower() not in ("ok", "no result", "none", "null"):
+                    _candidate = _fallback
+            data_missing = _data is None or (isinstance(_data, str) and not _data.strip())
+            data_incomplete = isinstance(_data, str) and self._looks_like_incomplete_code(_data)
+            candidate_better = bool(
+                _candidate
+                and (
+                    data_missing
+                    or data_incomplete
+                    or (isinstance(_data, str) and len(_candidate) > len(_data) + 200)
+                )
+            )
+            if candidate_better:
+                args["data"] = _candidate[:60000]
+                args["content"] = _candidate[:60000]
+                print("[AGENT] filesystem.write auto-filled/replaced data from slots/handoff payload")
 
             _path = str(args.get("path") or args.get("file_path") or args.get("filename") or "").strip()
             if not _path:
                 _path = str(_artifacts.get("last_file_path") or "").strip()
             if not _path:
-                _task_l = str(getattr(self, "_current_task_text", "") or "").lower()
-                if any(k in _task_l for k in ("c++", " cpp", ".cpp", "bellman", "algorithm", "source code")):
-                    _path = "SANDBOX/generated.cpp"
-                elif "markdown" in _task_l:
-                    _path = "SANDBOX/generated.md"
-                elif "json" in _task_l:
-                    _path = "SANDBOX/generated.json"
-                else:
-                    _path = "SANDBOX/generated_output.txt"
+                _path = self._extract_requested_output_filename(fallback="generated_output.txt")
             args.setdefault("path", _path)
 
         # whatsapp.send_media pre-flight: verify file exists in SANDBOX.
         # Accept both SANDBOX-relative paths and absolute paths that point inside SANDBOX.
         if tool_name == "whatsapp.send_media":
-            _url_arg = str(args.get("url", "")).strip()
             from pathlib import Path as _PF, PureWindowsPath as _PWP
             _sandbox_root = (_PF(__file__).parent.parent / "SANDBOX").resolve()
 
-            # Normalize obvious absolute Windows path forms to filename first.
-            # This avoids false negatives when runtime path semantics are POSIX-like.
-            _candidate_rel = _url_arg.replace("SANDBOX/", "", 1).replace("SANDBOX\\", "", 1)
-            if re.match(r"^[A-Za-z]:[\\/]", _url_arg):
-                _candidate_rel = _PWP(_url_arg).name
+            # Models vary: some pass to=<slot name>, recipient=<name>,
+            # phone=<number>, or omit it after a contact lookup. Normalize to
+            # the connector's required "to" field here.
+            if not str(args.get("to") or "").strip():
+                for key in ("recipient", "recipient_contact", "contact", "phone", "number", "jid"):
+                    if str(args.get(key) or "").strip():
+                        args["to"] = args.get(key)
+                        break
+            _to_raw = str(args.get("to") or "").strip()
+            _to_slot = _to_raw.lower()
+            if _to_slot in _slots:
+                _slot_to = str(_slots.get(_to_slot) or "").strip()
+                _phone = self._extract_phone_like(_slot_to)
+                if _phone:
+                    args["to"] = _phone
+            if not str(args.get("to") or "").strip() or not self._extract_phone_like(str(args.get("to") or "")):
+                _phone = str(_slots.get("recipient_phone_or_jid") or "").strip()
+                if not _phone:
+                    _contact_payload = str(_slots.get("contact_info") or _slots.get("recipient_contact") or "").strip()
+                    _phone = self._extract_phone_like(_contact_payload)
+                if _phone:
+                    args["to"] = _phone
 
-            _abs = (_sandbox_root / _candidate_rel).resolve()
+            def _media_candidate_path(raw: str):
+                raw = str(raw or "").strip().strip('"').strip("'")
+                if not raw:
+                    return None
+                rel = raw.replace("\\", "/")
+                rel = re.sub(r"(?i)^sandbox/", "", rel, count=1)
+                if re.match(r"^[A-Za-z]:[\\/]", raw):
+                    rel = _PWP(raw).name
+                try:
+                    p_raw = _PF(raw)
+                    if p_raw.is_absolute():
+                        resolved = p_raw.resolve()
+                        try:
+                            resolved.relative_to(_sandbox_root)
+                            if resolved.exists():
+                                return resolved
+                        except Exception:
+                            pass
+                    resolved = (_sandbox_root / rel).resolve()
+                    try:
+                        resolved.relative_to(_sandbox_root)
+                    except Exception:
+                        return None
+                    return resolved
+                except Exception:
+                    return None
 
-            # If the user provided an absolute path and it resolves under SANDBOX, trust it.
-            _provided_abs_ok = False
-            try:
-                _provided_abs = _PF(_url_arg).resolve()
-                _provided_abs_ok = str(_provided_abs).startswith(str(_sandbox_root)) and _provided_abs.exists()
-            except Exception:
-                _provided_abs_ok = False
+            def _sandbox_prefix_match(raw: str):
+                raw = str(raw or "").strip().strip('"').strip("'")
+                if not raw:
+                    return None
+                name = raw.replace("\\", "/").split("/")[-1].lower()
+                if len(name) < 6:
+                    return None
+                matches = []
+                for child in _sandbox_root.iterdir():
+                    if child.is_file():
+                        cname = child.name.lower()
+                        if cname.startswith(name) or name.startswith(cname):
+                            matches.append(child)
+                return matches[0] if len(matches) == 1 else None
 
-            if not _abs.exists() and not _provided_abs_ok:
+            _task_media_l = str(getattr(self, "_current_task_text", "") or "").lower()
+            preferred_candidates = []
+            if ".pdf" in _task_media_l or re.search(r"\bpdf\b", _task_media_l):
+                preferred_candidates.extend([
+                    _slots.get("pdf_file_path"),
+                    _artifacts.get("pdf_file_path"),
+                ])
+            if re.search(r"\b(document|doc|docx|report|file)\b", _task_media_l):
+                preferred_candidates.extend([
+                    _slots.get("document_file_path"),
+                    _artifacts.get("document_file_path"),
+                    _slots.get("file_path"),
+                    _artifacts.get("last_file_path"),
+                ])
+
+            url_candidates = preferred_candidates + [
+                args.get("url"),
+                args.get("file_path"),
+                args.get("path"),
+                args.get("file"),
+                args.get("media_path"),
+                args.get("media"),
+                args.get("document"),
+                args.get("attachment"),
+                args.get("attachment_path"),
+                _slots.get("file_path"),
+                _artifacts.get("last_file_path"),
+            ]
+            for key in ("url", "file_path", "path", "file", "media_path", "media", "document", "attachment", "attachment_path"):
+                val = str(args.get(key) or "").strip().lower()
+                if val in _slots:
+                    url_candidates.insert(0, _slots.get(val))
+            if re.search(r"\bpdf\b", _task_media_l):
+                for val in list(_slots.values()) + list(_artifacts.values()):
+                    fp = self._normalize_sandbox_file_ref(str(val or ""))
+                    if fp.lower().endswith(".pdf"):
+                        url_candidates.insert(0, fp)
+            for _fp in list(_artifacts.get("files") or []):
+                url_candidates.append(_fp)
+
+            _chosen = None
+            _tried = []
+            for candidate in url_candidates:
+                raw = str(candidate or "").strip()
+                if not raw:
+                    continue
+                _tried.append(raw)
+                p = _media_candidate_path(raw)
+                if p and p.exists():
+                    _chosen = p
+                    break
+                p = _sandbox_prefix_match(raw)
+                if p and p.exists():
+                    _chosen = p
+                    break
+
+            if not _chosen:
+                _shown = str(args.get("url") or args.get("file_path") or args.get("path") or args.get("file") or "").strip()
+                _suffix = f" Tried: {', '.join(dict.fromkeys(_tried[:5]))}." if _tried else ""
                 return {
                     "status": "error",
-                    "error": f"send_media pre-flight: '{_url_arg}' not found in SANDBOX. Create/verify the file before sending.",
+                    "error": f"send_media pre-flight: '{_shown or 'missing url'}' not found in SANDBOX. Create/verify the file before sending.{_suffix}",
                 }
 
             # Canonicalize outbound path to SANDBOX-relative form for connector consistency.
-            if _abs.exists():
-                args["url"] = f"SANDBOX/{_abs.name}"
+            args["url"] = f"SANDBOX/{_chosen.name}"
+            if not str(args.get("type") or "").strip():
+                ext = _chosen.suffix.lower()
+                if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+                    args["type"] = "image"
+                elif ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac"}:
+                    args["type"] = "audio"
+                elif ext in {".mp4", ".mov", ".mkv", ".webm", ".avi"}:
+                    args["type"] = "video"
+                else:
+                    args["type"] = "document"
 
         if "pdf.create" in tool_name or "word.create" in tool_name:
             if "text" in args and "content" not in args: args["content"] = args.pop("text")

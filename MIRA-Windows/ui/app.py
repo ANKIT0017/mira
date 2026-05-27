@@ -8,6 +8,7 @@ import re as _re
 import threading
 import queue
 import sys
+import uuid
 from pathlib import Path as _Path
 from functools import wraps
 
@@ -32,6 +33,27 @@ _task_store.init_db()
 # Tracks the model currently selected in the MIRA UI.
 # WhatsApp handler reads this so it uses the same model.
 _current_model = "qwen3:4b-instruct"
+_voice_stt = None
+_voice_stt_lock = threading.Lock()
+
+
+def _get_voice_stt():
+    """Lazy-load local STT for browser microphone uploads."""
+    global _voice_stt
+    with _voice_stt_lock:
+        if _voice_stt is not None:
+            return _voice_stt
+        from voice.stt_whisper import SpeechToText
+
+        stt_model = os.environ.get("MIRA_STT_MODEL", "base.en")
+        stt_backend = os.environ.get("MIRA_STT_BACKEND", "auto")
+        stt_compute = os.environ.get("MIRA_STT_COMPUTE_TYPE", "int8")
+        _voice_stt = SpeechToText(
+            model_size=stt_model,
+            backend=stt_backend,
+            compute_type=stt_compute,
+        )
+        return _voice_stt
 
 # ── API Key Authentication ────────────────────────────────────────────
 # Set MIRA_API_KEY in .env to protect all /api/* routes when exposed via ngrok.
@@ -76,6 +98,39 @@ def _check_api_auth():
     if provided != _MIRA_API_KEY:
         return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
+
+@app.route('/api/voice/transcribe', methods=['POST'])
+def voice_transcribe():
+    """Transcribe browser-recorded audio with the local STT backend."""
+    upload = request.files.get("audio")
+    if upload is None:
+        return jsonify({"status": "error", "error": "No audio upload provided."}), 400
+
+    sandbox = (_Path(__file__).parent.parent / "SANDBOX" / "voice_uploads").resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+    suffix = _Path(upload.filename or "audio.webm").suffix or ".webm"
+    if not _re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
+        suffix = ".webm"
+    audio_path = sandbox / f"voice_{uuid.uuid4().hex}{suffix}"
+
+    try:
+        upload.save(audio_path)
+        stt = _get_voice_stt()
+        text = stt.transcribe_file(str(audio_path))
+        return jsonify({
+            "status": "ok",
+            "text": text,
+            "backend": getattr(stt, "backend", "unknown"),
+            "model": getattr(stt, "model_size", "unknown"),
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+    finally:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+ 
 # --- SSE Streaming Endpoint ---
 @app.route('/api/stream', methods=['GET'])
 def stream():

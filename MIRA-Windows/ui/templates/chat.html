@@ -1118,323 +1118,565 @@
   </style>
 
   <style>
-    /* ── VOICE MODE SPLIT SCREEN ─────────────────────────────────────── */
+    /* Voice fluid mission surface */
     .container {
-      transition: margin-left 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-                  max-width  0.45s cubic-bezier(0.4, 0, 0.2, 1);
+      transition: opacity 0.32s ease, filter 0.32s ease, transform 0.32s ease;
     }
 
     body.voice-mode .container {
-      margin-left: 56vw;
-      margin-right: 0;
-      max-width: calc(44vw - 8px);
+      opacity: 0;
+      filter: blur(14px) saturate(0.65);
+      transform: scale(0.985);
+      pointer-events: none;
     }
 
-    /* Voice panel — slides in from left */
+    .voice-divider { display: none; }
+
     #voicePanel {
+      --voice-fluid-x: 42vw;
+      --voice-fluid-y: 43vh;
+      --voice-fluid-size: min(32vw, 340px);
+      --branch-progress: 0;
+      --voice-glow: rgba(95, 226, 255, 0.42);
       position: fixed;
-      left: 0;
-      top: 0;
-      width: 55vw;
-      height: 100vh;
-      background: radial-gradient(ellipse at 50% 55%,
-        rgba(74,222,128,0.05) 0%,
-        rgba(13,15,14,0.97) 55%,
-        var(--bg) 100%);
+      inset: 0;
       z-index: 500;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 28px;
-      transform: translateX(-100%);
-      transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1);
-      border-right: 1px solid var(--border);
-      overflow: hidden;
+      display: grid;
+      grid-template-rows: 76px 1fr 150px;
+      background:
+        radial-gradient(circle at 50% 18%, rgba(81, 92, 255, 0.16), transparent 34%),
+        radial-gradient(circle at 35% 54%, rgba(24, 224, 255, 0.15), transparent 38%),
+        linear-gradient(135deg, #030511 0%, #07101f 48%, #02040a 100%);
+      color: #eefaff;
+      opacity: 0;
       pointer-events: none;
+      overflow: hidden;
+      transform: scale(1.02);
+      transition: opacity 0.35s ease, transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
     }
 
     #voicePanel.active {
-      transform: translateX(0);
+      opacity: 1;
       pointer-events: all;
+      transform: scale(1);
     }
 
-    /* Subtle scan-line overlay */
     #voicePanel::before {
-      content: '';
+      content: "";
       position: absolute;
       inset: 0;
-      background: repeating-linear-gradient(
-        0deg,
-        transparent,
-        transparent 2px,
-        rgba(74,222,128,0.015) 2px,
-        rgba(74,222,128,0.015) 4px
-      );
+      background:
+        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.014) 1px, transparent 1px);
+      background-size: 46px 46px;
+      mask-image: radial-gradient(circle at center, black 0%, transparent 74%);
       pointer-events: none;
-      z-index: 0;
     }
 
-    .voice-panel-label {
+    #voicePanel::after {
+      content: "";
+      position: absolute;
+      inset: -15%;
+      background:
+        radial-gradient(circle at 42% 44%, rgba(255,255,255,0.10), transparent 13%),
+        radial-gradient(circle at 56% 41%, rgba(76, 208, 255, 0.11), transparent 18%),
+        radial-gradient(circle at 48% 56%, rgba(127, 94, 255, 0.12), transparent 20%);
+      filter: blur(70px);
+      opacity: 0.62;
+      animation: voiceAtmosphere 13s ease-in-out infinite alternate;
+      pointer-events: none;
+    }
+
+    @keyframes voiceAtmosphere {
+      from { transform: translate3d(-2%, -1%, 0) scale(1); }
+      to   { transform: translate3d(2%, 1%, 0) scale(1.05); }
+    }
+
+    .voice-topbar {
       position: relative;
-      z-index: 1;
-      font-size: 0.63rem;
-      font-weight: 700;
-      letter-spacing: 0.2em;
+      z-index: 3;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 22px 32px;
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.14em;
       text-transform: uppercase;
-      color: var(--text-muted);
+      color: rgba(223, 247, 255, 0.62);
+    }
+
+    .voice-indicators {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .voice-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+    }
+
+    .voice-indicator i {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: rgba(114, 232, 255, 0.8);
+      box-shadow: 0 0 14px rgba(114, 232, 255, 0.7);
+    }
+
+    .voice-close {
+      min-width: 34px;
+      min-height: 34px;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 50%;
+      border: 1px solid rgba(173, 226, 255, 0.22);
+      background: rgba(255,255,255,0.035);
+      color: rgba(235, 250, 255, 0.76);
+      font-size: 1.2rem;
+      line-height: 1;
+    }
+
+    .voice-stage {
+      position: relative;
+      z-index: 2;
+      min-height: 0;
+    }
+
+    .voice-fluid-cluster {
+      position: absolute;
+      left: var(--voice-fluid-x);
+      top: var(--voice-fluid-y);
+      width: var(--voice-fluid-size);
+      aspect-ratio: 1;
+      transform: translate(-50%, -50%);
+      display: grid;
+      place-items: center;
+      transition: transform 0.75s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    .voice-fluid {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      border-radius: 46% 54% 50% 50% / 50% 45% 55% 50%;
+      background:
+        radial-gradient(circle at 36% 28%, rgba(255,255,255,0.96) 0 4%, rgba(212,250,255,0.72) 8%, transparent 22%),
+        radial-gradient(circle at 62% 70%, rgba(134,104,255,0.74), transparent 35%),
+        radial-gradient(circle at 32% 64%, rgba(33,218,255,0.84), transparent 42%),
+        linear-gradient(135deg, rgba(30, 225, 255, 0.92), rgba(70, 91, 255, 0.78) 48%, rgba(168, 86, 255, 0.68));
+      box-shadow:
+        0 0 42px rgba(78, 222, 255, 0.42),
+        0 0 120px rgba(91, 92, 255, 0.28),
+        inset 18px 22px 42px rgba(255,255,255,0.22),
+        inset -34px -38px 64px rgba(20, 16, 95, 0.34);
+      filter: saturate(1.25);
+      animation: fluidBreath 5.4s ease-in-out infinite, fluidShape 8.5s ease-in-out infinite;
+      cursor: pointer;
+    }
+
+    .voice-fluid::before,
+    .voice-fluid::after {
+      content: "";
+      position: absolute;
+      inset: 12%;
+      border-radius: inherit;
+      border: 1px solid rgba(255,255,255,0.32);
+      filter: blur(1px);
+      opacity: 0.45;
+      animation: fluidSurface 4.4s ease-in-out infinite;
+    }
+
+    .voice-fluid::after {
+      inset: -18%;
+      border-color: rgba(78, 222, 255, 0.20);
+      filter: blur(9px);
+      opacity: 0.7;
+      animation-duration: 6.2s;
+    }
+
+    .voice-fluid-core {
+      position: absolute;
+      inset: 26%;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255,255,255,0.62), rgba(87,224,255,0.22) 42%, transparent 72%);
+      filter: blur(3px);
+      opacity: 0.56;
+      animation: coreDrift 5s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .voice-audio-ripples {
+      position: absolute;
+      inset: -26%;
+      pointer-events: none;
+    }
+
+    .voice-audio-ripples span {
+      position: absolute;
+      inset: 19%;
+      border-radius: 44% 56% 52% 48% / 49% 45% 55% 51%;
+      border: 1px solid rgba(114, 232, 255, 0.0);
+      opacity: 0;
+      transform: scale(0.75);
+    }
+
+    body.voice-state-listening .voice-audio-ripples span {
+      border-color: rgba(127, 236, 255, 0.28);
+      animation: audioRipple 1.15s ease-out infinite;
+    }
+
+    body.voice-state-listening .voice-audio-ripples span:nth-child(2) { animation-delay: 0.25s; }
+    body.voice-state-listening .voice-audio-ripples span:nth-child(3) { animation-delay: 0.50s; }
+
+    body.voice-state-listening .voice-fluid {
+      animation: fluidVoice 0.66s ease-in-out infinite alternate, fluidShape 3.4s ease-in-out infinite;
+      box-shadow:
+        0 0 68px rgba(91, 235, 255, 0.62),
+        0 0 150px rgba(101, 98, 255, 0.34),
+        inset 18px 22px 44px rgba(255,255,255,0.26),
+        inset -34px -38px 70px rgba(20, 16, 95, 0.38);
+    }
+
+    body.voice-state-understanding .voice-fluid-cluster {
+      transform: translate(-50%, -50%) scale(0.9);
+    }
+
+    body.voice-state-understanding .voice-fluid {
+      animation: fluidCompress 1.05s ease-in-out infinite alternate;
+      filter: saturate(1.55) brightness(1.08);
+    }
+
+    body.voice-state-working .voice-fluid-cluster,
+    body.voice-state-approval .voice-fluid-cluster,
+    body.voice-state-error .voice-fluid-cluster {
+      transform: translate(-50%, -50%) scale(0.82);
+    }
+
+    body.voice-state-completed .voice-fluid-cluster {
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    @keyframes fluidBreath {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.035); }
+    }
+
+    @keyframes fluidShape {
+      0%, 100% { border-radius: 46% 54% 50% 50% / 50% 45% 55% 50%; }
+      35% { border-radius: 53% 47% 43% 57% / 43% 57% 43% 57%; }
+      70% { border-radius: 44% 56% 58% 42% / 58% 42% 58% 42%; }
+    }
+
+    @keyframes fluidSurface {
+      0%,100% { transform: rotate(0deg) scale(1); opacity: 0.35; }
+      50% { transform: rotate(9deg) scale(1.08); opacity: 0.62; }
+    }
+
+    @keyframes coreDrift {
+      0%,100% { transform: translate(-4%, 3%) scale(1); }
+      50% { transform: translate(5%, -2%) scale(1.12); }
+    }
+
+    @keyframes fluidVoice {
+      from { transform: scale(0.985) skewX(-1deg); border-radius: 42% 58% 55% 45% / 48% 46% 54% 52%; }
+      to { transform: scale(1.075) skewX(1deg); border-radius: 57% 43% 44% 56% / 41% 59% 42% 58%; }
+    }
+
+    @keyframes fluidCompress {
+      from { transform: scale(0.94); }
+      to { transform: scale(1.02); }
+    }
+
+    @keyframes audioRipple {
+      0% { opacity: 0.0; transform: scale(0.78); }
+      20% { opacity: 0.85; }
+      100% { opacity: 0; transform: scale(1.52); }
+    }
+
+    .voice-branch-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.45s ease;
+    }
+
+    body.voice-state-working .voice-branch-svg,
+    body.voice-state-approval .voice-branch-svg,
+    body.voice-state-error .voice-branch-svg,
+    body.voice-state-completed .voice-branch-svg {
+      opacity: 1;
+    }
+
+    .voice-branch-halo,
+    .voice-branch-core {
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-dasharray: 1;
+      stroke-dashoffset: calc(1 - var(--branch-progress));
+      transition: stroke-dashoffset 0.9s cubic-bezier(0.25, 0.9, 0.2, 1), opacity 0.35s ease;
+    }
+
+    .voice-branch-halo {
+      stroke: rgba(109, 235, 255, 0.22);
+      stroke-width: 30;
+      filter: blur(10px);
+    }
+
+    .voice-branch-core {
+      stroke: url(#voiceBranchGradient);
+      stroke-width: 13;
+      filter: drop-shadow(0 0 18px rgba(91, 235, 255, 0.5));
+    }
+
+    body.voice-state-completed .voice-branch-halo,
+    body.voice-state-completed .voice-branch-core {
+      opacity: 0;
+      stroke-dashoffset: 1;
+      transition-delay: 0.45s;
+    }
+
+    .voice-steps {
+      position: absolute;
+      left: calc(var(--voice-fluid-x) + 11vw);
+      top: calc(var(--voice-fluid-y) - 8vh);
+      width: min(42vw, 560px);
+      height: 260px;
+      pointer-events: none;
+    }
+
+    .voice-step-node {
+      position: absolute;
+      display: grid;
+      gap: 7px;
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.8);
+      transition: opacity 0.35s ease, transform 0.45s cubic-bezier(0.2, 0.9, 0.2, 1), filter 0.35s ease;
+    }
+
+    .voice-step-node.visible {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    .voice-step-node::before {
+      content: "";
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: rgba(194, 246, 255, 0.28);
+      border: 1px solid rgba(209, 250, 255, 0.38);
+      box-shadow: 0 0 20px rgba(111, 232, 255, 0.2);
+    }
+
+    .voice-step-node.completed::before {
+      background: rgba(153, 246, 255, 0.9);
+      transform: scale(0.72);
+      box-shadow: 0 0 20px rgba(116, 238, 255, 0.48);
+    }
+
+    .voice-step-node.active::before {
+      background: #f5fdff;
+      box-shadow: 0 0 22px rgba(255,255,255,0.78), 0 0 44px rgba(86,225,255,0.56);
+      animation: activeNodePulse 1.05s ease-in-out infinite;
+    }
+
+    .voice-step-node.error::before {
+      background: #ffd7e0;
+      box-shadow: 0 0 26px rgba(255, 92, 130, 0.58);
+      animation: blockedNodePulse 1.3s ease-in-out infinite;
+    }
+
+    .voice-step-node.approval::before {
+      background: #ffffff;
+      box-shadow: 0 0 24px rgba(155, 137, 255, 0.75), 0 0 48px rgba(74,222,255,0.44);
+    }
+
+    .voice-step-label {
+      min-width: 150px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(174, 231, 255, 0.16);
+      background: rgba(5, 14, 30, 0.48);
+      backdrop-filter: blur(16px);
+      color: rgba(238, 250, 255, 0.86);
+      font-size: 0.72rem;
+      line-height: 1.35;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.16);
+    }
+
+    .voice-step-node.completed .voice-step-label {
+      opacity: 0.54;
+      transform: scale(0.96);
+    }
+
+    @keyframes activeNodePulse {
+      0%,100% { transform: scale(1); }
+      50% { transform: scale(1.28); }
+    }
+
+    @keyframes blockedNodePulse {
+      0%,100% { transform: scale(1); opacity: 0.92; }
+      50% { transform: scale(1.18); opacity: 1; }
+    }
+
+    .voice-approval {
+      position: absolute;
+      left: min(76vw, 980px);
+      top: 47vh;
+      z-index: 4;
+      min-width: 220px;
+      display: none;
+      gap: 10px;
+      align-items: center;
+      transform: translate(-50%, -50%);
+    }
+
+    body.voice-state-approval .voice-approval {
+      display: flex;
+    }
+
+    .voice-action-btn {
+      min-height: 32px;
+      min-width: 88px;
+      border-radius: 999px;
+      border: 1px solid rgba(194, 241, 255, 0.22);
+      background: rgba(255,255,255,0.065);
+      color: rgba(241, 252, 255, 0.9);
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      backdrop-filter: blur(14px);
+    }
+
+    .voice-action-btn.primary {
+      background: linear-gradient(135deg, rgba(103, 232, 249, 0.28), rgba(134, 116, 255, 0.24));
+      border-color: rgba(174, 245, 255, 0.52);
+      box-shadow: 0 0 26px rgba(94, 226, 255, 0.25);
+    }
+
+    .voice-error-actions {
+      position: absolute;
+      left: min(76vw, 980px);
+      top: 53vh;
+      z-index: 4;
+      display: none;
+      gap: 10px;
+      transform: translateX(-50%);
+    }
+
+    body.voice-state-error .voice-error-actions {
+      display: flex;
+    }
+
+    .voice-status-copy {
+      position: absolute;
+      left: 50%;
+      bottom: 108px;
+      z-index: 3;
+      transform: translateX(-50%);
+      text-align: center;
+      display: grid;
+      gap: 8px;
+      pointer-events: none;
+      width: min(560px, calc(100vw - 48px));
+    }
+
+    #voiceStateLabel {
+      font-size: 0.88rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: rgba(241, 252, 255, 0.88);
       font-family: var(--font-mono);
     }
 
-    .voice-orb-wrap {
+    #voiceSubstate {
+      max-width: 560px;
+      color: rgba(215, 238, 246, 0.58);
+      font-size: 0.78rem;
+      line-height: 1.5;
+      min-height: 1.5em;
+    }
+
+    .voice-transcript-dock {
       position: relative;
-      z-index: 1;
-      width: 200px;
-      height: 200px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .voice-ring {
-      position: absolute;
-      border-radius: 50%;
-      border: 1px solid rgba(74, 222, 128, 0.22);
-      animation: voiceRingExpand 2.8s ease-out infinite;
-    }
-    .voice-ring:nth-child(1) { width:  96px; height:  96px; animation-delay: 0.0s; }
-    .voice-ring:nth-child(2) { width: 136px; height: 136px; animation-delay: 0.7s; border-color: rgba(74,222,128,0.14); }
-    .voice-ring:nth-child(3) { width: 172px; height: 172px; animation-delay: 1.4s; border-color: rgba(74,222,128,0.08); }
-    .voice-ring:nth-child(4) { width: 210px; height: 210px; animation-delay: 2.1s; border-color: rgba(74,222,128,0.04); }
-
-    @keyframes voiceRingExpand {
-      0%   { transform: scale(0.7); opacity: 0; }
-      25%  { opacity: 1; }
-      100% { transform: scale(1.3); opacity: 0; }
-    }
-
-    .voice-orb {
-      width: 92px;
-      height: 92px;
-      border-radius: 50%;
-      background: radial-gradient(circle at 38% 38%,
-        rgba(74,222,128,0.18) 0%,
-        rgba(74,222,128,0.05) 55%,
-        transparent 100%);
-      border: 1.5px solid rgba(74,222,128,0.5);
-      box-shadow:
-        0 0 32px rgba(74,222,128,0.12),
-        0 0 72px rgba(74,222,128,0.06),
-        inset 0 0 28px rgba(74,222,128,0.08);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      position: relative;
-      z-index: 2;
-      animation: orbBreath 2.8s ease-in-out infinite;
-      cursor: pointer;
-      transition: box-shadow 0.3s;
-    }
-
-    .voice-orb:hover {
-      box-shadow:
-        0 0 52px rgba(74,222,128,0.24),
-        0 0 96px rgba(74,222,128,0.10),
-        inset 0 0 36px rgba(74,222,128,0.14);
-    }
-
-    @keyframes orbBreath {
-      0%,100% {
-        box-shadow:
-          0 0 28px rgba(74,222,128,0.10),
-          0 0 60px rgba(74,222,128,0.05),
-          inset 0 0 22px rgba(74,222,128,0.07);
-        transform: scale(1);
-      }
-      50% {
-        box-shadow:
-          0 0 48px rgba(74,222,128,0.22),
-          0 0 88px rgba(74,222,128,0.10),
-          inset 0 0 36px rgba(74,222,128,0.12);
-        transform: scale(1.05);
-      }
-    }
-
-    body.voice-recording .voice-orb {
-      border-color: rgba(74,222,128,0.85);
-      animation: orbPulseRecord 1s ease-in-out infinite;
-    }
-    body.voice-recording .voice-ring {
-      animation-duration: 1.3s;
-      border-color: rgba(74,222,128,0.35);
-    }
-
-    @keyframes orbPulseRecord {
-      0%,100% {
-        box-shadow:
-          0 0 52px rgba(74,222,128,0.30),
-          0 0 100px rgba(74,222,128,0.14),
-          inset 0 0 36px rgba(74,222,128,0.18);
-        transform: scale(1);
-      }
-      50% {
-        box-shadow:
-          0 0 80px rgba(74,222,128,0.50),
-          0 0 140px rgba(74,222,128,0.22),
-          inset 0 0 52px rgba(74,222,128,0.24);
-        transform: scale(1.07);
-      }
-    }
-
-    .voice-orb-icon {
-      font-size: 1.85rem;
-      user-select: none;
-      filter: drop-shadow(0 0 10px rgba(74,222,128,0.55));
-    }
-
-    .voice-waveform {
-      position: relative;
-      z-index: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-      height: 36px;
-    }
-
-    .voice-bar {
-      width: 3px;
-      border-radius: 2px;
-      background: var(--green-dim);
-      animation: voiceBarIdle 2s ease-in-out infinite;
-      opacity: 0.35;
-    }
-    .voice-bar:nth-child(1) { height:  7px; animation-delay: 0.00s; }
-    .voice-bar:nth-child(2) { height: 13px; animation-delay: 0.10s; }
-    .voice-bar:nth-child(3) { height: 22px; animation-delay: 0.20s; }
-    .voice-bar:nth-child(4) { height: 30px; animation-delay: 0.30s; }
-    .voice-bar:nth-child(5) { height: 22px; animation-delay: 0.20s; }
-    .voice-bar:nth-child(6) { height: 13px; animation-delay: 0.10s; }
-    .voice-bar:nth-child(7) { height:  7px; animation-delay: 0.00s; }
-
-    @keyframes voiceBarIdle {
-      0%,100% { transform: scaleY(0.35); opacity: 0.25; }
-      50%      { transform: scaleY(1);    opacity: 0.60; }
-    }
-
-    body.voice-recording .voice-bar {
-      opacity: 1;
-      animation: voiceBarActive 0.35s ease-in-out infinite alternate;
-    }
-    body.voice-recording .voice-bar:nth-child(1) { animation-delay: 0.00s; }
-    body.voice-recording .voice-bar:nth-child(2) { animation-delay: 0.07s; }
-    body.voice-recording .voice-bar:nth-child(3) { animation-delay: 0.14s; }
-    body.voice-recording .voice-bar:nth-child(4) { animation-delay: 0.04s; }
-    body.voice-recording .voice-bar:nth-child(5) { animation-delay: 0.11s; }
-    body.voice-recording .voice-bar:nth-child(6) { animation-delay: 0.08s; }
-    body.voice-recording .voice-bar:nth-child(7) { animation-delay: 0.16s; }
-
-    @keyframes voiceBarActive {
-      0%   { transform: scaleY(0.25); }
-      100% { transform: scaleY(1);    }
+      z-index: 4;
+      align-self: end;
+      width: min(760px, calc(100vw - 48px));
+      margin: 0 auto 18px;
+      padding: 14px 22px;
+      border-top: 1px solid rgba(192, 242, 255, 0.14);
+      color: rgba(234, 250, 255, 0.74);
+      text-align: center;
+      font-size: 0.92rem;
+      line-height: 1.55;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.045), transparent);
     }
 
     #voiceTranscript {
-      position: relative;
-      z-index: 1;
-      font-size: 0.84rem;
-      font-family: var(--font-mono);
-      color: var(--green);
-      text-align: center;
-      max-width: 68%;
-      min-height: 2.4em;
-      line-height: 1.65;
-      letter-spacing: 0.02em;
-      padding: 0 16px;
-      transition: color 0.2s;
-      font-weight: 500;
+      min-height: 1.5em;
+      max-height: 3.2em;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
     }
+
     #voiceTranscript.interim {
-      color: var(--text-dim);
+      color: rgba(190, 218, 229, 0.55);
       font-style: italic;
     }
 
-    .voice-state-text {
-      position: relative;
-      z-index: 1;
-      font-size: 0.63rem;
-      font-family: var(--font-mono);
-      color: var(--text-muted);
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .voice-state-dot {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: var(--text-muted);
-      flex-shrink: 0;
-    }
-    body.voice-recording .voice-state-dot {
-      background: var(--green);
-      animation: voiceDotBlink 1s ease-in-out infinite;
-    }
-    @keyframes voiceDotBlink {
-      0%,100% { opacity: 1; }
-      50%      { opacity: 0.15; }
-    }
-
-    .voice-cancel-btn {
-      position: relative;
-      z-index: 1;
-      font-size: 0.65rem;
-      font-family: var(--font-mono);
-      color: var(--text-muted);
-      background: transparent;
-      border: 1px solid var(--border);
-      padding: 6px 18px;
-      border-radius: 3px;
-      cursor: pointer;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      font-weight: 600;
-      transition: border-color 0.15s, color 0.15s;
-      min-width: unset;
-      min-height: unset;
-    }
-    .voice-cancel-btn:hover {
-      border-color: var(--red);
-      color: var(--red);
-    }
-
-    .voice-divider {
-      position: fixed;
-      left: 55vw;
-      top: 0;
-      width: 1px;
-      height: 100vh;
-      background: linear-gradient(
-        to bottom,
-        transparent 0%,
-        rgba(74,222,128,0.40) 30%,
-        rgba(74,222,128,0.55) 50%,
-        rgba(74,222,128,0.40) 70%,
-        transparent 100%
-      );
-      z-index: 501;
-      opacity: 0;
-      transition: opacity 0.45s 0.2s;
-      pointer-events: none;
-    }
-    body.voice-mode .voice-divider { opacity: 1; }
-
     #voiceInputBtn.voice-mode-active {
-      border-color: var(--green);
-      color: var(--green);
-      background: var(--green-faint);
+      border-color: rgba(110, 231, 255, 0.9);
+      color: #dffbff;
+      background: rgba(100, 219, 255, 0.12);
+      box-shadow: 0 0 18px rgba(101, 232, 255, 0.22);
+    }
+
+    @media (max-width: 760px) {
+      #voicePanel {
+        --voice-fluid-x: 50vw;
+        --voice-fluid-y: 36vh;
+        --voice-fluid-size: min(58vw, 260px);
+      }
+
+      .voice-topbar {
+        padding: 18px;
+      }
+
+      .voice-indicators {
+        gap: 10px;
+        font-size: 0.58rem;
+      }
+
+      .voice-steps {
+        left: 50vw;
+        top: 52vh;
+        width: 86vw;
+        height: 230px;
+      }
+
+      .voice-step-label {
+        min-width: 118px;
+        font-size: 0.66rem;
+      }
+
+      .voice-approval,
+      .voice-error-actions {
+        left: 50vw;
+        top: 72vh;
+      }
     }
   </style>
 
@@ -1940,41 +2182,61 @@
 
 <body data-mira-api-key="{{ mira_api_key }}">
 
-  <!-- Glowing vertical divider for voice split -->
+  <!-- Legacy divider kept inert for older layout hooks -->
   <div class="voice-divider"></div>
 
-  <!-- Voice Mode Panel -->
+  <!-- Voice fluid mission surface -->
   <div id="voicePanel">
-    <div class="voice-panel-label">◆ mira — voice input</div>
+    <div class="voice-topbar">
+      <div class="voice-indicators">
+        <span class="voice-indicator"><i></i><span id="voiceMicIndicator">Mic idle</span></span>
+        <span class="voice-indicator"><i></i><span id="voiceConnectionIndicator">Connected</span></span>
+      </div>
+      <button class="voice-close" onclick="exitVoiceMode()" title="Close voice UI">x</button>
+    </div>
 
-    <div class="voice-orb-wrap">
-      <div class="voice-ring"></div>
-      <div class="voice-ring"></div>
-      <div class="voice-ring"></div>
-      <div class="voice-ring"></div>
-      <div class="voice-orb" onclick="toggleVoiceInput()" title="Tap to speak">
-        <span class="voice-orb-icon">🎤</span>
+    <div class="voice-stage">
+      <svg class="voice-branch-svg" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="voiceBranchGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#e9fdff" stop-opacity="0.92" />
+            <stop offset="42%" stop-color="#5ee7ff" stop-opacity="0.95" />
+            <stop offset="100%" stop-color="#8a6dff" stop-opacity="0.88" />
+          </linearGradient>
+        </defs>
+        <path class="voice-branch-halo" pathLength="1" d="M 420 245 C 510 214, 570 142, 650 170 S 742 288, 828 245 S 902 183, 952 220" />
+        <path class="voice-branch-core" pathLength="1" d="M 420 245 C 510 214, 570 142, 650 170 S 742 288, 828 245 S 902 183, 952 220" />
+      </svg>
+
+      <div class="voice-fluid-cluster">
+        <div class="voice-audio-ripples"><span></span><span></span><span></span></div>
+        <div class="voice-fluid" onclick="restartVoicePrototype()" title="Replay voice prototype">
+          <div class="voice-fluid-core"></div>
+        </div>
+      </div>
+
+      <div class="voice-steps" id="voiceSteps"></div>
+
+      <div class="voice-approval" id="voiceApproval">
+        <button class="voice-action-btn primary" onclick="approveVoicePrototype()">Approve</button>
+        <button class="voice-action-btn" onclick="cancelVoicePrototype()">Cancel</button>
+      </div>
+
+      <div class="voice-error-actions" id="voiceErrorActions">
+        <button class="voice-action-btn primary" onclick="retryVoicePrototype()">Retry</button>
+        <button class="voice-action-btn" onclick="editVoicePrototype()">Edit</button>
+        <button class="voice-action-btn" onclick="cancelVoicePrototype()">Cancel</button>
+      </div>
+
+      <div class="voice-status-copy">
+        <div id="voiceStateLabel">Ready when you are.</div>
+        <div id="voiceSubstate">The fluid is whole.</div>
       </div>
     </div>
 
-    <div class="voice-waveform">
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
-      <div class="voice-bar"></div>
+    <div class="voice-transcript-dock">
+      <div id="voiceTranscript">Say something when ready.</div>
     </div>
-
-    <div id="voiceTranscript">Say something...</div>
-
-    <div class="voice-state-text">
-      <div class="voice-state-dot"></div>
-      <span id="voiceStateLabel">Tap mic to speak</span>
-    </div>
-
-    <button class="voice-cancel-btn" onclick="exitVoiceMode()">✕ Cancel</button>
   </div>
 
   <!-- Sidebar for Capabilities -->
@@ -2165,13 +2427,204 @@
       overlay.classList.toggle('visible');
     }
 
-    // Voice settings
+    // Voice UI prototype settings
     let voiceOutputEnabled = localStorage.getItem('voiceOutput') === 'true';
     let isRecording = false;
     let recognition = null;
+    let voiceMediaRecorder = null;
+    let voiceMediaStream = null;
+    let voiceAudioContext = null;
+    let voiceAudioChunks = [];
+    let voiceRecordingMode = 'browser';
     let synthesis = window.speechSynthesis;
+    let voiceFlowTimers = [];
+    let voiceCurrentState = 'idle';
+    let voiceLinkedToAgent = false;
+    let voiceLiveStepLabels = [];
+    let voiceLastTranscript = '';
+    const voiceStepPositions = [
+      { left: '8%', top: '58%' },
+      { left: '28%', top: '26%' },
+      { left: '48%', top: '44%' },
+      { left: '67%', top: '66%' },
+      { left: '82%', top: '48%' },
+      { left: '96%', top: '32%' }
+    ];
+    const voiceStateClasses = [
+      'voice-state-idle',
+      'voice-state-listening',
+      'voice-state-understanding',
+      'voice-state-working',
+      'voice-state-approval',
+      'voice-state-error',
+      'voice-state-completed'
+    ];
 
-    // Initialize Web Speech API
+    function clearVoiceFlowTimers() {
+      voiceFlowTimers.forEach(id => clearTimeout(id));
+      voiceFlowTimers = [];
+    }
+
+    function queueVoiceState(delay, eventName, payload) {
+      voiceFlowTimers.push(setTimeout(() => setVoiceAgentState(eventName, payload || {}), delay));
+    }
+
+    function stopRecording() {
+      isRecording = false;
+      document.body.classList.remove('voice-recording');
+      const btn = document.getElementById('voiceInputBtn');
+      if (btn) btn.classList.remove('recording');
+      if (voiceMediaStream) {
+        voiceMediaStream.getTracks().forEach(track => track.stop());
+        voiceMediaStream = null;
+      }
+      if (voiceAudioContext) {
+        try { voiceAudioContext.close(); } catch (_) {}
+        voiceAudioContext = null;
+      }
+      if (document.getElementById('voiceStatus').textContent.includes('Listening')) {
+        setVoiceStatus('');
+      }
+    }
+
+    function browserSpeechAvailable() {
+      return !!(window.webkitSpeechRecognition || window.SpeechRecognition);
+    }
+
+    function localSpeechAvailable() {
+      return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+    }
+
+    async function transcribeVoiceBlob(blob) {
+      const form = new FormData();
+      form.append('audio', blob, 'voice.webm');
+      setVoiceStatus('Transcribing locally...');
+      setVoiceAgentState('agent.understanding', { transcript: 'Transcribing...', finalTranscript: false });
+      const res = await fetch('/api/voice/transcribe', { method: 'POST', body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.status !== 'ok') {
+        throw new Error(data.error || 'Local transcription failed');
+      }
+      return (data.text || '').trim();
+    }
+
+    async function startLocalVoiceRecording() {
+      voiceRecordingMode = 'local';
+      voiceAudioChunks = [];
+      enterVoiceMode();
+      resetVoiceLiveSteps();
+      setVoiceStatus('Listening locally...');
+      setVoiceAgentState('agent.listening', { transcript: 'Listening...', finalTranscript: false });
+      voiceLinkedToAgent = true;
+      isRecording = true;
+      document.body.classList.add('voice-recording');
+      document.getElementById('voiceInputBtn').classList.add('recording');
+
+      voiceMediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1
+        }
+      });
+
+      const preferredType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      voiceMediaRecorder = new MediaRecorder(voiceMediaStream, { mimeType: preferredType });
+
+      voiceMediaRecorder.ondataavailable = event => {
+        if (event.data && event.data.size > 0) voiceAudioChunks.push(event.data);
+      };
+      voiceMediaRecorder.onerror = event => {
+        setVoiceAgentState('agent.error', { message: 'Local voice recording failed.' });
+        setVoiceStatus('Local voice recording failed');
+        stopRecording();
+      };
+      voiceMediaRecorder.onstop = async () => {
+        const chunks = voiceAudioChunks.slice();
+        stopRecording();
+        voiceMediaRecorder = null;
+        if (!chunks.length) return;
+        try {
+          const blob = new Blob(chunks, { type: preferredType });
+          const clean = await transcribeVoiceBlob(blob);
+          if (!clean) {
+            setVoiceAgentState('agent.error', { message: 'No speech detected.' });
+            setVoiceStatus('No speech detected');
+            return;
+          }
+          voiceLastTranscript = clean;
+          document.getElementById('input').value = clean;
+          setVoiceAgentState('agent.understanding', { transcript: clean, finalTranscript: true });
+          setVoiceStatus('');
+          setTimeout(() => sendMsg(), 220);
+        } catch (err) {
+          console.warn('[MIRA] Local STT failed, falling back to browser STT:', err);
+          setVoiceStatus('Local STT unavailable, using browser...');
+          if (browserSpeechAvailable()) {
+            try { recognition.start(); } catch (_) {}
+          } else {
+            setVoiceAgentState('agent.error', { message: err.message || 'Voice input failed.' });
+          }
+        }
+      };
+
+      voiceMediaRecorder.start();
+
+      try {
+        voiceAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = voiceAudioContext.createMediaStreamSource(voiceMediaStream);
+        const analyser = voiceAudioContext.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.fftSize);
+        const noiseSamples = [];
+        const startedAt = performance.now();
+        let speechStarted = false;
+        let silenceStartedAt = null;
+
+        const tick = () => {
+          if (!isRecording || voiceRecordingMode !== 'local' || !voiceMediaRecorder || voiceMediaRecorder.state !== 'recording') return;
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          const now = performance.now();
+          if (!speechStarted && now - startedAt < 650) noiseSamples.push(rms);
+          const noise = noiseSamples.length
+            ? noiseSamples.slice().sort((a, b) => a - b)[Math.floor(noiseSamples.length / 2)]
+            : 0.004;
+          const threshold = Math.max(0.016, noise * 3.2);
+          const isSpeech = rms > threshold;
+
+          if (isSpeech) {
+            speechStarted = true;
+            silenceStartedAt = null;
+          } else if (speechStarted) {
+            if (!silenceStartedAt) silenceStartedAt = now;
+            if (now - silenceStartedAt > 1000 && voiceMediaRecorder.state === 'recording') {
+              voiceMediaRecorder.stop();
+              return;
+            }
+          }
+
+          if (now - startedAt > 15000 && voiceMediaRecorder.state === 'recording') {
+            voiceMediaRecorder.stop();
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      } catch (_) {
+        // Recording still works; the user can tap again to stop manually.
+      }
+    }
+
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       recognition = new SpeechRecognition();
@@ -2181,42 +2634,36 @@
 
       recognition.onstart = () => {
         isRecording = true;
+        voiceLinkedToAgent = true;
         document.getElementById('voiceInputBtn').classList.add('recording');
-        setVoiceStatus('🎤 Listening...');
+        setVoiceStatus('Listening...');
         enterVoiceMode();
+        setVoiceAgentState('agent.listening', { transcript: 'Listening...' });
       };
 
       recognition.onresult = (event) => {
         let interim = '';
         let final = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          if (event.results[i].isFinal) {
-            final += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
+          if (event.results[i].isFinal) final += event.results[i][0].transcript;
+          else interim += event.results[i][0].transcript;
         }
-        const transcriptEl = document.getElementById('voiceTranscript');
         if (final) {
-          transcriptEl.textContent = final;
-          transcriptEl.classList.remove('interim');
-          document.getElementById('input').value = final;
-          setVoiceStatus('Recognized: ' + final);
-          document.getElementById('voiceStateLabel').textContent = 'Sending...';
-          setTimeout(() => {
-            exitVoiceMode();
-            sendMsg();
-          }, 650);
+          const clean = final.trim();
+          voiceLastTranscript = clean;
+          document.getElementById('input').value = clean;
+          setVoiceAgentState('agent.understanding', { transcript: clean, finalTranscript: true });
+          stopRecording();
+          setTimeout(() => sendMsg(), 420);
         } else if (interim) {
-          transcriptEl.textContent = interim;
-          transcriptEl.classList.add('interim');
+          setVoiceAgentState('agent.listening', { transcript: interim.trim(), finalTranscript: false });
         }
       };
 
       recognition.onerror = (event) => {
-        setVoiceStatus('❌ Error: ' + event.error);
+        setVoiceAgentState('agent.error', { message: 'Voice input failed: ' + event.error });
+        setVoiceStatus('Voice error: ' + event.error);
         stopRecording();
-        exitVoiceMode();
       };
 
       recognition.onend = () => {
@@ -2224,52 +2671,275 @@
       };
     }
 
-    function toggleVoiceInput() {
-      if (!recognition) {
-        alert('Speech recognition not supported in this browser');
+    function renderVoiceSteps(labels) {
+      const host = document.getElementById('voiceSteps');
+      if (!host) return;
+      const sourceLabels = labels || voiceLiveStepLabels;
+      host.innerHTML = sourceLabels.map((label, idx) => {
+        const pos = voiceStepPositions[idx];
+        const left = pos ? pos.left : `${Math.min(96, 8 + idx * 15)}%`;
+        const top = pos ? pos.top : `${idx % 2 ? 32 : 58}%`;
+        return `<div class="voice-step-node" data-step="${idx}" style="left:${left};top:${top}">
+          <div class="voice-step-label">${label}</div>
+        </div>`;
+      }).join('');
+    }
+
+    function eventToVoiceState(eventName) {
+      const key = String(eventName || '').replace(/^agent\./, '');
+      const map = {
+        idle: 'idle',
+        listening: 'listening',
+        understanding: 'understanding',
+        task_started: 'working',
+        step_started: 'working',
+        step_completed: 'working',
+        approval_required: 'approval',
+        error: 'error',
+        completed: 'completed'
+      };
+      return map[key] || key || 'idle';
+    }
+
+    function setVoiceAgentState(eventName, payload = {}) {
+      const state = eventToVoiceState(eventName);
+      voiceCurrentState = state;
+      document.body.classList.remove(...voiceStateClasses, 'voice-recording');
+      document.body.classList.add('voice-state-' + state);
+      if (state === 'listening') document.body.classList.add('voice-recording');
+
+      const panel = document.getElementById('voicePanel');
+      const label = document.getElementById('voiceStateLabel');
+      const substate = document.getElementById('voiceSubstate');
+      const transcript = document.getElementById('voiceTranscript');
+      const mic = document.getElementById('voiceMicIndicator');
+      const btn = document.getElementById('voiceInputBtn');
+      const progress = typeof payload.progress === 'number' ? payload.progress : branchProgressForState(state, payload.stepIndex);
+      panel && panel.style.setProperty('--branch-progress', String(Math.max(0, Math.min(1, progress))));
+
+      const copy = {
+        idle: ['Ready when you are.', 'The fluid is whole.'],
+        listening: ['Listening...', 'Voice ripples are being absorbed.'],
+        understanding: ['Understanding...', 'The fluid is compressing the request into intent.'],
+        working: [payload.status || 'Working...', payload.detail || 'The task branch is moving forward.'],
+        approval: ['Ready to send?', 'Approve to continue, or cancel to return to whole.'],
+        error: [payload.message || 'Connection lost.', 'The task is paused. The branch is waiting.'],
+        completed: ['Done.', 'The branch is returning to the main fluid.']
+      };
+      const selected = copy[state] || copy.idle;
+      if (label) label.textContent = selected[0];
+      if (substate) substate.textContent = selected[1];
+      if (mic) mic.textContent = state === 'listening' ? 'Mic active' : state === 'idle' ? 'Mic idle' : 'Agent active';
+      if (btn) btn.classList.toggle('voice-mode-active', document.body.classList.contains('voice-mode'));
+
+      if (transcript) {
+        if (payload.transcript) transcript.textContent = payload.transcript;
+        if (state === 'idle' && !payload.transcript) transcript.textContent = 'Say something when ready.';
+        transcript.classList.toggle('interim', state === 'listening' && !payload.finalTranscript);
+      }
+
+      updateVoiceStepNodes(state, payload.stepIndex);
+      window.dispatchEvent(new CustomEvent('voice-ui-state', { detail: { state, payload } }));
+    }
+
+    function branchProgressForState(state, stepIndex) {
+      if (state === 'idle' || state === 'listening' || state === 'understanding') return 0;
+      if (state === 'completed') return 1;
+      if (typeof stepIndex === 'number') return Math.min(1, 0.16 + (stepIndex * 0.15));
+      if (state === 'approval') return 0.62;
+      if (state === 'error') return 0.82;
+      return 0.34;
+    }
+
+    function updateVoiceStepNodes(state, stepIndex) {
+      document.querySelectorAll('.voice-step-node').forEach(node => {
+        const idx = Number(node.dataset.step);
+        node.classList.remove('visible', 'active', 'completed', 'approval', 'error');
+        if (typeof stepIndex !== 'number' || state === 'idle' || state === 'listening' || state === 'understanding') return;
+        if (idx <= stepIndex) node.classList.add('visible');
+        if (idx < stepIndex) node.classList.add('completed');
+        if (idx === stepIndex) node.classList.add('active');
+        if (state === 'approval' && idx === stepIndex) node.classList.add('approval');
+        if (state === 'error' && idx === stepIndex) node.classList.add('error');
+        if (state === 'completed') node.classList.add('visible', 'completed');
+      });
+    }
+
+    function resetVoiceLiveSteps() {
+      voiceLiveStepLabels = [];
+      const host = document.getElementById('voiceSteps');
+      if (host) host.innerHTML = '';
+    }
+
+    function ensureVoiceLiveStep(index, label) {
+      const idx = Math.max(0, Number(index || 0));
+      while (voiceLiveStepLabels.length <= idx) {
+        voiceLiveStepLabels.push('Waiting...');
+      }
+      if (label) voiceLiveStepLabels[idx] = label;
+      renderVoiceSteps(voiceLiveStepLabels);
+    }
+
+    function labelForStreamEvent(event) {
+      if (!event) return 'Working...';
+      if (event.type === 'tool_call') return `Using ${event.tool || 'tool'}...`;
+      if (event.type === 'tool_result') {
+        if (event.status === 'error') return `${event.tool || 'Step'} failed`;
+        return `${event.tool || 'Step'} complete`;
+      }
+      if (event.type === 'thought') return event.content || 'Thinking...';
+      if (event.type === 'need_input') return event.question || 'Input needed';
+      if (event.type === 'task_created') return 'Task started';
+      return event.content || event.type || 'Working...';
+    }
+
+    function syncVoiceWithStreamEvent(event) {
+      if (!document.body.classList.contains('voice-mode') || !voiceLinkedToAgent) return;
+      const stepIndex = Math.max(0, Number(event.step || voiceLiveStepLabels.length || 1) - 1);
+      if (event.type === 'task_created') {
+        resetVoiceLiveSteps();
+        ensureVoiceLiveStep(0, 'Task started');
+        setVoiceAgentState('agent.task_started', { stepIndex: 0, status: 'Task started', detail: 'The branch is now following the live agent run.' });
         return;
       }
+      if (event.type === 'thought') {
+        ensureVoiceLiveStep(stepIndex, labelForStreamEvent(event));
+        setVoiceAgentState('agent.understanding', { stepIndex, status: 'Understanding...', detail: event.content || '' });
+        return;
+      }
+      if (event.type === 'tool_call') {
+        ensureVoiceLiveStep(stepIndex, labelForStreamEvent(event));
+        setVoiceAgentState('agent.step_started', { stepIndex, status: labelForStreamEvent(event) });
+        return;
+      }
+      if (event.type === 'tool_result') {
+        ensureVoiceLiveStep(stepIndex, labelForStreamEvent(event));
+        if (event.status === 'error') {
+          setVoiceAgentState('agent.error', { stepIndex, message: labelForStreamEvent(event) });
+        } else {
+          setVoiceAgentState('agent.step_completed', { stepIndex, status: labelForStreamEvent(event) });
+        }
+        return;
+      }
+      if (event.type === 'need_input') {
+        ensureVoiceLiveStep(stepIndex, labelForStreamEvent(event));
+        setVoiceAgentState('agent.approval_required', { stepIndex, status: 'Input needed', detail: event.question || '' });
+        return;
+      }
+      if (event.type === 'error' || event.type === 'aborted' || event.type === 'step_limit' || event.type === 'iteration_limit') {
+        ensureVoiceLiveStep(stepIndex, event.content || 'Blocked');
+        setVoiceAgentState('agent.error', { stepIndex, message: event.content || 'Blocked' });
+        return;
+      }
+      if (event.type === 'final') {
+        const finalStep = Math.max(voiceLiveStepLabels.length, 1);
+        ensureVoiceLiveStep(finalStep, 'Done');
+        setVoiceAgentState('agent.completed', { stepIndex: finalStep, transcript: document.getElementById('voiceTranscript').textContent || '', progress: 1 });
+      }
+    }
 
+    function toggleVoiceInput() {
+      if (!localSpeechAvailable() && !recognition) {
+        enterVoiceMode();
+        setVoiceAgentState('agent.error', { message: 'Speech recognition is unavailable.' });
+        setVoiceStatus('Speech recognition unavailable');
+        return;
+      }
       if (isRecording) {
-        recognition.stop();
+        if (voiceRecordingMode === 'local' && voiceMediaRecorder && voiceMediaRecorder.state !== 'inactive') {
+          voiceMediaRecorder.stop();
+        } else if (recognition) {
+          recognition.stop();
+        }
+      } else if (document.body.classList.contains('voice-mode') && voiceCurrentState !== 'idle') {
+        exitVoiceMode();
       } else {
-        recognition.start();
+        if (localSpeechAvailable()) {
+          startLocalVoiceRecording().catch(err => {
+            console.warn('[MIRA] Local microphone failed, falling back to browser STT:', err);
+            if (recognition) {
+              enterVoiceMode();
+              resetVoiceLiveSteps();
+              try { recognition.start(); } catch (_) {}
+            } else {
+              enterVoiceMode();
+              setVoiceAgentState('agent.error', { message: err.message || 'Microphone unavailable.' });
+              setVoiceStatus('Microphone unavailable');
+            }
+          });
+        } else {
+          enterVoiceMode();
+          resetVoiceLiveSteps();
+          try { recognition.start(); } catch (_) {}
+        }
       }
     }
 
-    function stopRecording() {
-      isRecording = false;
-      document.body.classList.remove('voice-recording');
-      document.getElementById('voiceInputBtn').classList.remove('recording');
-      if (document.getElementById('voiceStatus').textContent.includes('Listening')) {
-        setVoiceStatus('');
-      }
-    }
-
-    /* ── VOICE MODE UI ─────────────────────────────────────────────── */
     function enterVoiceMode() {
-      document.body.classList.add('voice-mode', 'voice-recording');
+      renderVoiceSteps(voiceLiveStepLabels);
+      document.body.classList.add('voice-mode');
       document.getElementById('voicePanel').classList.add('active');
       document.getElementById('voiceInputBtn').classList.add('voice-mode-active');
-      const el = document.getElementById('voiceTranscript');
-      el.textContent = 'Listening...';
-      el.classList.remove('interim');
-      document.getElementById('voiceStateLabel').textContent = 'Listening...';
+      setVoiceStatus('Voice input active');
     }
 
     function exitVoiceMode() {
-      document.body.classList.remove('voice-mode', 'voice-recording');
+      clearVoiceFlowTimers();
+      voiceLinkedToAgent = false;
+      stopRecording();
+      document.body.classList.remove('voice-mode', 'voice-recording', ...voiceStateClasses);
+      document.body.classList.add('voice-state-idle');
       document.getElementById('voicePanel').classList.remove('active');
       document.getElementById('voiceInputBtn').classList.remove('voice-mode-active', 'recording');
-      document.getElementById('voiceStateLabel').textContent = 'Tap mic to speak';
-      const el = document.getElementById('voiceTranscript');
-      el.textContent = 'Say something...';
-      el.classList.remove('interim');
-      if (isRecording) {
-        isRecording = false;
-        try { recognition && recognition.stop(); } catch(_) {}
+      const panel = document.getElementById('voicePanel');
+      panel && panel.style.setProperty('--branch-progress', '0');
+      setVoiceAgentState('agent.idle');
+      setVoiceStatus('');
+    }
+
+    function restartVoicePrototype() {
+      if (!document.body.classList.contains('voice-mode')) enterVoiceMode();
+      resetVoiceLiveSteps();
+      if (recognition) {
+        try { recognition.start(); } catch (_) {}
       }
     }
+
+    function approveVoicePrototype() {
+      const niInput = document.querySelector('.need-input-widget:not(.answered) .ni-input');
+      const niBtn = document.querySelector('.need-input-widget:not(.answered) .ni-send');
+      if (niInput && niBtn) {
+        niInput.value = niInput.value || 'yes';
+        niBtn.click();
+        const idx = Math.max(voiceLiveStepLabels.length - 1, 0);
+        setVoiceAgentState('agent.step_started', { stepIndex: idx, status: 'Continuing...' });
+      }
+    }
+
+    function retryVoicePrototype() {
+      setVoiceAgentState('agent.step_started', {
+        stepIndex: Math.max(voiceLiveStepLabels.length - 1, 0),
+        status: 'Retrying...'
+      });
+    }
+
+    function editVoicePrototype() {
+      setVoiceAgentState('agent.listening', {
+        transcript: "Editing instruction...",
+        finalTranscript: false
+      });
+      const niInput = document.querySelector('.need-input-widget:not(.answered) .ni-input');
+      if (niInput) niInput.focus();
+    }
+
+    function cancelVoicePrototype() {
+      clearVoiceFlowTimers();
+      if (currentAbortController) currentAbortController.abort();
+      setVoiceAgentState('agent.completed', { transcript: 'Cancelled.', progress: 1 });
+      queueVoiceState(1500, 'agent.idle', { transcript: 'Cancelled.' });
+    }
+
+    window.setVoiceAgentState = setVoiceAgentState;
 
     function toggleVoiceOutput() {
       voiceOutputEnabled = !voiceOutputEnabled;
@@ -2647,6 +3317,15 @@
       const { stepsContainer, finalDiv, messageDiv } = createStreamingMessage();
 
       try {
+      if (document.body.classList.contains('voice-mode')) {
+        voiceLinkedToAgent = true;
+        voiceLastTranscript = text;
+        resetVoiceLiveSteps();
+        setVoiceAgentState('agent.understanding', {
+          transcript: text,
+            finalTranscript: true
+          });
+        }
         const _apiKey = localStorage.getItem('miraApiKey') || '';
         const _apiKeyParam = _apiKey ? `&api_key=${encodeURIComponent(_apiKey)}` : '';
         const _sessionParam = activeSessionId ? `&session_id=${encodeURIComponent(activeSessionId)}` : '';
@@ -2664,6 +3343,7 @@
           eventSource.onmessage = (e) => {
             try {
               const event = JSON.parse(e.data);
+              syncVoiceWithStreamEvent(event);
 
               switch (event.type) {
                 case 'task_created':
@@ -2739,6 +3419,14 @@
                   finalText = '✗ Error: ' + event.content;
                   break;
                 case 'done':
+                  if (document.body.classList.contains('voice-mode') && voiceLinkedToAgent) {
+                    setVoiceAgentState('agent.completed', {
+                      stepIndex: Math.max(voiceLiveStepLabels.length - 1, 0),
+                      transcript: voiceLastTranscript || text,
+                      progress: 1
+                    });
+                    setTimeout(() => setVoiceAgentState('agent.idle', { transcript: 'Task complete.' }), 2600);
+                  }
                   eventSource.close();
                   resolve();
                   return;

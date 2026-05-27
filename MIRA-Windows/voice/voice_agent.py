@@ -10,20 +10,32 @@ import threading
 import time
 
 class VoiceAgent:
-    def __init__(self, stt_model: str = "tiny.en", tts_voice: str = None):
+    def __init__(
+        self,
+        stt_model: str = "base.en",
+        tts_voice: str = None,
+        stt_backend: str = "auto",
+        stt_compute_type: str = "int8",
+    ):
         """
         Initialize voice agent
         
         Args:
             stt_model: Whisper model size (tiny.en, base.en, small.en)
             tts_voice: Path to Piper voice model (optional)
+            stt_backend: auto, faster-whisper, or openai-whisper
+            stt_compute_type: faster-whisper compute type
         """
         print("=" * 60)
         print("MIRA Voice Assistant Initializing...")
         print("=" * 60)
         
         print("\n[1/3] Loading Speech-to-Text...")
-        self.stt = SpeechToText(model_size=stt_model)
+        self.stt = SpeechToText(
+            model_size=stt_model,
+            backend=stt_backend,
+            compute_type=stt_compute_type,
+        )
         
         print("\n[2/3] Loading Text-to-Speech...")
         self.tts = TextToSpeech(voice_model=tts_voice)
@@ -55,7 +67,7 @@ class VoiceAgent:
             while self.running:
                 # 1. Listen for user speech
                 user_text = self.stt.listen_for_speech(
-                    silence_duration=1.5,
+                    silence_duration=1.0,
                     max_duration=15.0
                 )
                 
@@ -165,9 +177,20 @@ def main():
     parser = argparse.ArgumentParser(description="MIRA Voice Assistant")
     parser.add_argument(
         "--stt-model",
-        default="tiny.en",
-        choices=["tiny.en", "base.en", "small.en"],
+        default="base.en",
+        choices=["tiny.en", "base.en", "small.en", "medium.en"],
         help="Whisper model size"
+    )
+    parser.add_argument(
+        "--stt-backend",
+        default="auto",
+        choices=["auto", "faster-whisper", "openai-whisper"],
+        help="STT backend. auto prefers faster-whisper and falls back to openai-whisper."
+    )
+    parser.add_argument(
+        "--stt-compute-type",
+        default="int8",
+        help="faster-whisper compute type: int8, int8_float16, float16, float32"
     )
     parser.add_argument(
         "--tts-voice",
@@ -185,7 +208,9 @@ def main():
     # Create and run voice agent
     voice_agent = VoiceAgent(
         stt_model=args.stt_model,
-        tts_voice=args.tts_voice
+        tts_voice=args.tts_voice,
+        stt_backend=args.stt_backend,
+        stt_compute_type=args.stt_compute_type,
     )
     
     if args.streaming:
