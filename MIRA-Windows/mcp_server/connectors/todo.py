@@ -32,12 +32,26 @@ def _get_db():
     return db
 
 
+def _normalize_priority(priority: str = "medium") -> str:
+    p = str(priority or "medium").strip().lower()
+    aliases = {
+        "urgent": "high",
+        "critical": "high",
+        "important": "high",
+        "normal": "medium",
+        "med": "medium",
+        "default": "medium",
+        "minor": "low",
+    }
+    return aliases.get(p, p)
+
+
 @register_tool(
     "todo.add",
     category="Todo List",
-    description="Add a new task to the persistent todo list",
+    description="Add one new task to the persistent todo list",
     example='{"tool": "todo.add", "args": {"title": "Follow up on application", "priority": "high", "due_date": "2026-02-01"}}',
-    notes="Priority can be 'low', 'medium', or 'high'."
+    notes="Adds one task. Priority is normalized case-insensitively to 'low', 'medium', or 'high'. Use todo.add_many for multiple tasks."
 )
 def add_task(title: str, description: str = "", priority: str = "medium", due_date: str = None) -> dict:
     """
@@ -53,6 +67,7 @@ def add_task(title: str, description: str = "", priority: str = "medium", due_da
         Dict with task ID and confirmation
     """
     try:
+        priority = _normalize_priority(priority)
         # Validate priority
         if priority not in ['low', 'medium', 'high']:
             return {"status": "error", "error": "Priority must be 'low', 'medium', or 'high'"}
@@ -78,6 +93,71 @@ def add_task(title: str, description: str = "", priority: str = "medium", due_da
         
     except Exception as e:
         return {"status": "error", "error": f"Failed to add task: {str(e)}"}
+
+
+@register_tool(
+    "todo.add_many",
+    category="Todo List",
+    description="Add multiple tasks to the persistent todo list in one call",
+    example='{"tool": "todo.add_many", "args": {"tasks": [{"title": "Set SMART goals", "priority": "high", "due_date": "2026-05-29"}, {"title": "List tasks", "priority": "medium"}]}}',
+    notes="Use for batch todo creation. Each task supports title, description, priority, and due_date. Priority is case-insensitive."
+)
+def add_many_tasks(tasks: list) -> dict:
+    """
+    Add multiple tasks atomically enough for agent workflows.
+
+    Args:
+        tasks: List of task dicts with title, description, priority, due_date.
+
+    Returns:
+        Dict with created task records and count.
+    """
+    if not isinstance(tasks, list) or not tasks:
+        return {"status": "error", "error": "tasks must be a non-empty list"}
+
+    clean = []
+    for idx, item in enumerate(tasks, start=1):
+        if not isinstance(item, dict):
+            return {"status": "error", "error": f"Task #{idx} must be an object"}
+        title = str(item.get("title") or "").strip()
+        if not title:
+            return {"status": "error", "error": f"Task #{idx} missing required title"}
+        priority = _normalize_priority(item.get("priority") or "medium")
+        if priority not in ['low', 'medium', 'high']:
+            return {"status": "error", "error": f"Task #{idx}: Priority must be 'low', 'medium', or 'high'"}
+        clean.append({
+            "title": title,
+            "description": str(item.get("description") or "").strip(),
+            "priority": priority,
+            "due_date": item.get("due_date") or None,
+        })
+
+    try:
+        db = _get_db()
+        created = []
+        for item in clean:
+            cursor = db.execute(
+                "INSERT INTO tasks (title, description, priority, due_date) VALUES (?, ?, ?, ?)",
+                (item["title"], item["description"], item["priority"], item["due_date"])
+            )
+            created.append({
+                "id": cursor.lastrowid,
+                "title": item["title"],
+                "priority": item["priority"],
+                "status": "pending",
+                "due_date": item["due_date"],
+            })
+        db.commit()
+        db.close()
+        print(f"[TODO] Added {len(created)} tasks")
+        return {
+            "status": "success",
+            "count": len(created),
+            "tasks": created,
+            "message": f"Added {len(created)} tasks successfully",
+        }
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to add tasks: {str(e)}"}
 
 
 @register_tool(
@@ -315,6 +395,7 @@ def update_task(id: int, title: str = None, description: str = None, priority: s
             updates.append("description = ?")
             params.append(description)
         if priority is not None:
+            priority = _normalize_priority(priority)
             if priority not in ['low', 'medium', 'high']:
                 db.close()
                 return {"status": "error", "error": "Priority must be 'low', 'medium', or 'high'"}

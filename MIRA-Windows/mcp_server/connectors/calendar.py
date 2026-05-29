@@ -115,6 +115,61 @@ def add_event(
     print(f"[CALENDAR] Added event #{rowid}: '{title}' at {start}")
     return {"id": rowid, "title": title, "start": start, "end": end}
 
+
+@register_tool(
+    "calendar.add_many",
+    category="Calendar",
+    description="Add multiple one-time calendar events in one call",
+    example='{"tool": "calendar.add_many", "args": {"events": [{"title": "Set SMART goals", "start": "2026-05-29T16:00:00+05:30", "end": "2026-05-29T17:00:00+05:30"}]}}'
+)
+def add_many_events(events: list, db_path: str = None, **kwargs):
+    """Add multiple one-time events to the calendar."""
+    if not isinstance(events, list) or not events:
+        return {"status": "error", "error": "events must be a non-empty list"}
+    if db_path is None:
+        db_path = _default_db_path()
+
+    clean = []
+    for idx, ev in enumerate(events, start=1):
+        if not isinstance(ev, dict):
+            return {"status": "error", "error": f"Event #{idx} must be an object"}
+        title = ev.get("title") or ev.get("summary")
+        start = ev.get("start")
+        end = ev.get("end") or start
+        if not title:
+            return {"status": "error", "error": f"Event #{idx} missing required title"}
+        if not start:
+            return {"status": "error", "error": f"Event #{idx} missing required start"}
+        clean.append({
+            "title": str(title).strip(),
+            "start": str(start).strip(),
+            "end": str(end).strip(),
+            "notification_message": ev.get("notification_message"),
+        })
+
+    conn = _connect_calendar_db(db_path)
+    c = conn.cursor()
+    created = []
+    for ev in clean:
+        c.execute(
+            '''INSERT INTO events (title, start, end, metadata, recurrence, enabled, notification_message)
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (
+                ev["title"],
+                ev["start"],
+                ev["end"],
+                json.dumps({}),
+                'none',
+                1,
+                ev["notification_message"] or f"Reminder: {ev['title']}"
+            )
+        )
+        created.append({"id": c.lastrowid, "title": ev["title"], "start": ev["start"], "end": ev["end"]})
+    conn.commit()
+    conn.close()
+    print(f"[CALENDAR] Added {len(created)} events")
+    return {"status": "success", "count": len(created), "events": created}
+
 @register_tool(
     "calendar.list_events",
     category="Calendar",

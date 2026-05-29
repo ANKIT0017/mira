@@ -95,10 +95,10 @@ _SIDE_EFFECT_PREFIXES = (
     "whatsapp.send",
     "email.send", "email.create_draft",
     "contacts.add", "contacts.update", "contacts.delete",
-    "calendar.add_event", "calendar.add_recurring_event",
+    "calendar.add_event", "calendar.add_many", "calendar.add_recurring_event",
     "calendar.delete_event", "calendar.clear", "calendar.toggle_event",
     "filesystem.write", "filesystem.append",
-    "todo.add", "todo.update", "todo.delete",
+    "todo.add", "todo.add_many", "todo.update", "todo.delete",
     "todo.complete", "todo.complete_all", "todo.clear",
     "knowledge.ingest",
     "memory.write",
@@ -422,6 +422,11 @@ _TOOL_POLICY_REGISTRY: tuple = (
     ("whatsapp.send",      _POLICY_SEND),
     ("email.send",         _POLICY_SEND),
     ("email.create_draft", _POLICY_SEND),
+    ("todo.add_many",      _POLICY_SEND),
+    ("todo.add",           _POLICY_SEND),
+    ("todo.update",        _POLICY_SEND),
+    ("todo.delete",        _POLICY_SEND),
+    ("calendar.add_many",  _POLICY_SEND),
     ("calendar.add_event", _POLICY_SEND),
     ("calendar.add_recurring_event", _POLICY_SEND),
     ("calendar.delete_event", _POLICY_SEND),
@@ -474,6 +479,18 @@ _NI_ERROR_PATTERNS: tuple = (
     r'record.*not found|no (task|event|todo).*found',
 )
 
+_RETRYABLE_ARG_ERROR_PATTERNS: tuple = (
+    r"priority must be",
+    r"invalid .*must be one of",
+    r"must be one of",
+    r"invalid recurrence",
+    r"invalid time format",
+    r"correct call format",
+    r"missing \d+ required positional argument",
+    r"unexpected keyword argument",
+    r"got an unexpected",
+)
+
 
 def _classify_tool_result(
     policy: ToolPolicy,
@@ -489,6 +506,9 @@ def _classify_tool_result(
     """
     if error:
         e = error.lower()
+        for pat in _RETRYABLE_ARG_ERROR_PATTERNS:
+            if re.search(pat, e):
+                return "retryable"
         for pat in _NI_ERROR_PATTERNS:
             if re.search(pat, e):
                 return "need_input"
@@ -1125,6 +1145,13 @@ class Agent:
 
         if tool_name == "todo.add":
             artifacts["todo_add_count"] = int(artifacts.get("todo_add_count", 0) or 0) + 1
+        if tool_name == "todo.add_many" and isinstance(tool_res, dict):
+            created = tool_res.get("tasks") or []
+            artifacts["todo_add_count"] = int(artifacts.get("todo_add_count", 0) or 0) + len(created)
+            slots["todo_list_updates"] = json.dumps(created, ensure_ascii=False, default=str)[:12000]
+        if tool_name == "calendar.add_many" and isinstance(tool_res, dict):
+            events = tool_res.get("events") or []
+            slots["calendar_schedule"] = json.dumps(events, ensure_ascii=False, default=str)[:12000]
 
         if tool_name == "email.create_draft" and isinstance(tool_res, dict):
             _draft_id = tool_res.get("draft_id") or tool_res.get("id") or tool_res.get("message_id")
@@ -1615,17 +1642,15 @@ class Agent:
             query_l = re.sub(r"\s+", " ", query.lower()).strip()
             task_l = re.sub(r"\s+", " ", task.lower()).strip()
             omitted_constraints = re.search(
-                r"\b(not opinions?|financials?|technical analysis|investors?|execution|business|fundamental)\b",
+                r"\b(not opinions?|confirm|verified|facts?|claims?|evidence|sources?|current|latest|"
+                r"financials?|technical analysis|investors?|execution|business|fundamental)\b",
                 task_l,
             ) and not re.search(
-                r"\b(not opinions?|financials?|technical analysis|investors?|execution|business|fundamental)\b",
+                r"\b(not opinions?|confirm|verified|facts?|claims?|evidence|sources?|current|latest|"
+                r"financials?|technical analysis|investors?|execution|business|fundamental)\b",
                 query_l,
             )
-            is_financial_research = re.search(
-                r"\b(stock|stocks|share|shares|invest|investment|sector|sectors|ticker|equity)\b",
-                task_l,
-            )
-            if task and omitted_constraints and is_financial_research:
+            if task and omitted_constraints:
                 return task
             return query
         step = str(getattr(self, "_current_step_desc", "") or "").strip()
@@ -1814,6 +1839,195 @@ class Agent:
             return self._nth_business_day_from_tomorrow(int(artifacts.get("todo_add_count", 0) or 0))
         return ""
 
+    def _normalize_priority_value(self, value: str | None) -> str:
+        p = str(value or "medium").strip().lower()
+        aliases = {
+            "urgent": "high",
+            "critical": "high",
+            "important": "high",
+            "normal": "medium",
+            "med": "medium",
+            "default": "medium",
+            "minor": "low",
+        }
+        return aliases.get(p, p)
+
+    def _normalize_due_date_value(self, value: str | None) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not raw:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return raw
+        today = datetime.now().date()
+        low = raw.lower()
+        if low == "today":
+            return today.isoformat()
+        if low == "tomorrow":
+            return (today + timedelta(days=1)).isoformat()
+        if re.search(r"\bend of (?:the )?week\b|eow|friday", low):
+            days = (4 - today.weekday()) % 7
+            return (today + timedelta(days=days)).isoformat()
+        weekdays = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        for name, idx in weekdays.items():
+            if re.search(rf"\b{name}\b", low):
+                days = (idx - today.weekday()) % 7
+                return (today + timedelta(days=days)).isoformat()
+        return raw
+
+    def _normalize_clock_time(self, text: str | None) -> str:
+        raw = str(text or "").strip().lower()
+        m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", raw)
+        if not m:
+            return ""
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        mer = m.group(3)
+        if mer == "pm" and hour < 12:
+            hour += 12
+        if mer == "am" and hour == 12:
+            hour = 0
+        if hour > 23 or minute > 59:
+            return ""
+        return f"{hour:02d}:{minute:02d}"
+
+    def _normalize_calendar_datetime_value(self, value: str | None, default_date: str | None = None) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not raw:
+            return ""
+        if re.match(r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}", raw):
+            return raw
+        date_part = self._normalize_due_date_value(raw) or default_date or datetime.now().date().isoformat()
+        time_part = self._normalize_clock_time(raw) or "16:00"
+        return f"{date_part}T{time_part}:00+05:30"
+
+    def _normalize_common_tool_args(self, tool_name: str, args: dict) -> dict:
+        args = dict(args or {})
+        if tool_name in {"todo.add", "todo.update"} and "priority" in args:
+            args["priority"] = self._normalize_priority_value(args.get("priority"))
+        if tool_name == "todo.add_many" and isinstance(args.get("tasks"), list):
+            tasks = []
+            for item in args.get("tasks") or []:
+                if not isinstance(item, dict):
+                    continue
+                clean = dict(item)
+                clean["priority"] = self._normalize_priority_value(clean.get("priority"))
+                if clean.get("due_date"):
+                    clean["due_date"] = self._normalize_due_date_value(clean.get("due_date"))
+                tasks.append(clean)
+            args["tasks"] = tasks
+        if tool_name in {"todo.add", "todo.update"} and args.get("due_date"):
+            args["due_date"] = self._normalize_due_date_value(args.get("due_date"))
+        if tool_name == "calendar.add_event":
+            start = self._normalize_calendar_datetime_value(args.get("start"))
+            if start:
+                args["start"] = start
+            if args.get("end"):
+                args["end"] = self._normalize_calendar_datetime_value(args.get("end"), start[:10] if start else None)
+            elif start:
+                args["end"] = start
+        if tool_name == "calendar.add_many" and isinstance(args.get("events"), list):
+            events = []
+            for ev in args.get("events") or []:
+                if not isinstance(ev, dict):
+                    continue
+                clean = dict(ev)
+                start = self._normalize_calendar_datetime_value(clean.get("start"))
+                if start:
+                    clean["start"] = start
+                    clean["end"] = self._normalize_calendar_datetime_value(clean.get("end"), start[:10]) if clean.get("end") else start
+                events.append(clean)
+            args["events"] = events
+        if tool_name == "calendar.add_recurring_event":
+            if args.get("recurrence"):
+                args["recurrence"] = str(args.get("recurrence")).strip().lower()
+            clock = self._normalize_clock_time(args.get("time"))
+            if clock:
+                args["time"] = clock
+        if tool_name == "whatsapp.send_media" and args.get("type"):
+            args["type"] = str(args.get("type")).strip().lower()
+        return args
+
+    def _task_source_text_for_batch(self) -> str:
+        slots = (self._working_state or {}).get("slots", {})
+        parts = []
+        for key in ("extracted_tasks", "todo_list_updates", "calendar_schedule_details", "message_body", "summary"):
+            val = str(slots.get(key) or "").strip()
+            if val:
+                parts.append(val)
+        for bid in sorted(getattr(self, "buffer", {}).keys(), reverse=True)[:5]:
+            buf = self.buffer.get(bid)
+            data = str((buf or {}).get("data") if isinstance(buf, dict) else buf or "").strip()
+            if data:
+                parts.append(data)
+        return "\n\n".join(parts)
+
+    def _parse_batch_tasks_from_text(self, text: str) -> list[dict]:
+        rows = []
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw or "|" not in raw:
+                continue
+            if re.search(r"\|\s*:?-{2,}:?\s*\|", raw) or re.search(r"\baction item\b.*\bpriority\b", raw, re.IGNORECASE):
+                continue
+            cells = [c.strip(" *`") for c in raw.strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            if re.fullmatch(r"#|\d+|[ivx]+", cells[0].strip().lower()):
+                cells = cells[1:]
+            title = cells[0].strip().rstrip(".")
+            if not title or len(title) < 3:
+                continue
+            priority = self._normalize_priority_value(cells[1] if len(cells) > 1 else "medium")
+            due = self._normalize_due_date_value(cells[2] if len(cells) > 2 else "")
+            desc = cells[3] if len(cells) > 3 else ""
+            rows.append({
+                "title": title,
+                "priority": priority if priority in {"low", "medium", "high"} else "medium",
+                "due_date": due or None,
+                "description": desc,
+            })
+        if rows:
+            return rows[:25]
+
+        # Fallback for numbered/bulleted lists.
+        for line in str(text or "").splitlines():
+            m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$", line)
+            if not m:
+                continue
+            title = re.sub(r"\s*\((?:high|medium|low).*$", "", m.group(1), flags=re.IGNORECASE).strip(" .")
+            if 4 <= len(title) <= 140 and not re.search(r"\b(calendar|summary|proposed weekly)\b", title, re.IGNORECASE):
+                rows.append({"title": title, "priority": "medium", "due_date": None, "description": ""})
+        return rows[:25]
+
+    def _availability_time_from_context(self) -> str:
+        for _, ans in sorted((getattr(self, "_input_answers", {}) or {}).items()):
+            t = self._normalize_clock_time(ans)
+            if t:
+                return t
+        return self._normalize_clock_time(getattr(self, "_current_task_text", "")) or "16:00"
+
+    def _build_calendar_events_for_tasks(self, tasks: list[dict]) -> list[dict]:
+        if not tasks:
+            return []
+        clock = self._availability_time_from_context()
+        start_day = datetime.now().date()
+        events = []
+        for idx, task in enumerate(tasks[:12]):
+            day = start_day + timedelta(days=idx)
+            start = f"{day.isoformat()}T{clock}:00+05:30"
+            hh, mm = [int(x) for x in clock.split(":", 1)]
+            end_dt = datetime(day.year, day.month, day.day, hh, mm) + timedelta(hours=1)
+            end = end_dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+            events.append({
+                "title": str(task.get("title") or f"Work block {idx + 1}").strip(),
+                "start": start,
+                "end": end,
+            })
+        return events
+
     def _research_select_sources(self, plan: dict, search_payload: dict, max_sources: int = 5) -> list[dict]:
         preferred = [str(d).lower() for d in plan.get("preferred_domains", [])]
         query_terms = {
@@ -1904,31 +2118,192 @@ class Agent:
         except Exception:
             return []
 
-    def _research_extract_facts(self, query: str, plan: dict, pages: list[dict]) -> list[dict]:
+    def _research_contract(self, query: str, plan: dict | None = None) -> dict:
+        """Infer a compact, domain-neutral answer contract for research tasks."""
+        q = re.sub(r"\s+", " ", str(query or "")).strip()
+        q_l = q.lower()
+
+        def number_from_text(default: int) -> int:
+            words = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            }
+            m = re.search(r"\b(?:top|best|first|at least|minimum|min)?\s*(\d{1,2})\b", q_l)
+            if m:
+                return max(1, min(int(m.group(1)), 12))
+            for word, val in words.items():
+                if re.search(rf"\b(?:top|best|first|at least|minimum|min)?\s*{word}\b", q_l):
+                    return val
+            return default
+
+        if re.search(r"\b(compare|comparison|versus|vs\.?|which is better|rank)\b", q_l):
+            intent = "compare_items"
+            answer_unit = "item"
+            default_count = 2
+            required_fields = ["name", "comparison", "source"]
+        elif re.search(r"\b(best|top|recommend|recommendation|suggest|pick|choose|shortlist)\b", q_l):
+            intent = "recommend_items"
+            answer_unit = "item"
+            default_count = 5
+            required_fields = ["name", "reason", "source"]
+        elif re.search(r"\b(summarize|summarise|summary|explain|overview|brief)\b", q_l):
+            intent = "summarize"
+            answer_unit = "summary"
+            default_count = 1
+            required_fields = ["subject", "summary", "source"]
+        elif re.search(r"\b(confirm|verify|validated?|facts?|claims?|evidence|not opinions?)\b", q_l):
+            intent = "verify_claims"
+            answer_unit = "claim"
+            default_count = 3
+            required_fields = ["claim", "source"]
+        else:
+            intent = "find_facts"
+            answer_unit = "fact"
+            default_count = 3
+            required_fields = ["fact", "source"]
+
+        if re.search(r"\b(latest|current|today|this week|this month|this quarter|recent|202\d)\b", q_l):
+            required_fields = list(dict.fromkeys([*required_fields, "date_or_current_context"]))
+
+        min_items = number_from_text(default_count)
+        if intent in {"summarize", "find_facts"} and not re.search(r"\b(top|best|list|recommend|several|multiple|\d)\b", q_l):
+            min_items = 1
+
+        return {
+            "intent": intent,
+            "answer_unit": answer_unit,
+            "min_items": min_items,
+            "required_fields": required_fields,
+            "success_criteria": [
+                "Each answer candidate directly answers the user request.",
+                "Return concrete answer units, not just pages or places to look.",
+                "Each important answer candidate includes source support when available.",
+                "If enough concrete answer candidates are not found, report gaps instead of pretending.",
+            ],
+            "avoid": [
+                "source-only results",
+                "navigation text",
+                "generic category pages",
+                "article/list page titles used as final answers",
+                "unsupported claims",
+            ],
+        }
+
+    def _research_fact_text(self, fact: dict) -> str:
+        if not isinstance(fact, dict):
+            return ""
+        return " ".join(
+            re.sub(r"\s+", " ", str(v or "")).strip()
+            for v in fact.values()
+            if not isinstance(v, (dict, list))
+        ).strip()
+
+    def _research_primary_name(self, fact: dict) -> str:
+        if not isinstance(fact, dict):
+            return ""
+        for key in (
+            "name", "title", "item", "item/title", "tool", "product", "company",
+            "person", "ticker", "book", "movie", "paper", "subject", "claim",
+            "finding", "fact", "rule",
+        ):
+            val = str(fact.get(key) or "").strip()
+            if val:
+                return re.sub(r"\s+", " ", val)
+        return ""
+
+    def _research_has_supporting_detail(self, fact: dict, contract: dict) -> bool:
+        if not isinstance(fact, dict):
+            return False
+        detail_keys = {
+            "reason", "why", "why it matches", "summary", "short summary",
+            "description", "category", "genre/category", "comparison",
+            "comparison_points", "pros", "cons", "evidence", "date",
+            "date if available", "release date/year",
+        }
+        if contract.get("intent") not in {"recommend_items", "compare_items"}:
+            detail_keys.update({"finding", "fact", "claim", "rule"})
+        for key, val in fact.items():
+            if str(key).strip().lower() in detail_keys and str(val or "").strip():
+                return True
+        if contract.get("intent") in {"recommend_items", "compare_items"}:
+            return False
+        text = self._research_fact_text(fact)
+        return len(text) >= 80
+
+    def _research_is_source_lead(self, fact: dict, contract: dict) -> bool:
+        if not isinstance(fact, dict):
+            return True
+        label = str(fact.get("candidate_type") or fact.get("type") or "").lower()
+        if "source_lead" in label:
+            return True
+        name = self._research_primary_name(fact).lower()
+        source = str(fact.get("source") or "").strip().lower()
+        text = self._research_fact_text(fact).lower()
+        listish = bool(re.search(
+            r"\b(best|top|list|lists|guide|roundup|recommendations?|shelf|browse|"
+            r"articles?|home|category|categories|publisher|bookseller|search results?)\b",
+            name,
+        ))
+        no_detail = not self._research_has_supporting_detail(fact, contract)
+        same_as_source = bool(name and source and (name == source or name in source or source in name))
+        if listish and (no_detail or same_as_source):
+            return True
+        if not name and re.search(r"\b(available from|lists? of|sources?|look at|browse)\b", text):
+            return True
+        return False
+
+    def _research_candidate_grade(self, fact: dict, contract: dict) -> str:
+        if not isinstance(fact, dict):
+            return "source_lead"
+        explicit = str(fact.get("candidate_type") or fact.get("answer_type") or "").strip().lower()
+        if explicit in {"answer_candidate", "supporting_evidence", "source_lead"}:
+            if explicit == "answer_candidate" and self._research_is_source_lead(fact, contract):
+                return "source_lead"
+            return explicit
+        name = self._research_primary_name(fact)
+        has_source = bool(str(fact.get("source") or fact.get("url") or "").strip())
+        has_detail = self._research_has_supporting_detail(fact, contract)
+        if self._research_is_source_lead(fact, contract):
+            return "source_lead"
+        if contract.get("intent") in {"recommend_items", "compare_items"}:
+            return "answer_candidate" if name and has_detail else "supporting_evidence"
+        if contract.get("intent") in {"verify_claims", "find_facts"}:
+            return "answer_candidate" if (name or has_detail) and has_source else "supporting_evidence"
+        if contract.get("intent") == "summarize":
+            return "answer_candidate" if has_detail else "supporting_evidence"
+        return "answer_candidate" if (name or has_detail) else "source_lead"
+
+    def _research_annotate_facts(self, facts: list[dict], contract: dict) -> list[dict]:
+        annotated = []
+        for fact in facts or []:
+            if not isinstance(fact, dict):
+                continue
+            item = dict(fact)
+            item["candidate_type"] = self._research_candidate_grade(item, contract)
+            item["direct_answer"] = item["candidate_type"] == "answer_candidate"
+            annotated.append(item)
+        return annotated
+
+    def _research_extract_facts(self, query: str, plan: dict, pages: list[dict], contract: dict | None = None) -> list[dict]:
         if not pages:
             return []
-        finance_research = bool(re.search(
-            r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis)\b",
-            str(query or "").lower(),
-        ))
+        contract = contract or self._research_contract(query, plan)
         source_text = []
         for idx, page in enumerate(pages[:6], start=1):
             source_text.append(
                 f"SOURCE {idx}\nTitle: {page.get('title','')}\nURL: {page.get('url','')}\n"
                 f"Content:\n{str(page.get('content',''))[:1800]}"
             )
-        finance_rule = (
-            "For stock research, extract ticker-level evidence only. Each useful object should identify a ticker/company and at least one concrete business, execution, investor/ownership, financial, or technical-analysis fact. "
-            "Reject opinion-only stock picks and sector-only claims unless they connect to a named company.\n"
-            if finance_research else ""
-        )
         prompt = (
-            "Extract only the facts needed for the user's research request. Remove ads, navigation, duplicate noise, and unrelated items.\n"
-            f"{finance_rule}"
+            "Extract only information needed to satisfy the user's research request. "
+            "Classify every object as answer_candidate, supporting_evidence, or source_lead. "
+            "answer_candidate must directly answer the request; source_lead is only a page/place to inspect. "
+            "Remove ads, navigation, duplicate noise, and unrelated items.\n"
             f"User request: {query}\n"
+            f"Answer contract: {json.dumps(contract, ensure_ascii=False)}\n"
             f"Where to look: {json.dumps(plan.get('where_to_look', []), ensure_ascii=False)}\n"
             f"Extraction schema: {json.dumps(plan.get('extraction_schema', []), ensure_ascii=False)}\n"
-            "Return JSON only: an array of objects. Each object must include source and url when available.\n\n"
+            "Return JSON only: an array of objects. Each object must include candidate_type, source, and url when available.\n\n"
             + "\n\n".join(source_text)
         )
         facts = []
@@ -1947,7 +2322,7 @@ class Agent:
                 if key and key not in seen:
                     seen.add(key)
                     clean.append(item)
-            return clean
+            return self._research_annotate_facts(clean, contract)
         # Deterministic fallback: keep source-level evidence if LLM extraction fails.
         for page in pages[:8]:
             summary = re.sub(r"\s+", " ", str(page.get("content") or page.get("snippet") or "")).strip()[:360]
@@ -1956,31 +2331,51 @@ class Agent:
                     "claim": summary,
                     "source": page.get("title", ""),
                     "url": page.get("url", ""),
+                    "candidate_type": "source_lead",
+                    "direct_answer": False,
                 })
-        return facts
+        return self._research_annotate_facts(facts, contract)
 
-    def _research_synthesize(self, query: str, plan: dict, facts: list[dict]) -> str:
+    def _research_synthesize(self, query: str, plan: dict, facts: list[dict], contract: dict | None = None, adequacy_gaps: list[str] | None = None) -> str:
         if not facts:
             return "I could not extract reliable facts from the available research sources."
-        finance_research = bool(re.search(
-            r"\b(stock|stocks|invest|investment|investing|ticker|equity|share|shares|financials?|technical analysis)\b",
-            str(query or "").lower(),
-        ))
-        finance_rule = (
-            "For stock-investment research, do not present sectors, themes, or opinion-list mentions as final stock picks. "
-            "Only rank named companies/tickers that have extracted evidence for business/execution, financials, investors/ownership, and technical trend. "
-            "If the facts do not contain enough ticker-level evidence, state that clearly and list what evidence is missing instead of inventing recommendations. "
-            "Avoid financial-advice language; present this as research, not a guarantee.\n"
-            if finance_research else ""
-        )
+        contract = contract or self._research_contract(query, plan)
+        answer_facts = [f for f in facts if isinstance(f, dict) and f.get("candidate_type") == "answer_candidate"]
+        supporting = [f for f in facts if isinstance(f, dict) and f.get("candidate_type") != "answer_candidate"]
+        if not answer_facts and adequacy_gaps:
+            leads = []
+            for fact in supporting[:5]:
+                title = self._research_primary_name(fact) or str(fact.get("source") or "Source lead").strip()
+                url = str(fact.get("url") or "").strip()
+                if title:
+                    leads.append(f"- {title}" + (f" ({url})" if url else ""))
+            msg = (
+                "I found research sources, but not enough direct answer candidates for the request yet.\n"
+                "Missing: " + "; ".join(str(g) for g in adequacy_gaps[:4]) + "."
+            )
+            if leads:
+                msg += "\nUseful leads found:\n" + "\n".join(leads)
+            return msg[:1800]
+        synthesis_facts = answer_facts if answer_facts else facts
+        gap_note = ""
+        if adequacy_gaps:
+            gap_note = (
+                "Known gaps remain: "
+                + "; ".join(str(g) for g in adequacy_gaps[:4])
+                + ". If gaps prevent a complete answer, say so plainly.\n"
+            )
         prompt = (
             "Write the final answer using only the extracted research facts below. "
             "Be concise, concrete, and do not mention internal buffers or tool steps. "
-            "If the request asks to summarize items, summarize each item separately. "
+            "Use answer_candidate facts as the answer. Use supporting_evidence only to explain or cite. "
+            "Never present source_lead/page titles as final answer items. "
+            "If the request asks to summarize or recommend items, handle each answer item separately. "
             "Include source names/URLs briefly when useful.\n\n"
-            f"{finance_rule}"
             f"User request: {query}\n"
-            f"Facts:\n{json.dumps(facts[:25], ensure_ascii=False, indent=2)}"
+            f"Answer contract: {json.dumps(contract, ensure_ascii=False)}\n"
+            f"{gap_note}"
+            f"Answer facts:\n{json.dumps(synthesis_facts[:25], ensure_ascii=False, indent=2)}\n"
+            f"Supporting facts:\n{json.dumps(supporting[:10], ensure_ascii=False, indent=2)}"
         )
         try:
             ans = generate(prompt, model=getattr(self, "_exec_model", "local"), max_tokens=1800, timeout=180, temperature=0.1)
@@ -1997,56 +2392,79 @@ class Agent:
             lines.append(f"{idx}. {title}: {str(detail)[:240]}" + (f" Source: {src}" if src else ""))
         return "\n".join(lines)
 
-    def _research_adequacy_gaps(self, query: str, facts: list[dict]) -> list[str]:
-        """Return missing evidence areas that should trigger follow-up research."""
+    def _research_adequacy_gaps(self, query: str, facts: list[dict], contract: dict | None = None) -> list[str]:
+        """Return generic answer-contract gaps that should trigger follow-up research."""
+        contract = contract or self._research_contract(query, {})
         q_l = str(query or "").lower()
-        hay = json.dumps(facts or [], ensure_ascii=False, default=str).lower()
         gaps: list[str] = []
+        answer_candidates = [
+            f for f in (facts or [])
+            if isinstance(f, dict) and f.get("candidate_type") == "answer_candidate"
+        ]
+        source_leads = [
+            f for f in (facts or [])
+            if isinstance(f, dict) and f.get("candidate_type") == "source_lead"
+        ]
         unique_sources = {
             str(f.get("url") or f.get("source") or "").strip().lower()
-            for f in (facts or [])
+            for f in answer_candidates
             if isinstance(f, dict) and str(f.get("url") or f.get("source") or "").strip()
         }
         wants_verified = bool(re.search(r"\b(confirm|verified|facts?|claim|claims?|not opinions?|source|sources|evidence)\b", q_l))
-        wants_investment = bool(re.search(r"\b(stock|stocks|share|shares|ticker|invest|investment|equity)\b", q_l))
-        wants_sector = bool(re.search(r"\bsector|sectors|industry|industries\b", q_l))
+        min_items = max(1, int(contract.get("min_items") or 1))
+        if not answer_candidates and source_leads:
+            gaps.append("direct answer candidates, not just source pages")
+        if len(answer_candidates) < min_items:
+            gaps.append(f"at least {min_items} direct answer candidates")
+
+        required = [str(x).strip().lower() for x in contract.get("required_fields", []) if str(x).strip()]
+        missing_required: set[str] = set()
+        for fact in answer_candidates:
+            text = self._research_fact_text(fact).lower()
+            name = self._research_primary_name(fact)
+            has_source = bool(str(fact.get("source") or fact.get("url") or "").strip())
+            for req in required:
+                ok = True
+                if req in {"name", "subject"}:
+                    ok = bool(name)
+                elif req in {"source", "official source"}:
+                    ok = has_source
+                elif req in {"reason", "comparison", "summary", "claim", "fact"}:
+                    ok = self._research_has_supporting_detail(fact, contract)
+                elif req == "date_or_current_context":
+                    ok = bool(re.search(r"\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|today|current|latest|recent|quarter)\b", text))
+                else:
+                    ok = req in text or bool(str(fact.get(req) or "").strip())
+                if not ok:
+                    missing_required.add(req)
+        if answer_candidates and missing_required:
+            gaps.append("missing required fields: " + ", ".join(sorted(missing_required)[:4]))
+
         if wants_verified and len(unique_sources) < 2:
             gaps.append("multiple independent or primary sources")
-        if wants_sector and not re.search(
-            r"\b(manufacturing|services|construction|infrastructure|banking|financial|it|technology|"
-            r"pharma|healthcare|energy|power|capital goods|automobile|auto|telecom|cement|defence|"
-            r"consumer|fmcg|real estate|sectoral|gva)\b",
-            hay,
-        ):
-            gaps.append("sector-level growth evidence")
-        if wants_investment and not re.search(r"\b(ticker|nse|bse|listed|company|companies|stock|share)\b", hay):
-            gaps.append("named listed companies or tickers")
-        if wants_investment and re.search(r"\bfinancials?|investors?|ownership|technical analysis|technical\b", q_l):
-            if not re.search(r"\b(revenue|profit|earnings|cash flow|debt|margin|roe|roce|eps)\b", hay):
-                gaps.append("company financial facts")
-            if not re.search(r"\b(promoter|institutional|mutual fund|fii|dii|ownership|shareholding|investor)\b", hay):
-                gaps.append("investor or ownership facts")
-            if not re.search(r"\b(price|trend|support|resistance|volume|moving average|rsi|technical)\b", hay):
-                gaps.append("technical trend facts")
-        if wants_investment and len(facts or []) < 6:
-            gaps.append("enough extracted facts for comparison")
+        if facts and not answer_candidates and not source_leads:
+            gaps.append("facts classified against the answer contract")
         return list(dict.fromkeys(gaps))
 
-    def _research_followup_queries(self, query: str, gaps: list[str]) -> list[str]:
-        """Build targeted follow-up queries for missing research evidence."""
+    def _research_followup_queries(self, query: str, gaps: list[str], contract: dict | None = None) -> list[str]:
+        """Build targeted follow-up queries from generic contract gaps."""
         q = re.sub(r"\s+", " ", str(query or "")).strip()
-        q_l = q.lower()
+        contract = contract or self._research_contract(q, {})
         out: list[str] = []
-        if "sector-level growth evidence" in gaps:
-            out.append(f"{q} India latest quarter sectoral GVA growth official RBI MOSPI")
-        if "named listed companies or tickers" in gaps:
-            out.append(f"{q} Indian listed companies NSE BSE tickers by growth sectors")
-        if any(g in gaps for g in ("company financial facts", "investor or ownership facts", "technical trend facts")):
-            out.append(f"{q} company financials shareholding technical trend NSE BSE")
-        if "multiple independent or primary sources" in gaps:
-            out.append(f"{q} Reuters RBI MOSPI NSE official data")
-        if not out and re.search(r"\b(stock|stocks|invest|investment|sector|sectors)\b", q_l):
-            out.append(f"{q} verified facts sources")
+        req = " ".join(str(x) for x in contract.get("required_fields", [])[:4])
+        unit = str(contract.get("answer_unit") or "answer").strip()
+        intent = str(contract.get("intent") or "").strip()
+        if any("direct answer candidates" in g or "not just source pages" in g for g in gaps):
+            out.append(f"{q} concrete {unit} names details")
+            out.append(f"{q} examples with {req}".strip())
+        if any("missing required fields" in g for g in gaps):
+            out.append(f"{q} {req}".strip())
+        if any("multiple independent" in g for g in gaps):
+            out.append(f"{q} reliable sources evidence")
+        if any("at least" in g for g in gaps):
+            out.append(f"{q} list of {unit}s with sources")
+        if not out:
+            out.append(f"{q} {intent} {unit} evidence".strip())
         return list(dict.fromkeys(out))[:3]
 
     def _dedupe_research_facts(self, facts: list[dict]) -> list[dict]:
@@ -2057,7 +2475,14 @@ class Agent:
                 continue
             key = (
                 str(fact.get("url") or "").strip().lower(),
-                str(fact.get("claim") or fact.get("summary") or fact.get("ticker") or fact.get("company") or "").strip().lower()[:220],
+                str(
+                    self._research_primary_name(fact)
+                    or fact.get("claim")
+                    or fact.get("summary")
+                    or fact.get("fact")
+                    or fact.get("finding")
+                    or ""
+                ).strip().lower()[:220],
             )
             if key in seen:
                 continue
@@ -2071,9 +2496,11 @@ class Agent:
             return {"status": "error", "error": "research tool requires query/topic/task."}
         max_queries = int((args or {}).get("max_queries") or 5)
         max_sources = int((args or {}).get("max_sources") or 5)
+        max_rounds = max(1, min(int((args or {}).get("max_rounds") or 2), 4))
         plan = self._research_plan(query, max_queries=max_queries)
+        contract = self._research_contract(query, plan)
         if tool_name == "research.plan":
-            return {"status": "success", **plan}
+            return {"status": "success", **plan, "answer_contract": contract}
         searches = self._research_search_many(plan, max_results=int((args or {}).get("max_results") or 5))
         if tool_name == "research.search_many":
             status = "success" if searches.get("count", 0) else "error"
@@ -2090,30 +2517,43 @@ class Agent:
             if not pages:
                 return {"status": "error", "error": "No research sources could be read.", "plan": plan, "sources": selected}
             return {"status": "success", "plan": plan, "sources": selected, "pages": pages, "page_count": len(pages)}
-        facts = self._research_extract_facts(query, plan, pages)
-        adequacy_gaps = self._research_adequacy_gaps(query, facts)
-        followup_queries = self._research_followup_queries(query, adequacy_gaps)
+        facts = self._research_extract_facts(query, plan, pages, contract)
+        adequacy_gaps = self._research_adequacy_gaps(query, facts, contract)
+        followup_queries = self._research_followup_queries(query, adequacy_gaps, contract)
         extra_sources = []
         if tool_name in ("research.run", "research.extract_facts") and followup_queries:
-            for followup_query in followup_queries:
+            seen_followups = set()
+            for _round in range(max_rounds):
                 if not adequacy_gaps:
                     break
-                fplan = self._research_plan(followup_query, max_queries=max_queries)
-                fsearches = self._research_search_many(fplan, max_results=int((args or {}).get("max_results") or 5))
-                fselected = self._research_select_sources(fplan, fsearches, max_sources=max(3, min(max_sources, 6)))
-                fpages = self._research_read_sources(fselected)
-                ffacts = self._research_extract_facts(query, fplan, fpages)
-                if ffacts:
-                    facts = self._dedupe_research_facts([*facts, *ffacts])
-                    selected = [*selected, *fselected]
-                    extra_sources.extend(fselected)
-                    adequacy_gaps = self._research_adequacy_gaps(query, facts)
+                followup_queries = [
+                    fq for fq in self._research_followup_queries(query, adequacy_gaps, contract)
+                    if fq.lower() not in seen_followups
+                ]
+                if not followup_queries:
+                    break
+                for followup_query in followup_queries:
+                    if not adequacy_gaps:
+                        break
+                    seen_followups.add(followup_query.lower())
+                    fplan = self._research_plan(followup_query, max_queries=max_queries)
+                    fsearches = self._research_search_many(fplan, max_results=int((args or {}).get("max_results") or 5))
+                    fselected = self._research_select_sources(fplan, fsearches, max_sources=max(3, min(max_sources, 6)))
+                    fpages = self._research_read_sources(fselected)
+                    ffacts = self._research_extract_facts(query, fplan, fpages, contract)
+                    if ffacts:
+                        facts = self._dedupe_research_facts([*facts, *ffacts])
+                        facts = self._research_annotate_facts(facts, contract)
+                        selected = [*selected, *fselected]
+                        extra_sources.extend(fselected)
+                        adequacy_gaps = self._research_adequacy_gaps(query, facts, contract)
         if tool_name == "research.extract_facts":
             if not facts:
                 return {"status": "error", "error": "No useful facts could be extracted from research sources.", "plan": plan, "sources": selected}
             return {
                 "status": "success",
                 "plan": plan,
+                "answer_contract": contract,
                 "sources": selected,
                 "facts": facts,
                 "fact_count": len(facts),
@@ -2129,10 +2569,11 @@ class Agent:
             return {"status": "error", "error": "No useful research sources were found.", "plan": plan, "search": searches}
         if not facts:
             return {"status": "error", "error": "No useful facts could be extracted from research sources.", "plan": plan, "sources": selected}
-        answer = self._research_synthesize(query, plan, facts)
+        answer = self._research_synthesize(query, plan, facts, contract, adequacy_gaps)
         return {
             "status": "success",
             "query": query,
+            "answer_contract": contract,
             "where_to_look": plan.get("where_to_look", []),
             "queries": plan.get("queries", []),
             "sources": [
@@ -2411,7 +2852,22 @@ class Agent:
                 return val[:1800]
 
         raw = ""
-        for key in ("search_results", "results", "retrieved_results", "web_results"):
+        dynamic_slots = [
+            str(s or "").strip().lower()
+            for s in getattr(self, "_current_step_inputs", []) or []
+            if str(s or "").strip()
+        ]
+        for key in (
+            "research_answer",
+            "book_recommendations",
+            "recommendations",
+            "summary",
+            "search_results",
+            "results",
+            "retrieved_results",
+            "web_results",
+            *dynamic_slots,
+        ):
             val = str(slots.get(key) or "").strip()
             if val:
                 raw = val
@@ -2422,7 +2878,7 @@ class Agent:
                 if not isinstance(buf, dict):
                     continue
                 tool = str(buf.get("tool") or "")
-                if not tool.startswith(("search.", "firecrawl.")):
+                if not tool.startswith(("search.", "firecrawl.", "research.")):
                     continue
                 val = str(buf.get("data") or "").strip()
                 if val:
@@ -2445,7 +2901,11 @@ class Agent:
             )
             composed = str(generate(prompt, temperature=0.1, max_tokens=350) or "").strip()
             composed = self._sanitize_delivery_message(composed)
-            if composed and not self._looks_like_raw_retrieval_payload(composed):
+            if (
+                composed
+                and not composed.lower().startswith(("[error", "error running", "traceback"))
+                and not self._looks_like_raw_retrieval_payload(composed)
+            ):
                 slots["message_body"] = composed[:1800]
                 return slots["message_body"]
         except Exception as e:
@@ -2483,7 +2943,7 @@ class Agent:
                 break
 
         if usable:
-            lines = ["Here are some 2026 fiction/drama reading leads I found:"]
+            lines = ["Here are some fiction and romance reading leads I found:"]
             lines.extend(f"{idx}. {title}" for idx, title in enumerate(usable, start=1))
             msg = "\n".join(lines)
         else:
@@ -2496,7 +2956,7 @@ class Agent:
                     break
             if not compact:
                 return ""
-            msg = "Here are the 2026 fiction/drama recommendations I found:\n" + "\n".join(
+            msg = "Here are the fiction and romance recommendations I found:\n" + "\n".join(
                 f"- {s}" for s in compact
             )
 
@@ -2990,8 +3450,10 @@ class Agent:
             ("Filesystem", r"\b(list|show files|directory)\b", "filesystem.list"),
             ("Email", r"\bsend\b", "email.send"),
             ("Email", r"\b(list|read|inbox|fetch)\b", "email.list"),
+            ("Calendar", r"\b(all|multiple|several|each|every|blocks?|tasks?|\d+\s+).*\b(add|create|schedule)|\b(add|create|schedule).*\b(all|multiple|several|each|every|blocks?|tasks?|\d+\s+)", "calendar.add_many"),
             ("Calendar", r"\b(add|create|schedule)\b", "calendar.add_event"),
             ("Calendar", r"\b(list|show|upcoming)\b", "calendar.list_events"),
+            ("Todo List", r"\b(all|multiple|several|each|every|\d+\s+).*\b(add|create)|\b(add|create).*\b(all|multiple|several|each|every|\d+\s+)", "todo.add_many"),
             ("Todo List", r"\b(add|create)\b", "todo.add"),
             ("Todo List", r"\b(list|show)\b", "todo.list"),
             ("Contacts", r"\b(find|lookup|search|get)\b", "contacts.search"),
@@ -5338,7 +5800,12 @@ class Agent:
         predicted = self._predict_step_tools(step_desc, list(cats))
 
         planned_action = (planned_action or "").strip()
-        if planned_action in self.tools:
+        _batch_step = bool(re.search(r"\b(all|multiple|several|each|every|\d+\s+|extracted|identified|listed|blocks?|tasks?)\b", step_desc, re.IGNORECASE))
+        if planned_action == "todo.add" and _batch_step and "todo.add_many" in self.tools:
+            predicted = ["todo.add_many", "todo.add"] + [p for p in predicted if p not in {"todo.add_many", "todo.add"}]
+        elif planned_action == "calendar.add_event" and _batch_step and "calendar.add_many" in self.tools:
+            predicted = ["calendar.add_many", "calendar.add_event"] + [p for p in predicted if p not in {"calendar.add_many", "calendar.add_event"}]
+        elif planned_action in self.tools:
             predicted = [planned_action] + [p for p in predicted if p != planned_action]
         elif _is_verify_action:
             verify_bias = [
@@ -6486,6 +6953,152 @@ class Agent:
                 }
                 continue
 
+            # Deterministic batch todo/calendar creation. This avoids asking a small
+            # model to emit many side-effect calls or to remember exact schemas.
+            _batch_like_step = bool(re.search(
+                r"\b(all|multiple|several|each|every|extracted|identified|listed|blocks?|tasks?)\b",
+                step_desc,
+                re.IGNORECASE,
+            ))
+            if _batch_like_step and step_action in ("todo.add", "todo.add_many"):
+                _tasks = self._parse_batch_tasks_from_text(self._task_source_text_for_batch())
+                if len(_tasks) >= 2 and "todo.add_many" in self.tools:
+                    tool_name = "todo.add_many"
+                    tool_args = {"tasks": _tasks}
+                    _step_tool = tool_name
+                    yield {"type": "tool_call", "tool": tool_name, "args": tool_args, "step": i + 1}
+                    print(f"[STREAM][TOOL CALL] {tool_name}")
+                    print(f"[STREAM][TOOL ARGS] {json.dumps(tool_args, indent=2, default=str)[:2000]}")
+                    result = await asyncio.to_thread(self._safe_execute, tool_name, tool_args)
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        observation = f"Error: {result.get('error', 'unknown error')}"
+                        _step_had_error = True
+                        last_error = result.get("error", "unknown error")
+                        step_result = observation
+                        step_status = "failed"
+                        yield {"type": "tool_result", "tool": tool_name, "result": observation, "status": "error", "step": i + 1}
+                        self._context_compiler.metrics.record_tool_call(tool_name, success=False)
+                        self._context_compiler.metrics.end_step(i, success=False)
+                        completed.append({
+                            "step": step_desc,
+                            "status": step_status,
+                            "result": step_result,
+                            "tool": tool_name,
+                            "calls": _step_calls,
+                            "artifacts": _step_artifacts,
+                            "categories": step_categories,
+                            "raw_payload": json.dumps(result, default=str),
+                        })
+                        continue
+                    tool_res = result.get("result", result) if isinstance(result, dict) else result
+                    self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
+                    raw_obs = json.dumps(tool_res, indent=2, default=str)
+                    _step_raw_payload = raw_obs[:12000]
+                    yield {"type": "tool_result", "tool": tool_name, "result": raw_obs, "status": "ok", "step": i + 1}
+                    step_result = self._compress_obs(raw_obs, tool_name)
+                    self._store_declared_outputs(
+                        step_outputs or ["todo_list_updates"],
+                        tool_name,
+                        tool_res,
+                        raw_obs,
+                        step_result,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
+                    _step_success_calls += 1
+                    step_status = "done"
+                    _step_calls.append({
+                        "tool": tool_name,
+                        "status": "ok",
+                        "summary": step_result[:180],
+                        "args": json.dumps({"count": len(_tasks)}, default=str),
+                    })
+                    _step_actions.append(f"{tool_name} -> {step_result[:120]}")
+                    self._context_compiler.metrics.record_tool_call(tool_name, success=True)
+                    self._context_compiler.metrics.end_step(i, success=True)
+                    completed.append({
+                        "step": step_desc,
+                        "status": step_status,
+                        "result": step_result,
+                        "tool": tool_name,
+                        "calls": _step_calls,
+                        "artifacts": _step_artifacts,
+                        "categories": step_categories,
+                        "raw_payload": _step_raw_payload,
+                    })
+                    continue
+
+            if _batch_like_step and step_action in ("calendar.add_event", "calendar.add_many"):
+                _tasks = self._parse_batch_tasks_from_text(self._task_source_text_for_batch())
+                _events = self._build_calendar_events_for_tasks(_tasks)
+                if len(_events) >= 2 and "calendar.add_many" in self.tools:
+                    tool_name = "calendar.add_many"
+                    tool_args = {"events": _events}
+                    _step_tool = tool_name
+                    yield {"type": "tool_call", "tool": tool_name, "args": tool_args, "step": i + 1}
+                    print(f"[STREAM][TOOL CALL] {tool_name}")
+                    print(f"[STREAM][TOOL ARGS] {json.dumps(tool_args, indent=2, default=str)[:2000]}")
+                    result = await asyncio.to_thread(self._safe_execute, tool_name, tool_args)
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        observation = f"Error: {result.get('error', 'unknown error')}"
+                        _step_had_error = True
+                        last_error = result.get("error", "unknown error")
+                        step_result = observation
+                        step_status = "failed"
+                        yield {"type": "tool_result", "tool": tool_name, "result": observation, "status": "error", "step": i + 1}
+                        self._context_compiler.metrics.record_tool_call(tool_name, success=False)
+                        self._context_compiler.metrics.end_step(i, success=False)
+                        completed.append({
+                            "step": step_desc,
+                            "status": step_status,
+                            "result": step_result,
+                            "tool": tool_name,
+                            "calls": _step_calls,
+                            "artifacts": _step_artifacts,
+                            "categories": step_categories,
+                            "raw_payload": json.dumps(result, default=str),
+                        })
+                        continue
+                    tool_res = result.get("result", result) if isinstance(result, dict) else result
+                    self._update_working_state_from_tool_result(tool_name, tool_args, tool_res)
+                    raw_obs = json.dumps(tool_res, indent=2, default=str)
+                    _step_raw_payload = raw_obs[:12000]
+                    yield {"type": "tool_result", "tool": tool_name, "result": raw_obs, "status": "ok", "step": i + 1}
+                    step_result = self._compress_obs(raw_obs, tool_name)
+                    self._store_declared_outputs(
+                        step_outputs or ["calendar_schedule"],
+                        tool_name,
+                        tool_res,
+                        raw_obs,
+                        step_result,
+                        needed_by=step_needed_by,
+                        source_step=i + 1,
+                        source_goal=step_desc,
+                    )
+                    _step_success_calls += 1
+                    step_status = "done"
+                    _step_calls.append({
+                        "tool": tool_name,
+                        "status": "ok",
+                        "summary": step_result[:180],
+                        "args": json.dumps({"count": len(_events)}, default=str),
+                    })
+                    _step_actions.append(f"{tool_name} -> {step_result[:120]}")
+                    self._context_compiler.metrics.record_tool_call(tool_name, success=True)
+                    self._context_compiler.metrics.end_step(i, success=True)
+                    completed.append({
+                        "step": step_desc,
+                        "status": step_status,
+                        "result": step_result,
+                        "tool": tool_name,
+                        "calls": _step_calls,
+                        "artifacts": _step_artifacts,
+                        "categories": step_categories,
+                        "raw_payload": _step_raw_payload,
+                    })
+                    continue
+
             # Complex Excel tasks are safer to execute deterministically once
             # raw tabular data is available. This avoids asking the small model
             # to serialize large row arrays, formulas, charts, pivots, and
@@ -7583,7 +8196,7 @@ class Agent:
                 step_status == "failed"
                 and not _step_rewound
                 and _plan_revisions < MAX_PLAN_REVISIONS
-                and _consecutive_failures >= REPLAN_CONSECUTIVE_FAILURES
+                and (_force_plan_revise or _consecutive_failures >= REPLAN_CONSECUTIVE_FAILURES)
             ):
                 yield {
                     "type": "thought",
@@ -8127,18 +8740,18 @@ class Agent:
             _task_l = _task_text.lower()
             _query_l = _query.lower()
             if _task_text and tool_name in ("research.run", "research.extract_facts"):
-                _is_verified_investment = bool(
-                    re.search(r"\b(stock|stocks|share|shares|invest|investment|sector|sectors)\b", _task_l)
-                    and re.search(r"\b(confirm|verified|facts?|claim|claims?|not opinions?|source|sources)\b", _task_l)
+                _has_research_constraints = bool(
+                    re.search(r"\b(confirm|verified|facts?|claim|claims?|not opinions?|source|sources|evidence|current|latest)\b", _task_l)
                 )
-                _query_missing_core = bool(
-                    ("stock" in _task_l and "stock" not in _query_l and "share" not in _query_l)
-                    or ("india" in _task_l and "india" not in _query_l)
-                    or ("sector" in _task_l and "sector" not in _query_l)
-                )
-                if _is_verified_investment and (_query_missing_core or len(_query_l.split()) < 8):
+                _task_terms = {
+                    w for w in re.findall(r"[a-z0-9]{4,}", _task_l)
+                    if w not in {"find", "search", "send", "whatsapp", "create", "make", "with", "then", "best", "top"}
+                }
+                _query_terms = set(re.findall(r"[a-z0-9]{4,}", _query_l))
+                _missing_terms = len(_task_terms - _query_terms) >= max(2, min(4, len(_task_terms) // 3 or 1))
+                if _has_research_constraints and (_missing_terms or len(_query_l.split()) < 8):
                     args["query"] = _task_text
-                if _is_verified_investment:
+                if _has_research_constraints:
                     args["max_sources"] = max(int(args.get("max_sources") or 0), 8)
                     args["max_queries"] = max(int(args.get("max_queries") or 0), 5)
             return self._execute_research_tool(tool_name, args or {})
@@ -8614,6 +9227,8 @@ class Agent:
                 args = parsed_args
                 print(f"[AGENT] Parsed inline args string for {tool_name}")
 
+        args = self._normalize_common_tool_args(tool_name, args)
+
         # think: inject buffer content and/or inline context into the prompt
         # before dispatching to the reasoning connector (which has no buffer access).
         if tool_name == "think":
@@ -8805,6 +9420,10 @@ class Agent:
             args = {}
         # whatsapp.send pre-flight: require text payload or auto-fill from handoff payload.
         if tool_name == "whatsapp.send":
+            _explicit_message_supplied = any(
+                isinstance(args.get(k), str) and args.get(k).strip()
+                for k in ("message", "body", "text", "content")
+            )
             if not str(args.get("to") or "").strip():
                 _to = str(_slots.get("recipient_phone_or_jid") or "").strip()
                 if not _to:
@@ -8833,8 +9452,9 @@ class Agent:
             if _slot_key in _slots and isinstance(_slots.get(_slot_key), str) and _slots.get(_slot_key).strip():
                 _msg = _slots[_slot_key].strip()
                 args["message"] = _msg
+                _explicit_message_supplied = False
                 print(f"[AGENT] whatsapp.send dereferenced message slot: {_slot_key}")
-            if _msg and self._looks_like_raw_retrieval_payload(_msg):
+            if _msg and self._looks_like_raw_retrieval_payload(_msg) and not _explicit_message_supplied:
                 _prepared = str(_slots.get("message_body") or _slots.get("recommendations") or _slots.get("summary") or "").strip()
                 if _prepared and not self._looks_like_raw_retrieval_payload(_prepared):
                     _msg = self._normalize_delivery_body(_prepared)
@@ -8843,7 +9463,7 @@ class Agent:
                 else:
                     args["message"] = ""
                     _msg = ""
-            if self._task_requires_retrieval_delivery_message() and not literal_args:
+            if self._task_requires_retrieval_delivery_message() and not literal_args and not _explicit_message_supplied:
                 generic_delivery = bool(re.fullmatch(r'["\']?\s*(hi|hello|hey|hi\s+\w+|hello\s+\w+|hey\s+\w+)[.!? "\']*', _msg, re.IGNORECASE))
                 has_prepared = any(
                     isinstance(_slots.get(k), str)
